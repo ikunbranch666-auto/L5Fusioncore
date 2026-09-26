@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>AETHER-NODE // L5 动力聚变核心 · 实时展示终端</title>
+  <link rel="stylesheet" href="./src/styles.css" />
+</head>
+<body>
+  <div id="stage">
+    <canvas id="gl"></canvas>
+    <div class="stage-grid" aria-hidden="true"></div>
+    <div class="stage-vignette" aria-hidden="true"></div>
+  </div>
+
+  <header id="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div class="brand-text">
+        <strong>AETHER-NODE // 0x7F-KRONOS</strong>
+        <span>L5 动力聚变核心 · 实时展示终端</span>
+      </div>
+    </div>
+    <nav id="tabs" role="tablist" aria-label="副屏导航">
+      <button class="tab is-active" data-view="main" role="tab">主视窗</button>
+      <button class="tab" data-view="geometry" role="tab">几何与分层</button>
+      <button class="tab" data-view="material" role="tab">材质与光度</button>
+      <button class="tab" data-view="chain" role="tab">数值链路</button>
+      <button class="tab" data-view="motion" role="tab">动力学</button>
+      <button class="tab" data-view="guard" role="tab">约束与验收</button>
+    </nav>
+    <div class="spec-badge">SPEC&nbsp;v2.0-IMPLEMENTATION-BASELINE</div>
+  </header>
+
+  <!-- ============ 常驻遥测 HUD（全部为 L5 相关量） ============ -->
+  <aside id="hud">
+    <div class="hud-head">
+      <span class="dot" id="hud-live-dot"></span>
+      <span>L5 运行遥测</span>
+      <span class="hud-state" id="hud-state-tag">01 STABLE_IDLE</span>
+    </div>
+
+    <div class="hud-primary">
+      <div class="hud-primary-label">E(t) 实时发光功率</div>
+      <div class="hud-primary-value" id="m-et">1.20</div>
+      <div class="hud-primary-sub" id="m-et-range">区间 1.20 ~ 1.34</div>
+    </div>
+
+    <div class="hud-rows">
+      <div class="row"><span>MainParam p</span><b id="m-p">0.000</b></div>
+      <div class="row bar-row">
+        <div class="pbar"><i id="m-p-bar"></i><u id="m-p-guard"></u></div>
+      </div>
+      <div class="row"><span>I_core(p)</span><b id="m-icore">1.20</b></div>
+      <div class="row"><span>E0 基线（上钳 <span id="m-cap">3.5</span>）</span><b id="m-e0">1.20</b></div>
+      <div class="row"><span>呼吸 Φ(t) / T</span><b id="m-phi">0.00 / 4.0s</b></div>
+      <div class="row"><span>微抖动 ΔP</span><b id="m-jitter">未启用</b></div>
+      <div class="row"><span>外层 alpha</span><b id="m-alpha">0.35</b></div>
+      <div class="row"><span>H_accent 色相</span><b id="m-hue">182.8°</b></div>
+      <div class="row swatch-row">
+        <span>发光色（RGB 插值）</span>
+        <b><i class="swatch" id="m-swatch"></i><span id="m-hex">#00F2FE</span></b>
+      </div>
+      <div class="row"><span>可见光晕</span><b id="m-spill">不产生（&lt; 1.5）</b></div>
+    </div>
+
+    <div class="hud-foot">
+      <div><span>1.0u =</span><b id="m-unitpx">54.0 px</b></div>
+      <div><span>DPR</span><b id="m-dpr">1.0</b></div>
+      <div><span>帧耗时</span><b id="m-frame">— ms</b></div>
+    </div>
+  </aside>
+
+  <!-- ============ 副屏（全部围绕 L5） ============ -->
+  <section id="panel" hidden>
+    <button class="panel-close" id="panel-close" aria-label="收起副屏">收起 ✕</button>
+
+    <!-- ① 几何与分层 -->
+    <div class="panel-view" data-view="geometry">
+      <h2>L5 · 几何与分层</h2>
+      <p class="lead">双层嵌套正十二面体：内层固态发光核心、外层悬浮半透明电磁约束框，两层不接触。</p>
+      <svg class="diagram" viewBox="0 0 360 210" role="img" aria-label="L5 内外层半径剖面示意">
+        <defs>
+          <radialGradient id="coreGrad" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stop-color="#8ffbff" /><stop offset="60%" stop-color="#00F2FE" /><stop offset="100%" stop-color="#0284C7" />
+          </radialGradient>
+        </defs>
+        <g transform="translate(180,105)">
+          <circle r="96" fill="none" stroke="#1E293B" stroke-dasharray="3 4" />
+          <polygon id="dg-shell-out" fill="none" stroke="#38BDF8" stroke-width="1" opacity="0.75" />
+          <polygon id="dg-shell-in" fill="none" stroke="#38BDF8" stroke-width="1" opacity="0.35" />
+          <polygon id="dg-core" fill="url(#coreGrad)" opacity="0.9" />
+          <line x1="0" y1="0" x2="0" y2="-96" stroke="#334155" stroke-width="1" />
+          <text x="6" y="-52" class="dg-t">R_core 0.8u</text>
+          <text x="6" y="-84" class="dg-t">外层 1.0u</text>
+          <text x="-72" y="92" class="dg-t dim">壁厚 0.04u · 径向间距 0.20u</text>
+        </g>
+      </svg>
+      <table class="spec">
+        <tbody>
+          <tr><th>形状</th><td>双层嵌套正十二面体（不得退化为球体 / 二十面体）</td><td class="src">5.6.1</td></tr>
+          <tr><th>内层外接半径</th><td>R_core = 0.8u</td><td class="src">5.6.1</td></tr>
+          <tr><th>外层外接半径</th><td>1.0u（= R_core × 1.25）</td><td class="src">附录 B.7</td></tr>
+          <tr><th>外层壁厚</th><td>0.04u</td><td class="src">附录 B.7</td></tr>
+          <tr><th>内外层径向间距</th><td>0.20u（满足层间 ≥ 0.15u）</td><td class="src">B.7 / 3.4.1</td></tr>
+          <tr><th>外层 alpha</th><td>0.35 → 0.55（随 MainParam 线性）</td><td class="src">附录 B.7</td></tr>
+          <tr><th>Z 轴物理层深</th><td>+0.0u</td><td class="src">4.1</td></tr>
+          <tr><th>视差系数 K₅</th><td>0.90</td><td class="src">4.1 / 3.3.3</td></tr>
+          <tr><th>RenderOrder</th><td>30（内层）/ 31（外层）</td><td class="src">4.1 / B.7</td></tr>
+          <tr><th>深度写入</th><td>内层 Write/Test = True；外层 Write = False / Test = True</td><td class="src">4.1 / B.7</td></tr>
+          <tr><th>单位换算</th><td>px = World × (ViewportHeight_css / 20.0) × DPR</td><td class="src">17.1</td></tr>
+          <tr><th>DPR 上限</th><td>min(devicePixelRatio, 2.0)</td><td class="src">2.3.1</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ② 材质与光度 -->
+    <div class="panel-view" data-view="material">
+      <h2>L5 · 材质与光度</h2>
+      <p class="lead">M-Core 为 Custom HDR Core Shader（Prog_HDRCore），不走标准 PBR 通道，无描边。</p>
+      <table class="spec">
+        <tbody>
+          <tr><th>材质模型</th><td>Custom HDR Core Shader</td><td class="src">6.1</td></tr>
+          <tr><th>Albedo / Emissive</th><td><i class="swatch" style="background:#00F2FE"></i>#00F2FE（485nm / 182.8°）</td><td class="src">6.1 / 5.6.2</td></tr>
+          <tr><th>Roughness / Metalness</th><td>0.05 / 0.10</td><td class="src">6.1</td></tr>
+          <tr><th>Emissive Intensity</th><td>声明区间 2.5 ~ 5.0（不做 clamp，由 E(t) 驱动）</td><td class="src">6.1 / B.4</td></tr>
+          <tr><th>描边</th><td>无</td><td class="src">6.1</td></tr>
+          <tr><th>核心点光源</th><td>(0,0,0) · 4.0 cd · 衰减指数 2.0 · 半径 3.5u</td><td class="src">6.3</td></tr>
+          <tr><th>Tone Mapping</th><td>ACESFilmicToneMapping，Exposure 1.0，输出 sRGB</td><td class="src">7.1.1</td></tr>
+          <tr><th>Bloom</th><td>Threshold 1.0 · Radius 0.45 · Strength 0.85</td><td class="src">7.1.2</td></tr>
+          <tr><th>双阈值</th><td>硬阈值 1.0 / 可见溢出下限 1.5</td><td class="src">B.6 / 1.4.1</td></tr>
+        </tbody>
+      </table>
+
+      <h3>色相迁移（附录 B.1：RGB 分量线性插值）</h3>
+      <div class="hue-strip">
+        <i class="hue-marker" id="hue-marker"></i>
+      </div>
+      <div class="hue-readout">
+        <span><i class="swatch" id="hue-swatch"></i><b id="hue-hex">#00F2FE</b></span>
+        <span>H_accent = <b id="hue-deg">182.8°</b></span>
+        <span>p = <b id="hue-p">0.000</b></span>
+      </div>
+      <p class="note">禁止使用 HSV/HSL 色相角插值；p = 0.5 时插值结果为 RGB(128, 181, 127)，对应 119.4°，属该时刻 H_accent 的合法位置。</p>
+
+      <h3>三态工作点</h3>
+      <table class="spec compact">
+        <thead><tr><th>状态</th><th>p</th><th>I_core</th><th>E0</th><th>E(t) 区间</th><th>T 呼吸</th></tr></thead>
+        <tbody>
+          <tr><td>01 STABLE_IDLE</td><td>0.0</td><td>1.20</td><td>1.20</td><td>1.20 ~ 1.34</td><td>4.0s</td></tr>
+          <tr><td>02 ACTIVE_ENGAGE</td><td>0.5</td><td>2.19</td><td>2.19</td><td>2.19 ~ 2.45</td><td>3.2s</td></tr>
+          <tr><td>03 OVERDRIVE</td><td>1.0</td><td>4.00</td><td>3.50</td><td>3.50 ~ 3.92</td><td>1.6s</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ③ 数值链路 -->
+    <div class="panel-view" data-view="chain">
+      <h2>L5 · MainParam 数值链路</h2>
+      <p class="lead">I_core 为唯一强度源，13.1 的幂次曲线为下凸形状，禁止用直线插值替代。</p>
+      <div class="formula">
+        <code>I_core(t) = 1.2 + 2.8 × MainParam(t)<sup>1.5</sup></code>
+        <code>E0(t) = min(I_core(t), coreMaxBrightness)</code>
+        <code>E(t) = E0(t) × [1.0 + 0.12 × Φ(t)]</code>
+      </div>
+      <svg class="chart" id="chart-icore" viewBox="0 0 340 200" role="img" aria-label="I_core 随 MainParam 变化曲线"></svg>
+      <table class="spec compact">
+        <thead><tr><th>MainParam</th><th>p^1.5</th><th>I_core</th><th>备注</th></tr></thead>
+        <tbody>
+          <tr><td>0.0</td><td>0.0</td><td>1.20</td><td>STABLE_IDLE 目标值</td></tr>
+          <tr><td>0.226</td><td>0.1074</td><td>1.50</td><td>可见光晕起始点</td></tr>
+          <tr><td>0.5</td><td>0.3536</td><td>2.19</td><td>ACTIVE_ENGAGE 目标值</td></tr>
+          <tr><td>0.745</td><td>0.6429</td><td>3.00</td><td>进入过载区间下界</td></tr>
+          <tr><td>1.0</td><td>1.0</td><td>4.00</td><td>再经 3.5 上钳</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ④ 动力学 -->
+    <div class="panel-view" data-view="motion">
+      <h2>L5 · 动力学</h2>
+      <p class="lead">呼吸相位以累加方式推进，周期切换时相位连续，禁止用 2πt / T 直接求值（14.2 / 附录 B.10）。</p>
+      <svg class="chart" id="chart-breath" viewBox="0 0 340 140" role="img" aria-label="呼吸波形实时曲线"></svg>
+      <table class="spec">
+        <tbody>
+          <tr><th>呼吸波形</th><td>Φ = 0.5 − 0.5 × cos(phase)</td><td class="src">10.1.1</td></tr>
+          <tr><th>相位推进</th><td>phase += 2π × dt / T_breath（越界回绕）</td><td class="src">B.10</td></tr>
+          <tr><th>呼吸周期</th><td>4.0s / 3.2s / 1.6s</td><td class="src">45.1</td></tr>
+          <tr><th>发光调制</th><td>E(t) = E0 × [1.0 + 0.12 × Φ(t)]</td><td class="src">10.1.2</td></tr>
+          <tr><th>微抖动</th><td>ΔP_core = PerlinNoise(t × 20.0) × 0.015u × envelope</td><td class="src">5.6.3 / B.5</td></tr>
+          <tr><th>抖动包络</th><td>clamp(p × 2.0, 0, 1)；IDLE 不启用，ENGAGE / OVERDRIVE 启用</td><td class="src">B.5</td></tr>
+          <tr><th>位移幅度</th><td>0.015u（1080p / DPR1 下 ≈ 0.81px）</td><td class="src">5.6.3 / 17.1</td></tr>
+          <tr><th>减弱动效</th><td>prefers-reduced-motion 时几何抖动归零，仅保留发光呼吸</td><td class="src">41.3 / 10.1.2</td></tr>
+        </tbody>
+      </table>
+      <div class="kv-grid">
+        <div><span>当前 T_breath</span><b id="mo-t">4.0 s</b></div>
+        <div><span>当前 Φ</span><b id="mo-phi">0.00</b></div>
+        <div><span>抖动包络</span><b id="mo-env">0.00</b></div>
+        <div><span>ΔP 位移</span><b id="mo-dp">0.000 u</b></div>
+      </div>
+    </div>
+
+    <!-- ⑤ 约束与验收 -->
+    <div class="panel-view" data-view="guard">
+      <h2>L5 · 硬性约束与验收</h2>
+
+      <h3>三级钳制（44.4）</h3>
+      <div class="clamp-chain">
+        <div class="clamp-node"><i>1</i><b>输入层</b><span>setTelemetryValue(v)：typeof number 校验 + Clamp(v,0,1)</span></div>
+        <div class="clamp-node"><i>2</i><b>物理层</b><span>插值输出 Math.min(1.0, Math.max(0.0, val))</span></div>
+        <div class="clamp-node"><i>3</i><b>GPU 层</b><span>shader 内 clamp(u_main_param, 0.0, 1.0)</span></div>
+      </div>
+      <button class="btn ghost" id="btn-clamp-test">注入越界值 v = 1.7 进行钳制审计</button>
+      <pre class="audit" id="clamp-audit">等待注入…（输入层应直接输出 1.0）</pre>
+
+      <h3>不可牺牲红线（63.2）</h3>
+      <ul class="redlines">
+        <li>L2 六片装甲几何与开合动力学 <em>（本项目不渲染 L2）</em></li>
+        <li>1.5px 亚像素高对比度细描边 <em>（本项目不渲染描边）</em></li>
+        <li class="is-active">L5 动力聚变核心的颜色与明度呼吸映射 <em>本项目唯一红线：任何帧率下呼吸与色相迁移均保留</em></li>
+      </ul>
+
+      <h3>双色相约束（65.1 / §6.3）</h3>
+      <div class="kv-grid">
+        <div><span>H_base 带</span><b>220° ± 10° → [210°, 230°]</b></div>
+        <div><span>H_accent(t)</span><b id="gd-accent">182.8°</b></div>
+        <div><span>允许带</span><b id="gd-band">[172.8°, 192.8°]</b></div>
+        <div><span>色相聚类数</span><b id="gd-clusters">2（背景带 + 当前强调带）</b></div>
+      </div>
+
+      <h3>验收自检</h3>
+      <ul class="checklist" id="checklist">
+        <li data-check="geo"><i></i>几何为双层嵌套正十二面体，R_core 0.8u / 外层 1.0u</li>
+        <li data-check="icore"><i></i>I_core = 1.2 + 2.8·p^1.5，p ∈ [0,1]</li>
+        <li data-check="e0"><i></i>E0 = min(I_core, 3.5)，上钳作用于基线而非 E(t)</li>
+        <li data-check="breath"><i></i>OVERDRIVE 期间 E(t) ∈ [3.50, 3.92]，呼吸未被压平</li>
+        <li data-check="color"><i></i>色值按 RGB 分量线性插值（非 HSV 色相角）</li>
+        <li data-check="phase"><i></i>呼吸相位累加推进，周期切换无亮度阶跃</li>
+        <li data-check="clamp"><i></i>三级钳制全部实现（输入 / 物理 / GPU）</li>
+        <li data-check="time"><i></i>时间全部取自 MasterClock.simTime，无 Date.now / performance.now</li>
+        <li data-check="hdr"><i></i>ACES + Selective Bloom（0.85 / 0.45 / 1.0）</li>
+        <li data-check="hue"><i></i>同一时刻仅两个色相聚类</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ============ 底部控制台 ============ -->
+  <footer id="dock">
+    <div class="dock-group">
+      <span class="dock-label">FSM 状态</span>
+      <div class="seg" id="seg-state">
+        <button data-state="STABLE_IDLE" class="is-active"><b>01</b>STABLE_IDLE<kbd>1</kbd></button>
+        <button data-state="ACTIVE_ENGAGE"><b>02</b>ACTIVE_ENGAGE<kbd>2</kbd></button>
+        <button data-state="OVERDRIVE"><b>03</b>OVERDRIVE<kbd>3</kbd></button>
+      </div>
+    </div>
+
+    <div class="dock-group grow">
+      <span class="dock-label">遥测注入 setTelemetryValue(v)</span>
+      <div class="inject">
+        <input type="range" id="inject-range" min="0" max="1" step="0.001" value="0" />
+        <output id="inject-out">0.000</output>
+      </div>
+    </div>
+
+    <div class="dock-group">
+      <span class="dock-label">视口缩放</span>
+      <div class="seg" id="seg-zoom">
+        <button data-zoom="1">1.00×<em>规格</em></button>
+        <button data-zoom="2">2.00×</button>
+        <button data-zoom="2.5" class="is-active">2.50×</button>
+        <button data-zoom="4">4.00×</button>
+      </div>
+    </div>
+
+    <div class="dock-group">
+      <span class="dock-label">展示模式</span>
+      <div class="seg" id="seg-show">
+        <button data-show="off">规格严格</button>
+        <button data-show="on" class="is-active">自旋 + 视差</button>
+      </div>
+    </div>
+
+    <div class="dock-group">
+      <span class="dock-label">视觉增强<em>非规格</em></span>
+      <div class="seg" id="seg-fx">
+        <button data-fx="off">规格字面</button>
+        <button data-fx="on" class="is-active">等离子 + 光轴</button>
+      </div>
+    </div>
+
+    <div class="dock-group">
+      <span class="dock-label">时钟</span>
+      <button class="btn" id="btn-pause">暂停</button>
+    </div>
+
+    <div class="dock-hint" id="dock-hint">prefers-reduced-motion：关闭</div>
+  </footer>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

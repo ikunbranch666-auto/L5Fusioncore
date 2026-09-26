@@ -1,0 +1,18 @@
+{
+  "name": "l5-fusion-core-showcase",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "AETHER-NODE · L5 动力聚变核心 实时展示终端（依据 L5_fusion_core_implementation_spec v2.0 实施）",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5173",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4173"
+  },
+  "dependencies": {
+    "three": "^0.186.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.11"
+  }
+}
