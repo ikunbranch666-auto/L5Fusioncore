@@ -427,6 +427,18 @@ function bindFxSeg() {
   });
 }
 
+/** 层级显示开关：把几何与分层面板里的复选框接到 L5Core.setLayer */
+function bindLayers() {
+  const boxes = document.querySelectorAll('#layer-list input[data-layer]');
+  boxes.forEach((cb) => {
+    cb.addEventListener('change', () => {
+      if (l5 && typeof l5.setLayer === 'function') {
+        l5.setLayer(cb.dataset.layer, cb.checked);
+      }
+    });
+  });
+}
+
 let dragging = false;
 function syncSliderTo(value, force = false) {
   if (dragging && !force) return;
@@ -542,6 +554,7 @@ function boot() {
   bindZoomSeg();
   bindShowSeg();
   bindFxSeg();
+  bindLayers();
   bindInject();
   bindPause();
   bindClampTest();

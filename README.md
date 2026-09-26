@@ -315,6 +315,15 @@ grep 产物确认本次新增的标识符真的进去了**，再跑探针。
 新增可观测：`rot.events`（逐次事件过冲峰值）、`rot.ease`（面内缓动档差）、`rot.returning`
 （回归中的碎片数）、`sample.phase`（step/ret）。
 
+### v5.13e：雾气 over 叠加遮挡主结构 + 水晶外推后三层化
+
+| # | 问题（用户观察） | 诊断 | 修正 |
+| :-- | :--- | :--- | :--- |
+| 1 | "雾气改为 over 叠加后更诡异了，雾气直接遮挡了外壳，根本没法看，且雾气片非常尖锐、颜色非常重，完全占据主视野" | 旧 `gl_FragColor = vec4(c*a, a*u_occ)` 在 `blendSrc: OneFactor` 预乘混合下 rgb 未乘 `u_occ`；`u_occ=0.85` 时雾成为接近不透明的饱和实体片，盖在主结构前 → 既挡壳又重。边缘 `exp(-y*y*2.6)` 过窄 → 尖锐刀片状 | ① 修正预乘：`vec4(c*a*u_occ, a*u_occ)`（rgb 与 alpha 同步按 `u_occ` 缩放，调低 `u_occ` 即等比例去遮挡+去饱和）；② `u_occ` 默认 `0.85→0.35`（"半透明环绕软雾，低遮挡不挡主结构"，可用 `?tk_wispOcc=` 调）；③ 边缘 `exp(-y*y*2.6)` → `exp(-y*y*1.4)` 加宽去尖锐；④ 颜色提亮减饱和：`mix(u_color, 白, 0.30)` 幅度 `0.55*0.42` → `0.45*0.42` |
+| 2 | "水晶碎块外推后原外壳依旧存在，核心没暴露，看起来像三层结构（核心 / 完整护罩 / 水晶碎片）；实际上水晶外推后完整外壳应作为基准面隐藏" | 完整内壳 `shellInner` 与碎片共用同一个 `u_shell_alpha`，只随 fragments 的 deploy 淡出；碎片外推后内壳仍满 alpha 在场 → 三层观感 | ① `shellInnerUniforms` 新增**独立** `u_shell_alpha`（不再与碎片共享同一引用）；② `sync()` 末尾按 deploy 淡出：`innerFade = 1 − smoothstep(_deploy, 0, 0.55)`，`shellInnerUniforms.u_shell_alpha = shellAlpha × innerFade` —— 碎片展开（`_deploy>0.55`）后内壳淡出为隐藏基准面、核心暴露；回落时内壳复原 |
+
+验证：构建产物 grep 确认 `vec4(c * a * u_occ, a * u_occ)`、`exp(-y * y * 1.4)`、`u_occ:{value:.35}`、`innerFade` 同步逻辑均进入 `dist/assets/index-B1mwUKGU.js`（构建 #2）；`?probe=1` 已暴露 `stats.shell.innerAlpha`（O_occ85 全展开工况 `deployT=1` 时预期 →0）。注：本机无头 Chrome（swiftshader）偶发 `--dump-dom` 不返回导致探针采集超时，需以 `--virtual-time-budget` + 硬超时强杀兜底，构建级 grep 验证为可靠主证据。
+
 ### 无头验收管线（tmp_probe.mjs）
 
 无 puppeteer 依赖：`node tmp_serve.mjs`（静态服 dist）+ 无头 Chrome `--dump-dom` 读取页内像素探针

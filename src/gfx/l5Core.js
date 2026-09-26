@@ -230,6 +230,7 @@ uniform float u_petal;               // 0 = 外壳装甲板；1 = 散热花瓣�
 uniform float u_core_layer;          // v5.3：1 = 裂片内芯发光层（加色叠加的第 2 层绘制）
 uniform vec3  u_crystal_tint;        // v5.4：水晶本体色（与强调色做差分，便于分辨晶体/构造体）
 uniform float u_deploy;              // v5.4：展开进度 0→1（驱动色差与断口亮度）
+uniform float u_shell_fade;          // v-new：内壳展开后整体淡出（基准面隐藏，0=完全不可见；与 u_shell_alpha 解耦）
 uniform float u_seam_form;           // v5.9：轮廓线一次性渐显进度 0→1（阈值触发，定时长）
 uniform float u_crack_mul;            // v5.10：水晶加色项（轮廓线/断口）消融系数
 uniform float u_pulse_gate;           // v5.11：轮廓线脉冲闸门（0.20 阈值后开 → 0.80 展开止）
@@ -748,6 +749,10 @@ void main() {
     c += u_emissive_color * rim * u_shell_gain * (0.20 + 0.50 * pC) * lit;
     c += vec3(1.0) * spec * u_shell_gain * (0.14 + 0.36 * pC) * lit;
 
+    // v-new：内壳展开淡出 —— premultiplied(OneFactor) 混合下，alpha 缩小不会门控颜色，
+    // 必须显式用 u_shell_fade 乘掉 c 与 alpha，基准面才会在 _deploy>0.55 后真正不可见。
+    c *= u_shell_fade;
+    alpha *= u_shell_fade;
     gl_FragColor = vec4(c, alpha);
     return;
   }
@@ -878,107 +883,6 @@ void main() {
  *  本版删除 RING_TUBE（精密导管）全部代码，改为粗管径环体上的雾丝着色。
  * ------------------------------------------------------------------ */
 
-/* 雾缕：实例化**三维弯曲缎带**（沿环向的一条弧，不是面向相机的长方形片）——
- * v5.10 关键修正：v5.7 的雾片是"沿切向拉长 + billboard"，切向一旦接近视线方向，
- * 它在屏幕上的 2D 投影就会瞬间翻转（用户："能看到这所谓的雾瞬间旋转 90 度，
- * 就和一个长方形片一样"）。billboard 的朝向是**屏幕空间**量，本身就会突变；
- * 这里改为真正的 3D 曲线缎带：
- *   · 沿环向铺一条弧（8 段），每段位置 = 环上点 + 截面偏移 + 随时间流动的低频扰动；
- *   · 宽度方向用**环自身的局部标架**（径向 × cos φ + 环轴 × sin φ），φ 只随环向角
- *     平滑变化 —— 不存在任何屏幕空间量，因此不可能"瞬间旋转"；
- *   · 两端收成尖（lens 剖面）+ 横向高斯 + 缕内疏密驻波 → 读作一缕雾，不是一块片。 */
-const RING_WISP_VERT = /* glsl */ `
-precision highp float;
-attribute float aTheta0;   // 初相（环向）
-attribute float aSpeed;    // 环向漂移角速度
-attribute float aCrossA;   // 截面相位（决定这缕宽度方向的朝向）
-attribute float aCrossR;   // 截面半径 [0,1)
-attribute float aLen;      // 弧长（世界单位）
-attribute float aWid;      // 缕的最大半宽
-attribute float aBright;   // 亮度
-attribute float aSeed;
-uniform float u_time;
-uniform float u_form;
-uniform float u_ringR;
-uniform float u_outerR;
-uniform float u_tubeR;
-varying vec2  vQ;          // x∈[-1,1] 沿缕长，y∈[-1,1] 沿缕宽
-varying float vA;
-varying float vSeed;
-float easeOutCubic(float x) { x = clamp(x, 0.0, 1.0); return 1.0 - pow(1.0 - x, 3.0); }
-void main() {
-  float s = uv.x;                       // 0..1 沿弧
-  float v = uv.y * 2.0 - 1.0;           // -1..1 跨宽
-  vQ = vec2(s * 2.0 - 1.0, v);
-  vSeed = aSeed;
-
-  float form = easeOutCubic(clamp(u_form * 1.25 - aSeed * 0.25, 0.0, 1.0));
-  float Rr = mix(u_outerR, u_ringR, form);
-  float swirl = (1.0 - form) * (1.4 + 2.2 * fract(aSeed * 7.31)) * sign(aSpeed);
-  // 弧：角宽 = 弧长 / 半径（越靠内圈角宽越大，弧本身的形状不变）
-  float dth = aLen / max(Rr, 0.001);
-  float theta = aTheta0 + swirl + u_time * aSpeed + (s - 0.5) * dth;
-  float ca = aCrossA + u_time * (fract(aSeed * 3.71) - 0.5) * 0.22;   // 截面内缓慢游走
-  float cr = aCrossR * u_tubeR * (0.55 + 0.45 * form);
-  float ct = cos(theta), st = sin(theta);
-
-  // 环上点（含截面偏移）
-  vec3 P = vec3(ct * (Rr + cr * cos(ca)), cr * sin(ca), st * (Rr + cr * cos(ca)));
-  // 宽度方向 = 环局部标架（径向与环轴的固定组合）→ 纯 3D，随环平滑转动，不会突变
-  vec3 rad = vec3(ct, 0.0, st);
-  vec3 W = normalize(rad * cos(ca) + vec3(0.0, 1.0, 0.0) * sin(ca));
-
-  /* v5.11：把缎带卷成**三维螺旋**（而不是近似一个平面）：平面缎带一旦转到接近侧视
-   * 就会整条塌成一条线再展开 —— 这就是残留的"突兀转向"。卷起来之后它不存在单一
-   * 平面，任何视角下都是连续形变。扰动同时含时间项 → 全程流畅流动。 */
-  float t1 = u_time * 0.33 + aSeed * 31.0;
-  vec3 Tdir = vec3(-st, 0.0, ct);
-  vec3 flow = Tdir * sin(s * 4.1 + t1 * 1.31)
-            + rad  * cos(s * 3.3 - t1 * 0.84) * 0.85
-            + vec3(0.0, 1.0, 0.0) * sin(s * 5.2 + t1 * 1.67) * 0.75;
-  P += flow * (0.075 + 0.085 * fract(aSeed * 11.3)) * (0.35 + 0.65 * form);
-
-  /* v5.11：删掉 lens（sqrt(1-x²)）两端收尖 —— 那正是纺锤形/两边尖中间鼓的来源。
-   * 改为：端部只做很窄的软收（不是尖），宽度沿弧再叠一段低频摆动 → 轮廓不规则、
-   * 像雾团边缘而不是一枚纺锤。 */
-  float endFade = smoothstep(0.0, 0.20, s) * smoothstep(1.0, 0.80, s);
-  float wobble = 0.74 + 0.26 * sin(s * 5.7 + aSeed * 21.0 + u_time * 0.47);
-  P += W * v * aWid * (0.42 + 0.80 * endFade * wobble);
-
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(P, 1.0);
-  float flick = 0.74 + 0.26 * sin(u_time * (1.1 + 1.9 * fract(aSeed * 5.13)) + aSeed * 61.7);
-  vA = flick * aBright * (0.20 + 0.80 * form);
-}
-`;
-
-const RING_WISP_FRAG = /* glsl */ `
-precision highp float;
-uniform float u_time;
-uniform float u_form;
-uniform float u_gain;
-uniform vec3  u_color;
-uniform float u_occ;                 // v5.13e：雾的软雾强度（0=退回纯加色 1=接近不透明遮挡；默认半透明环绕）
-varying vec2  vQ;
-varying float vA;
-varying float vSeed;
-void main() {
-  float x = vQ.x, y = vQ.y;
-  float along = max(1.0 - x * x, 0.0);              // 两端渐隐
-  float across = exp(-y * y * 1.4);                 // 横向高斯 → 软雾边（v5.13e：2.6→1.4 加宽，去"尖锐刀片状"）
-  // 缕内疏密：沿长度的行波 + 每缕随机相位 → 时时刻刻在缓慢变化
-  float strands = 0.62 + 0.38 * sin(x * 4.3 + vSeed * 37.0 + u_time * 0.62);
-  float a = u_gain * vA * pow(along, 1.15) * across * strands * (0.22 + 0.78 * u_form);
-  a = clamp(a, 0.0, 0.50);
-  // 雾读作被能量照亮的轻雾：芯部向白拉一点、整体饱和度压低 → 不再"颜色很重"
-  vec3 c = mix(u_color, mix(u_color, vec3(1.0), 0.45), across * 0.42);
-  /* v5.13e：预乘 alpha 的 over 合成（dst = src + dst·(1−src.a)），**同时**把 rgb 也乘
-   * 上 u_occ —— 这样调低 u_occ 时"遮挡"与"亮度"等比例下降，雾变成环绕结构的半透明
-   * 软雾，而不是 v5.13d 那种 u_occ=0.85 下既挡壳又饱和的实体片。
-   *  · over 合成总量天然有界，雾与碎片在屏幕空间重叠也不会冲过 1.0（修掉 v5.13c 的死白）。
-   *  · u_occ 是软雾强度旋钮：0.35 ≈ 环绕不挡主结构；调到 1 才回到接近不透明的遮挡。 */
-  gl_FragColor = vec4(c * a * u_occ, a * u_occ);
-}
-`;
 
 /* 粒子：GPU 顶点着色器解算环行位置；粒子散布在**雾带的整个截面**内（不是排成一条线），
  * 与雾丝共同构成环状构造 —— 没有管道，粒子本身就是环的一部分。 */
@@ -1121,6 +1025,7 @@ export class L5Core {
       // 之前固定紫罗兰与橙色几乎互补，撞色最狠（用户："根本不融合"）。
       u_crystal_tint: { value: new THREE.Color(0xdfeaff) },
       u_deploy: { value: 0.0 },       // v5.4：展开进度 → 驱动水晶色差与断口亮度
+      u_shell_fade: { value: 1.0 },   // v-new：内壳整体淡出系数（0=完全不可见；与 u_shell_alpha 解耦，真正门控颜色）
       u_seam_form: { value: 0.0 },    // v5.9：轮廓线渐显进度（阈值触发、固定时长，与能量无关）
       u_crack_mul: { value: 1.0 },     // v5.10：水晶加色项消融系数（诊断用，默认 1）
       u_pulse_gate: { value: 0.0 },     // v5.11：轮廓线脉冲（阈值后循环扩散）
@@ -1199,6 +1104,7 @@ export class L5Core {
       u_hard_body: { value: 1.0 },
       u_layer_gain: { value: 0.0 },
       u_shell_gain: { value: 0.28 },
+      u_shell_fade: { value: 1.0 },  // v-new：独立副本 —— 内壳展开淡出（不共享引用，避免误伤其他材质）
       u_petal: { value: 0.35 }      // 内壳：略实心、有边缘勾边，但不吃裂片专属的星云气流
     });
     this.shellMaterial = this._shellMaterial(
@@ -1280,77 +1186,6 @@ export class L5Core {
 
       const uColor = { value: new THREE.Color(0x00f2fe) };   // 雾带与粒子共享，每帧同步强调色
 
-      // —— 星云雾缕（实例化面片）——
-      const WISP_COUNT = 340;
-      // 8 段 × 1 段宽的条带：沿环向铺开的一条弧（顶点着色器把它弯成 3D 曲线）
-      const quad = new THREE.PlaneGeometry(1, 1, 12, 1);   // 12 段：卷曲更平滑
-      const wispGeo = new THREE.InstancedBufferGeometry();
-      wispGeo.index = quad.index;
-      wispGeo.setAttribute('position', quad.attributes.position);
-      wispGeo.setAttribute('uv', quad.attributes.uv);
-      wispGeo.instanceCount = WISP_COUNT;
-      {
-        const wTheta0 = new Float32Array(WISP_COUNT);
-        const wSpd = new Float32Array(WISP_COUNT);
-        const wCA = new Float32Array(WISP_COUNT);
-        const wCR = new Float32Array(WISP_COUNT);
-        const wLen = new Float32Array(WISP_COUNT);
-        const wWid = new Float32Array(WISP_COUNT);
-        const wBri = new Float32Array(WISP_COUNT);
-        const wSeed = new Float32Array(WISP_COUNT);
-        for (let i = 0; i < WISP_COUNT; i++) {
-          const r1 = Math.random(), r2 = Math.random(), r3 = Math.random();
-          wTheta0[i] = (i / WISP_COUNT) * Math.PI * 2 + (r1 - 0.5) * 0.24;
-          wSpd[i] = def.flowDir * (0.06 + 0.16 * r2);        // 缓慢环向漂移（主旋转由 Group 承担）
-          wCA[i] = r1 * Math.PI * 2;
-          wCR[i] = Math.sqrt(r3);                            // 截面内均匀
-          // v5.10：短而胖（长宽比 ~2:1），不再是 6:1 的长条 —— 长条必然读成"长方形片"
-          wLen[i] = 0.55 + 0.78 * r2 * r2;   // 弧长（沿环向）—— 长但收尖成流线，不是等宽长条
-          wWid[i] = 0.09 + 0.14 * r3;
-          wBri[i] = 0.35 + 0.65 * r2 * r3;
-          wSeed[i] = r3;
-        }
-        wispGeo.setAttribute('aTheta0', new THREE.InstancedBufferAttribute(wTheta0, 1));
-        wispGeo.setAttribute('aSpeed', new THREE.InstancedBufferAttribute(wSpd, 1));
-        wispGeo.setAttribute('aCrossA', new THREE.InstancedBufferAttribute(wCA, 1));
-        wispGeo.setAttribute('aCrossR', new THREE.InstancedBufferAttribute(wCR, 1));
-        wispGeo.setAttribute('aLen', new THREE.InstancedBufferAttribute(wLen, 1));
-        wispGeo.setAttribute('aWid', new THREE.InstancedBufferAttribute(wWid, 1));
-        wispGeo.setAttribute('aBright', new THREE.InstancedBufferAttribute(wBri, 1));
-        wispGeo.setAttribute('aSeed', new THREE.InstancedBufferAttribute(wSeed, 1));
-      }
-      const wispUniforms = {
-        u_time: { value: 0 },
-        u_form: { value: 0 },
-        u_ringR: { value: RING_R },
-        u_outerR: { value: RING_R * 1.55 },
-        u_tubeR: { value: WISP_TUBE },
-        u_gain: { value: 0 },
-        u_color: uColor,
-        u_occ: { value: 0.35 }           // v5.13e：半透明环绕软雾（低遮挡，不挡主结构；可用 ?tk_wispOcc= 调）
-      };
-      const wispMat = new THREE.ShaderMaterial({
-        vertexShader: RING_WISP_VERT,
-        fragmentShader: RING_WISP_FRAG,
-        uniforms: wispUniforms,
-        transparent: true,
-        side: THREE.DoubleSide,          // 3D 缎带会被背面剔除掉一半 → 必须双面
-        depthWrite: false,
-        depthTest: true,
-        /* v5.13d：**预乘 alpha 的 over 合成**（dst = src + dst·(1−src.a)）。
-         * 见 RING_WISP_FRAG 的说明 —— 加色混合会让雾与碎片的屏幕空间重叠处冲出 1.0。 */
-        blending: THREE.CustomBlending,
-        blendEquation: THREE.AddEquation,
-        blendSrc: THREE.OneFactor,
-        blendDst: THREE.OneMinusSrcAlphaFactor,
-        blendSrcAlpha: THREE.OneFactor,
-        blendDstAlpha: THREE.OneMinusSrcAlphaFactor
-      });
-      const wisp = new THREE.Mesh(wispGeo, wispMat);
-      wisp.name = 'L5_Ring_Wisp';
-      wisp.renderOrder = 33;
-      wisp.frustumCulled = false;      // 实例位置由顶点着色器解算，包围球不可信
-      g.add(wisp);
 
       // —— 粒子（散布于雾带截面内）——
       const theta0 = new Float32Array(FLOW_COUNT);
@@ -1405,7 +1240,7 @@ export class L5Core {
       g.add(flow);
 
       this.group.add(g);
-      this.ringGroups.push({ group: g, def, wispUniforms, flowUniforms, uColor });
+      this.ringGroups.push({ group: g, def, flow, flowUniforms, uColor });
     }
 
     /* ---------- 约束场辉光（v5.1：取代双层球膜） ----------
@@ -1439,17 +1274,6 @@ export class L5Core {
     this.group.add(this.fieldGlow);
     this._qGlow = new THREE.Quaternion(); // 广告牌反向旋转专用
 
-    /* ---------- 硬表面发光棱（加粗 + 提亮，保证在亮核上可辨） ---------- */
-    this.rodMaterial = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(0x38bdf8),
-      transparent: true,
-      opacity: 0.9,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending
-    });
-    this.shellRods = new THREE.Mesh(edgeRods(R_SHELL_OUT, 0.024), this.rodMaterial);
-    this.shellRods.name = 'L5_Rods_Shell';
-    this.shellRods.renderOrder = 32;
 
     this.coreRodMaterial = new THREE.MeshBasicMaterial({
       color: new THREE.Color(0x00f2fe),
@@ -1490,7 +1314,7 @@ export class L5Core {
     this.group.add(
       this.coreMesh, this.coreRods,
       this.shellInner, ...this.fragments.map((f) => f.mesh),
-      this.shellRods, this.cage, this.cageGhost
+      this.cage, this.cageGhost
     );
 
     this._q = new THREE.Quaternion();
@@ -1816,9 +1640,6 @@ export class L5Core {
       rg.group.rotation.y = simTime * rg.def.speed
         + (1.0 - fe) * (1.0 - fe) * 3.2 * rg.def.flowDir;
       rg.uColor.value.copy(this.uniforms.u_emissive_color.value);
-      rg.wispUniforms.u_time.value = simTime;
-      rg.wispUniforms.u_form.value = fe;
-      rg.wispUniforms.u_gain.value = ringGain;
       rg.flowUniforms.u_time.value = simTime;
       rg.flowUniforms.u_form.value = fe;
       rg.flowUniforms.u_gain.value = ringGain * 1.20;
@@ -1865,10 +1686,6 @@ export class L5Core {
     }
     // v5.10 消融标定：分层关掉加色层，量化各自对"总亮度"的贡献（诊断过曝元凶用）
     this._ringMul = t.ring ?? this._ringMul ?? 1.0;
-    // v5.13d：雾的遮挡强度（0 = 退回纯加色，用于消融验证"重合过曝"是否由它造成）
-    if (t.wispOcc != null) {
-      for (const rg of this.ringGroups) rg.wispUniforms.u_occ.value = t.wispOcc;
-    }
     this._cageMul = t.cage ?? this._cageMul ?? 1.0;
     this._crackMul = t.crack ?? this._crackMul ?? 1.0;   // 轮廓线/断口等水晶加色项
     if (t.core2 != null) u.u_core_gain.value = t.core2;   // v5.11：内芯加色层
@@ -1887,7 +1704,6 @@ export class L5Core {
   setEnhancements(on) {
     this.coreMaterial.uniforms.u_vol_steps.value = on ? 32 : 0;
     if (this.fieldGlow) this.fieldGlow.visible = !!on;
-    this.shellRods.visible = on;
     this.coreRods.visible = on;
     this.cageGhost.visible = on;
     // 规格字面档：内壳不做展开形变（v5.3：散热鳍已按用户要求整体移除）
@@ -1900,6 +1716,38 @@ export class L5Core {
       mat.blendSrc = THREE.OneFactor;
       mat.blendDst = THREE.OneMinusSrcAlphaFactor;
       mat.needsUpdate = true;
+    }
+  }
+
+  /**
+   * 层级显示开关。关闭即彻底隐藏：obj.visible=false 在 three.js 中既不被渲染、
+   * 也不写深度缓冲、不参与拾取/后处理掩膜 —— 不会"隐藏了但干涉还在"。
+   * 基准面（shellInner）是旋转基石，按用户要求不提供关闭（几何始终在场，仅随展开淡出）。
+   * @param {string} name  fragments | core | particles | fieldGlow | cage
+   * @param {boolean} on
+   */
+  setLayer(name, on) {
+    const v = !!on;
+    switch (name) {
+      case 'fragments':        // 水晶碎块 / 外壳（285 片外甲，含其内芯发光子层）
+        for (const f of this.fragments) f.mesh.visible = v;
+        break;
+      case 'core':             // 等离子核心 + 核心棱线
+        this.coreMesh.visible = v;
+        this.coreRods.visible = v;
+        break;
+      case 'particles':        // 能量环粒子流（环截面内漂移的点）
+        for (const rg of this.ringGroups) if (rg.flow) rg.flow.visible = v;
+        break;
+      case 'fieldGlow':        // 约束场辉光板
+        if (this.fieldGlow) this.fieldGlow.visible = v;
+        break;
+      case 'cage':             // 笼线（诊断骨架）
+        this.cage.visible = v;
+        this.cageGhost.visible = v;
+        break;
+      default:                 // 基准面（shellInner）：旋转基石，始终显示，不提供关闭
+        break;
     }
   }
 
@@ -1964,6 +1812,7 @@ export class L5Core {
     // 内壳几何仍在场景里（碎块旋转/浮动的基准），只是不可见；能量回落、裂片收回时再淡入。
     const innerFade = 1.0 - THREE.MathUtils.smoothstep(this._deploy, 0.0, 0.55);
     this.shellInnerUniforms.u_shell_alpha.value = shellAlpha * innerFade;
+    this.shellInnerUniforms.u_shell_fade.value = innerFade;   // v-new：真正门控内壳颜色，使其彻底淡出
 
     this.cageMaterial.color.copy(color);
     this.cageMaterial.opacity = (0.45 + 0.50 * p) * head * (this._cageMul ?? 1.0);
@@ -1976,8 +1825,6 @@ export class L5Core {
     // v5.7：高能量态整体过曝 → 棱线的能量斜率下调（0.98/1.15 → 0.62/0.72）；
     // v5.10：再乘展开余量 head（棱线只让出 60%，保证机械骨架仍可读）。
     const rodHead = 1.0 - 0.60 * (1.0 - head);
-    this.rodMaterial.color.copy(color).multiplyScalar(rg * (0.46 + 0.62 * p));
-    this.rodMaterial.opacity = (0.50 + 0.28 * hot) * rodHead;
     this.coreRodMaterial.color.copy(color).multiplyScalar(rg * (0.58 + 0.72 * p));
     this.coreRodMaterial.opacity = (0.55 + 0.26 * hot) * rodHead;
   }
@@ -1985,7 +1832,7 @@ export class L5Core {
   dispose() {
     this.fragments.forEach((f) => f.geo.dispose());   // 本体与内芯层共享同一几何，释放一次即可
     [this.coreMesh, this.shellInner, this.cage, this.cageGhost,
-      this.coreRods, this.shellRods, this.fieldGlow].forEach((m) => m.geometry.dispose());
+      this.coreRods, this.fieldGlow].forEach((m) => m.geometry.dispose());
     // v5：能量环流的导管/粒子几何与材质（旧 comet 实现已删除）
     this.ringGroups.forEach((rg) => {
       rg.group.children.forEach((ch) => {
@@ -1998,7 +1845,6 @@ export class L5Core {
     this.shellInnerMaterial.dispose();
     this.fragCoreMaterial.dispose();
     this.fieldGlowMaterial.dispose();
-    this.rodMaterial.dispose();
     this.coreRodMaterial.dispose();
     this.cageMaterial.dispose();
     this.cageGhostMaterial.dispose();

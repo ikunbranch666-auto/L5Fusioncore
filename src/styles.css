@@ -170,10 +170,18 @@ button, input { font-family: inherit; color: inherit; }
   letter-spacing: 0.08em; font-weight: 600;
 }
 .lead { font-size: 12px; line-height: 1.7; color: var(--dim); margin: 0 0 14px; }
+.lead.tight { margin: 0 0 10px; }
 .note {
   font-size: 11px; line-height: 1.7; color: var(--mute); margin: 8px 0 0;
   border-left: 2px solid var(--line); padding-left: 10px;
 }
+.sub { font-size: 13px; color: var(--text); margin: 18px 0 8px; letter-spacing: 0.02em; }
+.layer-list { list-style: none; margin: 4px 0 4px; padding: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px; }
+.layer-list li { font-size: 12px; }
+.layer-list label { display: flex; align-items: center; gap: 8px; cursor: pointer; color: var(--dim); }
+.layer-list input[type="checkbox"] { accent-color: var(--core); width: 14px; height: 14px; cursor: pointer; }
+.layer-list li.locked label { cursor: default; color: var(--mute); }
+.layer-list li.locked input { opacity: 0.55; cursor: not-allowed; }
 
 .diagram { width: 100%; height: auto; margin: 4px 0 14px; }
 .dg-t { font-family: var(--mono); font-size: 8.5px; fill: var(--dim); }
