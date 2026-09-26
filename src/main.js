@@ -102,6 +102,11 @@ function runProbe() {
     };
     // 展开机构直读：花瓣环有没有真的转出去，看这个数（0=闭合，1=全开）
     stats.deploy = { allowed: !!l5._deployAllowed, d: +(l5._deploy ?? 0).toFixed(4) };
+    // v5.13e：完整内壳淡出验证 —— 外甲裂片外推后 innerAlpha 应趋于 0（壳隐藏、露核心）
+    stats.shell = {
+      innerAlpha: +(l5.shellInnerUniforms?.u_shell_alpha?.value ?? 0).toFixed(4),
+      innerVisible: !!(l5.shellInner?.visible)
+    };
     // v5.7：裂片外推错峰 + 行波加速的可观测指标
     //  · waveSpeed = 浮动速度倍率（1.5× @p=0.80 → 3.0× @p=1.00，线性）
     //  · pushSpread = 同一时刻各片外推完成度的最小/最大差（>0 即证明"不同时到位"）
