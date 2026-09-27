@@ -37,6 +37,9 @@ const stage = new L5Stage(canvas, l5.group, {
   preserveDrawingBuffer: urlQ0.get('probe') != null
 });
 
+// v-fix：把初始正交缩放倍率注入粒子系统，避免默认 2.5× 下粒子过小
+l5.setZoom(stage.zoom);
+
 const prefs = {
   coreMaxBrightness: DEFAULT_CORE_MAX_BRIGHTNESS, // 41.1
   breathPeriod: 4.0                                // 41.1
@@ -399,6 +402,7 @@ function bindZoomSeg() {
   document.querySelectorAll('#seg-zoom button').forEach((btn) => {
     btn.addEventListener('click', () => {
       stage.setZoom(parseFloat(btn.dataset.zoom));
+      l5.setZoom(parseFloat(btn.dataset.zoom));   // v-fix：同步粒子像素尺寸缩放
       document.querySelectorAll('#seg-zoom button').forEach((b) => b.classList.toggle('is-active', b === btn));
     });
   });
@@ -575,6 +579,7 @@ function boot() {
     const z = parseFloat(urlQ.get('zoom'));
     if (Number.isFinite(z) && z > 0) {
       stage.setZoom(z);
+      l5.setZoom(z);   // v-fix：同步粒子像素尺寸缩放
       document.querySelectorAll('#seg-zoom button').forEach((b) => b.classList.toggle('is-active', parseFloat(b.dataset.zoom) === z));
     }
     if (urlQ.get('fx') === '0') {
