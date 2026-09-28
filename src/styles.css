@@ -305,18 +305,27 @@ table.spec thead th { color: var(--mute); border-bottom: 1px solid var(--line); 
 .seg button.is-active b, .seg button.is-active kbd { color: var(--core); }
 
 .inject { display: flex; align-items: center; gap: 12px; }
-#inject-range {
-  flex: 1; -webkit-appearance: none; appearance: none; height: 4px; border-radius: 2px;
+#inject-range, #zoom-range {
+  flex: 1; min-width: 90px;
+  -webkit-appearance: none; appearance: none; height: 4px; border-radius: 2px;
   background: linear-gradient(90deg, var(--cyan-deep), var(--core)); outline: none; cursor: pointer;
 }
-#inject-range::-webkit-slider-thumb {
+#inject-range::-webkit-slider-thumb, #zoom-range::-webkit-slider-thumb {
   -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
   background: #eaf9ff; border: 2px solid var(--core);
   box-shadow: 0 0 10px rgba(0, 242, 254, 0.8); cursor: pointer;
 }
-#inject-out {
+#inject-range::-moz-range-thumb, #zoom-range::-moz-range-thumb {
+  width: 14px; height: 14px; border: 2px solid var(--core); border-radius: 50%;
+  background: #eaf9ff; box-shadow: 0 0 10px rgba(0, 242, 254, 0.8); cursor: pointer;
+}
+#inject-out, #zoom-out {
   font-family: var(--mono); font-size: 12px; min-width: 52px; text-align: right; color: var(--core);
 }
+/* 缩放组：滑条 + 快捷档同排，滑条吃掉剩余宽度，档位紧凑不换行 */
+#zoom-range { max-width: 260px; }
+#seg-zoom button { padding: 6px 8px; }
+#seg-zoom button em { margin-left: 4px; }
 .btn {
   background: rgba(15, 23, 42, 0.8); border: 1px solid var(--line); border-radius: 8px;
   padding: 8px 14px; font-size: 11.5px; color: var(--dim); cursor: pointer; transition: 0.18s;

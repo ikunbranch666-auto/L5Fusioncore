@@ -121,7 +121,8 @@
         <li><label><input type="checkbox" data-layer="particles" checked /> 粒子（能量环粒子流）</label></li>
         <li><label><input type="checkbox" data-layer="ambient" checked /> 能量粒子（吸附 / 冷却）</label></li>
         <li><label><input type="checkbox" data-layer="fieldGlow" checked /> 场辉（约束场辉光板）</label></li>
-        <li><label><input type="checkbox" data-layer="cage" checked /> 线框（诊断骨架）</label></li>
+        <li><label><input type="checkbox" data-layer="rods" /> 棱线光导管（核心 30 棱实体管 · 默认关）</label></li>
+        <li><label><input type="checkbox" data-layer="cage" /> 线框（诊断骨架 · 默认关）</label></li>
         <li class="locked"><label><input type="checkbox" checked disabled /> 基准面（旋转基准 · 常显）</label></li>
       </ul>
     </div>
@@ -276,13 +277,18 @@
       </div>
     </div>
 
-    <div class="dock-group">
-      <span class="dock-label">视口缩放</span>
+    <div class="dock-group grow">
+      <span class="dock-label">视口缩放 zoom（0.50× ~ 20.00× ｜ Q/E 缩放一档，R 复位）</span>
+      <div class="inject">
+        <input type="range" id="zoom-range" min="0.5" max="20" step="0.05" value="2.5" />
+        <output id="zoom-out">2.50×</output>
+      </div>
       <div class="seg" id="seg-zoom">
         <button data-zoom="1">1.00×<em>规格</em></button>
-        <button data-zoom="2">2.00×</button>
         <button data-zoom="2.5" class="is-active">2.50×</button>
-        <button data-zoom="4">4.00×</button>
+        <button data-zoom="6">6.00×</button>
+        <button data-zoom="12">12.00×</button>
+        <button data-zoom="20">20.00×<em>近景</em></button>
       </div>
     </div>
 

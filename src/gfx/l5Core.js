@@ -27,7 +27,7 @@
  */
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
-import { buildFaceFragments } from './dodecaKit.js';
+import { buildFaceFragments, buildFaceFracturePlan } from './dodecaKit.js';
 
 export const R_CORE = 0.8;      // 5.6.1 内层外接半径
 export const R_SHELL_OUT = 1.0; // 附录 B.7 外层外接半径
@@ -92,6 +92,17 @@ export const FRAG_RET_TIMEOUT = 2.2;
 /** v5.13d：能量掉下阈值后，**最多**冻结收拢这么久就开始降（用户：等半秒不到就回落） */
 export const FRAG_RET_HOLD = 0.45;
 
+/* —— v5.19：首次转动的排期（修"所有面同时转动一次"）——
+ * 根因（探针 g16a 实测）：grp.nextAt 是**绝对时刻**，而能量 <80 期间转动触发条件
+ * 根本不参与判定，nextAt 就一直停在很久以前的值（实测 1.79~3.79，而展开到位时
+ * simTime 已到 6.48）。于是 d 一越过 0.98，12 个面全部满足 simTime >= nextAt
+ * → 同一帧一起转（实测 12 个面首次激活时刻全是 6.48，spread = 0）。
+ * 修正：在"刚具备资格"的上升沿按**当前时刻**重新排期。
+ * · ROT_FIRST_DELAY_BASE：展开到位后最短等多久才允许转（留出"刚升起来"的读秒）；
+ * · ROT_FIRST_STAGGER：12 个面首次转动摊开的窗口（分层随机分槽，不是纯随机）。 */
+export const ROT_FIRST_DELAY_BASE = 0.30;
+export const ROT_FIRST_STAGGER = 2.60;
+
 /** v5.7：能量越过 DEPLOY_START 后，环状雾带的成形动画时长（秒，固定值） */
 export const RING_FORM_DUR = 1.0;
 
@@ -113,7 +124,23 @@ export const SHELL_FORM_DUR = 0.75;
 /** 水晶壳前沿的软边宽度（半径占比）与推进缓动指数：1.35 次幂 → 面内可见时长占 63% */
 export const SHELL_FORM_SOFT = 0.14;
 /** 水晶壳前沿自带的一道"脉冲亮边"增益（渐显是"脉冲"，不是单纯淡入） */
-export const SHELL_FORM_EDGE = 0.90;
+export const SHELL_FORM_EDGE = 2.00;
+/* v5.21：**前沿脉冲线的周长补偿** —— 修"脉冲线都到达边缘的时候亮度叠加会闪一下"。
+ * crystalBand 是逐像素固定峰值 1.0，而折线的**屏幕弧长 ∝ 前沿半径**（面心处几乎是一个点，
+ * 五边形边界处是整圈周长）。于是总光通量随前沿线性增长 → 到边缘时最亮 → 一次过冲闪光，
+ * 越过 bloom 阈值 1.0 还会把整面糊白（与 v5.20"过曝糊成一团"同一根因）。
+ * 补偿后单位长度增益 = 1/(1 + SHELL_ARC_COMP * front01)：front=0 → 1.00，front=1 → 1/(1+C)。
+ * 1.15 → 边缘处单位亮度降到 46%，全程总光通量基本持平。 */
+export const SHELL_ARC_COMP = 1.15;
+/* v5.21：**断裂侧壁在 u_deploy=0 时的反光下限** ——
+ * 渐显渐隐（u_shell_form 0→1）整段都发生在 u_deploy=0，而断口反光项原来乘了 u_deploy
+ * → 侧壁被乘成 0，晶体板只剩一个没有厚度的平面五边形。
+ * 用户原话："你现在渐显渐隐过程中画的两个面中间我没有看到任何侧壁"。
+ * 0.55 = 内部裂纹侧壁的常驻档（压住 v5.5 修掉的"低能态暗轮廓线"）；
+ * 外圈侧壁另有 1.7 的加成（见片元里 wallOuter），读作五棱柱真正的柱面。 */
+export const WALL_AMP_FLOOR = 0.55;
+/** v5.21：侧壁显现门控 wallVis 的下限（原 smoothstep(0.02,0.30,u_deploy) 在渐显段恒为 0） */
+export const WALL_VIS_FLOOR = 0.60;
 /* —— Round G：面内径向「脉冲环 + 半隐扩散」——*
  * ★ v5.16 重构（用户明确指出：这些行为都该在**基准面**上，不该在水晶碎块上）：
  *   原实现把三种触发全部做在 285 片水晶碎块的材质上（_writeFaceRev 只写碎片 uniform），
@@ -146,7 +173,7 @@ export const HIT_FRAG_GAP = 0.9;
 /** 命中脉冲线的高亮增益（线很细，可以给得比面级环高一点） */
 /* v5.18：0.62 → 1.05 —— 线宽砍到 0.024·u_hitR（原 0.055）后总光通量下降，
  * 用峰值补回，保证"更细但更锐"而不是"更细也更暗"。 */
-export const HIT_LINE_GAIN = 1.05;
+export const HIT_LINE_GAIN = 2.10;
 /** 只有 radialN ≥ 此值的碎片才进撞击捕集池 —— "粒子只会打在最外面一圈的碎片上" */
 export const HIT_OUTER_RADIAL = 0.86;
 
@@ -169,12 +196,100 @@ export const HIT_OUTER_RADIAL = 0.86;
  *   ～ 水晶碎块开始升起的时间"。碎块那段 = SEAM_BURST_DUR(0.72s) → 取 0.42s，
  *   与爆发**并发**起跑，基准面先扫完，碎块才升起。 */
 export const BASE_PULSE_DUR = 0.42;
+
+/* —— v5.19：撞击队列（用户定标）——
+ * 用户原话："保证每个水晶碎块面的最外围一圈碎片，在转动间隔时间内至少各被打中一次
+ *   （不能固定击打顺序，可以每个转动间隔内随机一个 n+1 ~ n+2 长度的队列
+ *   （n 为每个面最外围一圈碎片个数），将最外围的所有碎片先随机各排列一个到队列的
+ *   随机位置，空位继续随机碎片，这样能保证间隔内一定都各被击中一次）"
+ * · HIT_QUEUE_MIN_SPAN：排期窗口的最短跨度（防止 nextAt 太近导致队列挤成一团）；
+ * · HIT_QUEUE_EXTRA_*：队列长度 = n + 1 ~ n + 2（多出来的 1~2 个是"重复命中"，
+ *   让节奏不机械 —— 每片至少一次，少数片被击中两次）。 */
+/* —— v5.19：储能态能量粒子流 ——
+ * · CHARGE_PER_FRAG：每片的能量粒子数。相位按 2π/K 均分 → "**规律**流动"；
+ * · CHARGE_OMEGA：环流角速度（rad/s），匀速 → 读作有组织的能量环流；
+ * · CHARGE_RADIUS_LO/HI：轨道半径（× 片包围半径 boundR）。必须 <1，粒子才在片内；
+ * · CHARGE_MIN_STORED：进入储能态所需的最少命中次数（1 = 打中一次就亮）。 */
+export const CHARGE_PER_FRAG = 3;
+export const CHARGE_OMEGA = 2.2;
+export const CHARGE_RADIUS_LO = 0.38;
+export const CHARGE_RADIUS_HI = 0.72;
+export const CHARGE_MIN_STORED = 1;
+
+export const HIT_QUEUE_MIN_SPAN = 1.10;
+export const HIT_QUEUE_EXTRA_MIN = 1;
+export const HIT_QUEUE_EXTRA_MAX = 2;
+
+/* ==================== v5.20：脉冲柱面（真正的立体侧壁） ====================
+ * 用户原话（v5.19）：「脉冲线往下打出的两个面之间的**柱面**现在和上下两个面完全一样，
+ *   或者我猜你根本没有画这个柱面……只能看出上下两个面，并且两个面还会互相遮挡，
+ *   根本看不出上下关系，加上柱面会好很多，同时**柱面的颜色就和脉冲线颜色一样**，
+ *   因为本质是这个柱面在向外扩张，柱面内是水晶材质。」
+ * 用户原话（v5.20）：「柱面还是没有显现。我怀疑你把柱面加到了**那个贴片上面的那个面**上，
+ *   而不是**上下两个五边形脉冲面之间**的那个柱面上。」→ **用户判断完全正确**。
+ *
+ * 根因（读几何代码定案）：
+ *   · 晶体板本身是**实体**：`dodecaKit.js` 里 CRYST_Z0 = −0.012、CRYST_Z1 = +0.018
+ *     → 每面是一块厚 0.030 的五边形板（顶面/底面/4 面断裂侧壁）。
+ *     "上下两个五边形脉冲面" = **这块板的上表面与下表面**。
+ *   · 而 v5.19 我把"柱面"写成了 `crystalWall(sdShell, 0.045)` —— 那是**面内的一道环带**
+ *     （sdShell 是面内归一化半径），所以它必然跟顶面处在**同一个平面**上 →
+ *     用户看到的就是"和上下两个面完全一样"，一点立体感都没有。
+ *   · 结论：柱面**必须是真实几何**——面内色带无论怎么调都不可能产生"上下关系"，
+ *     因为深度信息只存在于几何里，不存在于同一个 fragment 的着色里。
+ *
+ * 做法：每个面一根**五边形管**（CylinderGeometry，5 边、无端盖），
+ *   · 轴向 = 该面法线；
+ *   · 半径 = 该面五边形外接半径 × COLUMN_R_GAIN（与板边缘对齐）；
+ *   · 下沿钉在**基准面**（R_SHELL_IN，含 u_lift 抬升），
+ *     上沿钉在**晶体板顶面**（面半径 + 板自身抬升 off + CRYST_Z1），
+ *     高度随"板上升 + 基准面抬升"一起长 → 板越高、柱面越高（"柱面在向外扩张"）；
+ *   · 颜色 = 脉冲线颜色（与 shellPulseCol 同源），更暗（侧壁受光少）→ 亮顶面 + 同色暗侧壁
+ *     = 读得出"这是一个有厚度的体"；
+ *   · 用 DoubleSide + 加色，正反两面都发光（管是开口的，只能看到侧壁）。
+ * 为什么用真实几何而不是继续在 shader 里画：**遮挡关系只能由深度缓冲产生**。
+ *   顶面能挡住柱面、柱面能挡住背面的柱面 —— 这是"上下关系"的唯一来源。 */
+export const COLUMN_R_GAIN = 1.000;   // 柱面半径 = 该面五边形外接半径 × 此值（与板边缘齐平）
+/* 柱面管朝向的基准轴：CylinderGeometry 经 rotateX(π/2) 后轴为局部 +Z。
+ * 逐帧要把它转到该面的法线方向 —— 用 quaternion.setFromUnitVectors(+Z, normal)。
+ * 放模块级常量（类方法体里的方法名不是可访问标识符，写成 updatePulseColumns._z 会 ReferenceError）。 */
+const COL_AXIS_Z = new THREE.Vector3(0, 0, 1);
+/* ★ 必须 > 1：实测（隔离探针）柱面半径取 0.995（与板轮廓重合）时，
+ *   柱面的侧壁与晶体板的**轮廓完全共面** → 板把它整个盖住，合成画面里 Δ≈0.0001 = 看不见。
+ *   取 1.03 让侧壁比板边缘**多露 3%** → 任何视角都能看到一条厚度边。 */
+/* v5.21c：1.45 → **0.85**，并配 COLUMN_H0 / COLUMN_H_COMP 做柱高归一。
+ * 1.45 是在"看不到侧壁"时拍出来的；后来发现真因是**朝向 bug**（见 updatePulseColumns），
+ * 朝向修好之后 1.45 就过头了 —— 展开时 12 根加色管一起变长，直接"超新星爆发"。
+ * 现在口径：静止态 0.85（读得出是壁、不越 bloom 阈值），展开态由高度归一压回去。 */
+export const COLUMN_GAIN = 0.85;      // 柱面亮度（相对脉冲线峰值）
+/** 静止态柱高（= R_SHELL_IN→板顶 的自然间隙），柱高归一的基准 */
+export const COLUMN_H0 = 0.038;
+/** 柱高归一系数：超出基准的高按 1/(1 + k·超量) 收回单位亮度（1.10 → 满展开约剩 0.18） */
+export const COLUMN_H_COMP = 1.10;
+export const COLUMN_MIN_H = 0.0;      // v5.20b：不再兜底 —— 柱高**就是**线框划定的壁厚，不做人为放大
+export const PLATE_LIFT0 = 0.0;       // v5.20b：**保留为 0 且不再使用**（见下方说明）
+/* ★★ v5.20b：**整个"浮起高度"概念被用户否决并删除**。
+ *   用户原话："为什么要推开，水晶面底部正好和基准面贴合，只有上面和基准面有一定距离，
+ *     就是线框划定的厚度。现在直接就是在现线框框定的厚度的外面推离，然后再画两个面，
+ *     这不搞笑吗。"
+ *   教训（已写入 skill §75）：新增位移量必须与既有位移一起算峰值；更根本的是 ——
+ *   **不要为了"造出"一个效果而凭空加位移**。板底面本来就在基准面上，
+ *   厚度是 R_SHELL_IN → R_SHELL_OUT 那一层壁（= 线框划定的厚度），
+ *   柱面只是这层壁**本来就有的侧壁**，把它画出来即可。
+ *   值保留为 0：`off` 里已不再引用它，仅作历史记录。 */
+/* ★★ 这是让柱面**看得见**的关键（实测三轮才定案）：
+ *   柱面的侧壁与晶体板轮廓共面时，板会在屏幕空间把它完全盖住 ——
+ *   gain 拉到 8.0、半径放大到 1.03，合成画面里 Δmean 依然只有 ±0.0001（隔离视图 P2 却清清楚楚）。
+ *   根因：晶体板用预乘混合（dst 乘 1−alpha，alpha 高到 0.92），任何与它共面/在其后的层都被乘掉。
+ *   要让"上下两个五边形脉冲面之间的柱面"真的看得见，两个面必须**真的分开** ——
+ *   故给晶体块一个浮起高度：板在上、基准面在下，中间的空隙由柱面填满且**四面可见**。 */
+export const COLUMN_TOP_FADE = 0.30;  // 顶沿渐隐比例（0=硬边；越大越像从板底漫出来的光）
 /** 面间错相占用的行程比例：0.35 → 各面起跑错开 0.147s，但都在 BASE_PULSE_DUR 内扫完 */
 export const BASE_FACE_STAGGER = 0.35;
 /* v5.18：基准面擦除环（= 用户说的"渐隐渐显脉冲线"）同步收细 ——
  * 半宽 0.038 → 0.018（显著区从 ≈0.09 半径收到 ≈0.043），增益 0.30 → 0.52 补回峰值。
  * 依据：用户"撞击和渐隐渐显的脉冲线宽度都过于大了，完全不符合精细、科技感的要求"。 */
-export const BASE_RING_SIGMA = 0.018;
+export const BASE_RING_SIGMA = 0.011;
 export const BASE_RING_GAIN = 0.52;
 /** 擦除前沿的软边（半径占比）与推进缓动指数 */
 export const BASE_WIPE_SOFT = 0.16;
@@ -466,7 +581,12 @@ uniform float u_base_boost;          // v5.17：幽灵态下的结构线亮度�
  * 改 JS 常量时必须同步改这里（GLSL 读不到 JS 的 export）。
  * 只用在不需探针 A/B 的地方；需要 A/B 的一律走 uniform（如 u_seam_glow_fade）。 */
 #define SHELL_FORM_SOFT  0.14   // 水晶壳渐显前沿的软边（半径占比）
-#define SHELL_FORM_EDGE  0.90   // 水晶壳渐显前沿自带的脉冲亮边增益
+#define SHELL_FORM_EDGE  2.00   // 水晶壳渐显前沿自带的脉冲亮边增益（v5.20：线 0.006 太细被抗锯齿抹暗 → 线放到 0.009 + 峰值再补）
+/* v5.21：与 JS 侧 SHELL_ARC_COMP / WALL_AMP_FLOOR / WALL_VIS_FLOOR 一一对应（改 JS 需同步改这里）。
+ * SHELL_ARC_COMP = 前沿折线的周长补偿，防"到达边缘时闪一下"（详见 JS 侧同名常量注释）。 */
+#define SHELL_ARC_COMP   1.15
+#define WALL_AMP_FLOOR   0.55   // 断口侧壁在 u_deploy=0 时的反光下限
+#define WALL_VIS_FLOOR   0.60   // 侧壁显现门控 wallVis 的下限
 /* v5.18：数据流拖尾（冰蓝粒子方格细流）。
  * 增益走 **uniform u_data_trail**（JS 侧 DATA_TRAIL_GAIN=0.35），不用 #define ——
  * 这样探针能消融验证"拖尾到底画出来没有"，后续也能直接调，不需要镜像两份常量。
@@ -476,7 +596,7 @@ uniform float u_base_boost;          // v5.17：幽灵态下的结构线亮度�
 #define SHELL_FORM_END   1.35   // 前沿终点（>1 = 越过五边形边界）
 #define SHELL_FORM_START -0.20  // 前沿起点（<0 → u_shell_form=0 时整壳完全不显示）
 /* v5.18：0.038 → 0.018（与 JS export BASE_RING_SIGMA 镜像，改一边必须改另一边） */
-#define BASE_RING_SIGMA  0.018  // 基准面细线环的高斯半宽（"极薄"）
+#define BASE_RING_SIGMA  0.011  // 基准面细线环的高斯半宽（"极薄"）
 #define BASE_WIPE_SOFT   0.16   // 基准面擦除前沿软边
 #define BASE_WIPE_JIT    0.10   // 擦除前沿的方位不规则扰动
 #define BASE_WIPE_END    1.35
@@ -485,9 +605,23 @@ uniform float u_base_boost;          // v5.17：幽灵态下的结构线亮度�
 #define BASE_FACE_STAGGER 0.35  // 12 面起跑错相占用的行程比例
 /* v5.17：核心透屏 —— 闭合态把热封在壳内（防"面心白团"），展开态核心暴露 → 炽亮。
  * 方向由"随展开变暗"改为"随展开变亮"（用户本轮报的高能态变暗根因）。 */
+/* ★★ v5.21c：这两个因子原来是**相乘**的，叠起来 ×2.465 → 满能量核心糊成一坨白。
+ * 用户原话："嗯对，所以我又把能量调到1，然后又看见了这坨屎。"
+ * 教训与 skill §75（"新增位移量之前必须核对与既有位移的叠加总量"）**同一类错误**：
+ *   v5.17 为修"能量>80 核心太暗"把 CONTAIN_HI 从 0.14 翻到 1.45；
+ *   后来又加了独立的高能曝光 EXPOSE_HI = 1.70 —— 两个都是"调亮"，没人核对乘积。
+ * 现在把**总量**当唯一口径来定：闭合 0.22 → 满能量 1.15（≈ ×5.2，v5.17 的"太暗"仍然修好），
+ * 而不再是 ×2.465。以后要再调亮/调暗，改的是这个**乘积**，不要再各改一个。 */
 #define CORE_CONTAIN_LO  0.22   // 闭合态（_deploy=0）：把热封在壳内，防"每个面心白团"
-#define CORE_CONTAIN_HI  1.45   // 展开态（_deploy=1）：核心暴露 → 炽亮（旧值 0.14，方向是反的）
-#define CORE_EXPOSE_HI   1.70   // p≥1.0 时的额外曝光（p≤0.70 时为 1.0）
+#define CORE_CONTAIN_HI  1.00   // 展开态（_deploy=1）：核心暴露 → 提亮（原 1.45）
+#define CORE_EXPOSE_HI   1.15   // p≥1.0 时的额外曝光（p≤0.70 时为 1.0；原 1.70）
+/* v5.21c：核心亮度上限改为**软拐点**。
+ * 原来是 "if (_lc > 2.6) c *= 2.6/_lc;" —— 硬钳会把所有越界像素压成**同一个值**
+ * （2.6 的平板），相对结构在这一步就被抹平，再经 bloom 就是一张均匀白盘 = 用户说的"一坨"。
+ * 软压保留亮度**序关系**（2.0 与 4.0 仍映射到不同值）→ 只有最亮的丝越过 bloom 阈值，
+ * 湍流结构活得下来。渐近峰值 = CORE_KNEE + CORE_HEAD = 1.70。 */
+#define CORE_KNEE   0.95        // 软拐点：此亮度以下不动
+#define CORE_HEAD   0.75        // 拐点以上的压缩头room（渐近上限 1.70）
 /* 调参口径（探针 l5-verify/probe_g14.cjs 的 D2_coreIsolated）：
  *   _deploy=1 且隐藏碎块时，画面中心区亮度 mean ≈ 0.36（0.62/1.40 档）
  *   → 0.74/1.55 档约为 ×1.42。另有 ?tk_core=<v> 可直接改 u_plasma_gain 现场试。 */
@@ -777,8 +911,20 @@ void main() {
      * fbm 云团 + 面内径向衰减 + 慢呼吸；能量越高越亮。加色层不吃凹凸/裂缝细节，
      * 那些是本体层的职责 —— 两层叠加才有"晶体里透出光"的纵深。 */
     if (u_core_layer > 0.5) {
-      vec3 np2 = vObjPos * 4.3 + vec3(u_time * 0.11, -u_time * 0.17, u_time * 0.07);
-      float neb2 = smoothstep(0.18, 0.92, fbm3(np2));
+      /* ★★ v5.19：整个水晶壳体的白雾**已删除** ★★
+       * 用户原话："白雾和整个系统都很割裂，这个构造体是由精密粒子和水晶面组成的，
+       *   白雾会带来混乱、雾蒙蒙的感觉，请删掉整个水晶壳体的白雾，换一种水晶发光效果。"
+       * 历代实测：这一层从 v5.3 起就是"体内冷光"，为治"面心白团"被压成**均匀毯子**
+       *   （g15c 消融：Δmean 0.0318 / 均匀度 3.11，而轮廓线只有 0.0072 / 11.6），
+       *   v5.18 改成丝状脉络后降到 0.0077 / 9.94 —— 但用户判定：脉络也还是雾。
+       * 结论：**任何基于低频 fbm 的体内加色都会读作雾**。故彻底弃用 fbm 云团。
+       *
+       * 换成的"水晶发光"= **棱面冷光**：
+       *   裂片几何是**非索引 + computeVertexNormals()** → vNormalWorld 在**每个三角面内
+       *   是常量** → dot(棱面法线, 主光) 是逐棱面常量 → 每个小棱面各自亮一档。
+       *   于是发光跟着晶体的**真实棱面**走（硬边、锐利、随转动跳变），
+       *   而不是一团浮在体内的雾 —— 这才是"水晶面在发光"。 */
+      float facet = pow(clamp(dot(normalize(vNormalWorld), normalize(KEY_LIGHT_DIR)), 0.0, 1.0), 1.6);
       float rad2 = length(vObjPos);
       float fall = smoothstep(u_face_apothem * 1.10, 0.0, rad2);
       /* Round G（R1 修复，实测定位）：这一层就是"面心白团 + 周期往外扩散"的主犯之一。
@@ -809,21 +955,21 @@ void main() {
        *        → 有亮丝、也有**真正的空隙**；
        *     ② 再叠一层更高频的细丝，让冷光读作"封在晶体里的能量脉络"而不是雾；
        *     ③ alpha 跟着结构走（空隙处真正透空），不再是常驻 0.60。 */
-      /* CORE_STRUCT_K：结构窗口的整体下移量。窗口下移 → 典型值进入窗口 → 冷光回来；
-       * 但窗口**宽度不变** → 高对比依旧（有亮丝也有真空隙），不会退回均匀毯子。
-       * 这是唯一需要实测扫的旋钮（见探针 g15e）：neb2 的典型值约 0.45，
-       * 窗口起点 0.42 会把典型值压在窗口底部 → 冷光几乎消失，必须下调起点。 */
-      float veins = smoothstep(0.42 - u_core_struct_k, 0.88 - u_core_struct_k, neb2);
-      float fine  = smoothstep(0.50 - u_core_struct_k, 0.92 - u_core_struct_k,
-                               fbm3(np2 * 2.7 + vec3(11.3, 5.1, 19.7)));
-      float structC = veins * (0.30 + 0.70 * fine);
+      /* 棱面冷光 = 棱面明暗 × 边缘菲涅尔。
+       * · facet：逐棱面常量 → 硬边、随齿轮转动**跳变**（水晶的"活光"）；
+       * · facing：视线掠射处更亮 → 读作棱边透光，而不是体内泛白；
+       * · 两者相乘且**没有均匀的常数底** → 一定存在暗棱面，不可能糊成一片。 */
+      float rimC  = pow(1.0 - facing, 2.2);
+      float glowC = (0.30 + 0.70 * facet) * (0.40 + 0.60 * rimC);
       vec3 coreCol = vec3(0.36, 0.54, 0.80) * 0.92;
-      vec3 cCore = coreCol * structC * breath * gate
+      vec3 cCore = coreCol * glowC * breath * gate
                  * (0.30 + 0.70 * pC) * (0.35 + 0.65 * eN)
                  * (0.55 + 0.45 * fall);
       // 断裂侧壁与本体层同步：闭合态隐藏（否则加色侧壁会在裂缝处印出亮线）
       float wallVisC = smoothstep(0.02, 0.30, u_deploy);
-      float aC = mix(0.08, 0.46, structC) * mix(1.0, wallVisC, vWall);
+      /* alpha 也跟着棱面结构走 —— 暗棱面处真正透空，不再有常驻的不透明毯子。
+       * 峰值 0.30（原 0.60 的一半）→ 即便最亮处也不会把背后的轮廓线冲掉。 */
+      float aC = 0.30 * glowC * mix(1.0, wallVisC, vWall);
       gl_FragColor = vec4(cCore * u_core_gain * mix(1.0, wallVisC, vWall), aC);
       return;
     }
@@ -1016,19 +1162,37 @@ void main() {
         float _slc = max(max(c.r, c.g), c.b);
         if (_slc > 0.85) c *= 0.85 / _slc;
       }
+      /* v5.19：白雾删除 + 用户定标"35-80 阶段的轮廓线太淡、脉冲高亮不明显"
+       * → 底线幅度 (0.26+0.09·pC) → (0.46+0.20·pC)，脉冲 0.60 → 1.05。
+       * 之所以现在才敢提亮：以前提亮会被白雾的均匀底噪吃掉（抬的是底噪不是线），
+       * 现在底噪没了，提的每一分都落在**线上**，对比度直接转化成"看得清"。 */
       c += mix(u_emissive_color * 1.25, tint, 0.42)
          * pow(seamEdge, 2.2) * mix(0.92, 1.12, vRim)
-         * (0.26 + 0.09 * pC) * (0.65 + 0.35 * lambert) * appear
+         * (0.46 + 0.20 * pC) * (0.65 + 0.35 * lambert) * appear
          * u_crack_mul * u_seam_amp
          * (filled * 0.95 + head * 1.5)
          /* 轮廓线循环脉冲（20–80 能量区间，沿轮廓由内向外扩散；幅度受控，不糊面） */
-         + pulseCol * pow(seamEdge, 1.8) * mix(0.90, 1.0, vRim) * pulse * 0.60 * u_pulse_gain * u_pulse_gate
+         + pulseCol * pow(seamEdge, 1.8) * mix(0.90, 1.0, vRim) * pulse * 1.05 * u_pulse_gain * u_pulse_gate
          /* ③ 0.80 爆发 —— 铺满全部轮廓线后的整体高亮；靠覆盖面积而非单点亮度读作事件。 */
          + pulseCol * pow(seamEdge, 1.8) * mix(0.75, 1.0, vRim) * bInst * 1.05;
       // 断口（断裂侧壁）在展开后要有自己的反光，否则侧面一片死黑；
       // v5.6：反光荣用**能量色**一半 —— 断口被机器自身的光照亮 → 把水晶缝进场景。
+      /* v5.21：断口反光**不再随 u_deploy 归零**。
+       * 用户原话："你现在渐显渐隐过程中画的两个面中间我没有看到任何侧壁。"
+       * 根因：渐显渐隐（u_shell_form 0→1）全程 u_deploy=0，而这里原来乘了 u_deploy
+       * → 侧壁唯一专属的照明项被乘成 0；下面的 wallVis 同样在 u_deploy=0 时为 0，
+       * 又把侧壁的 c 与 alpha 一起抹掉。两道门控叠加 = 晶体板只剩一个没有厚度的平面
+       * 五边形 —— 正是示意图里那个五棱柱缺掉的侧壁。
+       * 修法：① 断口反光给下限 WALL_AMP_FLOOR（下面 wallVis 同步给 WALL_VIS_FLOOR）；
+       *       ② 只有落在**五边形外边界**上的侧壁才读作"棱柱的柱面" —— 内部裂纹侧壁
+       *          若同样提亮，会在每条裂缝上印出描边（v5.5 已经修掉的老问题）。
+       *          用面内归一化半径 vCrackUV.x 挑出外圈侧壁，单独加成 wallOuter。 */
+      float wallOuter = vWall * smoothstep(0.86, 0.99, vCrackUV.x);
       c += mix(vec3(0.85, 0.92, 1.0), frost, 0.35)
-         * pow(1.0 - ndv, 3.0) * 0.15 * u_deploy * u_crack_mul * u_wall_amp;
+         * pow(1.0 - ndv, 3.0) * 0.15
+         * mix(WALL_AMP_FLOOR + 1.7 * wallOuter, 1.0 + 0.9 * wallOuter,
+              smoothstep(0.0, 0.30, u_deploy))
+         * u_crack_mul * u_wall_amp;
       // v5.6 融合项：轮廓边光用能量色 —— 经典"边缘光把物体缝进环境"手法。
       // 强度压在"染色"而不是"发光"档：过强会把水晶和构造体一起冲进白区（实测翻车）。
       c += u_emissive_color * pow(1.0 - ndv, 3.5) * (0.10 + 0.20 * pC) * (0.40 + 0.25 * u_deploy);   // 恢复边光能量色（结构冷、能量暖）
@@ -1057,28 +1221,53 @@ void main() {
       float sdShell = crystalLineSDF(rt, azF, shellFront, vShard * 3.1, 0.055, 0.020);
       // 前沿判定：几乎硬边（±0.012 抗锯齿）—— 不再是 ±0.14 的软过渡（那正是"雾气"来源）
       float shellVis = smoothstep(0.012, -0.012, sdShell);
-      /* 顶面亮折线（脉冲线本体）：v5.18 窄带 0.022 → **0.011**。
-       * 用户："撞击和渐隐渐显的脉冲线宽度都过于大了，完全不符合精细、科技感的要求。"
-       * 线变细会掉总光通量 → 同步把 SHELL_FORM_EDGE 从 0.55 提到 0.90 补回峰值，
-       * 结果是"更细但更锐"，而不是"更细也更暗"。 */
-      float shellLine = crystalBand(sdShell, 0.011)
-        * smoothstep(0.03, 0.14, u_shell_form) * (1.0 - smoothstep(0.80, 1.0, u_shell_form));
-      /* v5.18：往内的数据流拖尾。内侧 = 面心方向 = sdShell < 0 的那一侧，
-       * 即"已经被前沿扫过"的区域 —— 读作数据在往回流。 */
-      float shellTrail = dataTrail(-sdShell, azF * 2.5, 0.055, 0.50, vShard * 9.1, 0.26, DATA_TRAIL_DUTY)
-        * smoothstep(0.03, 0.14, u_shell_form) * (1.0 - smoothstep(0.80, 1.0, u_shell_form));
-      /* 柱体感：紧贴线**之后**一条 ~0.045 半径的侧壁暗带。
-       * 亮折线（顶面）+ 暗带（侧壁）+ 已扫过的块体 → 读作"从基准面立起来的柱体"，
-       * 而不是一层浮在面上的软光。 */
-      float shellWall = crystalWall(sdShell, 0.045);
+      /* 顶面亮折线（脉冲线本体）：v5.18 0.022→0.011，**v5.19 再收到 0.006**。
+       * 用户两轮都在说太粗："宽度都过于大了，完全不符合精细、科技感的要求"、
+       * "还是过粗了……一定要细，这样才能显现出脉冲线精密地覆盖整个面的效果"。
+       * 线变细会掉总光通量 → 峰值由 SHELL_FORM_EDGE 补（0.55→0.90→**1.35**），
+       * 保证"更细但更锐"，而不是"更细也更暗"。 */
+      /* v5.21：修「脉冲线都到达边缘的时候亮度叠加会闪一下」。三个叠加成因逐个堵：
+       *  ① **周长效应**（主因）：crystalBand 是逐像素固定峰值 1.0，而折线的屏幕弧长
+       *     ∝ 前沿半径 —— 面心处几乎是一个点、五边形边界处是整圈周长。于是总光通量
+       *     随前沿线性增长，到边缘时最亮 → 一次过冲闪光；越过 bloom 阈值 1.0 后还会
+       *     把整面糊白（与 v5.20"过曝糊成一团白色"是同一根因）。
+       *     → shellArc 周长补偿：线越长，单位长度增益越低，全程总光通量基本持平。
+       *  ② **退出太晚**：原来按 u_shell_form 收（0.80→1.0），折算成前沿位置是
+       *     front 1.04→1.35 —— 线**已经压到边界上**才开始收，峰值被完整放过才衰减。
+       *     → 改按前沿半径 shellFront 直接收：0.78 起收、1.06 收完（对应
+       *       u_shell_form 0.63→0.81），收在"到达边缘之前"。
+       *  ③ **同像素多段折线堆叠**：jag 折线在 azimuth 上抖得厉害时相邻两段可能落进
+       *     同一像素、crystalBand 的值相加。用 min(.., 1.0) 封顶，单像素峰值恒为 1。 */
+      float shellFront01 = clamp(shellFront, 0.0, 1.0);
+      float shellArc  = 1.0 / (1.0 + SHELL_ARC_COMP * shellFront01);
+      float shellExit = 1.0 - smoothstep(0.78, 1.06, shellFront);
+      float shellLine = min(crystalBand(sdShell, 0.009), 1.0)
+        * smoothstep(0.03, 0.14, u_shell_form) * shellExit;
+      /* v5.18：往内的数据流拖尾。内侧 = 面心方向 = sdShell < 0 的那一侧。
+       * v5.19：方格尺寸 0.055→**0.032**、拖尾长度 0.26→**0.17** —— 用户说"数据细尾本身
+       * 还是过粗了"，细尾要能读作"细流"而不是一片方格地毯。 */
+      /* v5.21：拖尾同样要周长/面积补偿 —— 它铺开的是**面积**（∝ front²），比线更容易
+       * 在"前沿抵达边缘、整个面都被铺满"的那一刻冲到峰值。故按 shellArc² 收（比线更狠），
+       * 读作"数据流随前沿推远而退去"，而不是一张越铺越亮的地毯。同样用 min(..,1.0) 封顶。 */
+      float shellTrail = min(dataTrail(-sdShell, azF * 2.5, 0.032, 0.50, vShard * 9.1, 0.17, DATA_TRAIL_DUTY), 1.0)
+        * smoothstep(0.03, 0.14, u_shell_form) * shellExit * shellArc * shellArc;
+      /* ★ v5.20：这里原来（v5.19）是 float shellWall = crystalWall(sdShell, 0.045);
+       * —— 一个**面内环带**，然后当作"柱面"加色。用户第二轮实测直接指出：
+       *   「柱面还是没有显现。我怀疑你把柱面加到了那个贴片上面的那个面上，
+       *     而不是上下两个五边形脉冲面之间的那个柱面上。」→ 判断全中。
+       * 面内色带与顶面**共面**，永远不可能产生"上下关系"；
+       * 真正的柱面已改为**真实几何**（五边形管，见 _buildPulseColumns / COLUMN_*），
+       * 由深度缓冲负责遮挡 → 这里不再需要任何"假柱面"项。
+       * （保留 shellVis 门控，它管的是"板本身显不显现"。） */
 
       // 闭合态(d≈0)压低 alpha → 透出背后 R=0.96 基准面的五边形轮廓外壳（用户：20–80 能量要看到带轮廓线的外壳）；
       // 展开(d→1)升为实心晶片。碎片 depthWrite=false，基准面先渲染，故透明碎片处轮廓可透出。
       // （closed 已在函数级作用域声明，晶体/基准面两分支共用）
       float alpha = clamp(0.42 + 0.30 * fres + 0.18 * u_deploy, 0.0, 0.92);
       // v5.16：水晶壳渐显前沿 —— c 与 alpha 同乘，未显现处真正不显示
-      // v5.17：再乘柱体侧壁的暗带（顶面亮线在下方单独叠加，不参与这次压暗）
-      c *= shellVis * (1.0 - 0.55 * shellWall);
+      // v5.19：删掉「1 − 0.55·shellWall」的压暗 —— 柱面改为**画出来**（同色带），
+      // 不再靠压暗暗示。柱面在下方单独加色，不受这次门控影响。
+      c *= shellVis;
       alpha *= shellVis;
       // v-new（用户选 A）：闭合态碎片退为半透晶纱 —— 预乘(OneFactor)混合下只降 alpha
       // 不压 c 时颜色仍整强度叠加，基准面五边形轮廓照样被冲掉；必须两者同乘。
@@ -1089,7 +1278,11 @@ void main() {
        * 闭合态相邻片的侧壁严丝合缝地对贴在一起，双面叠加会在每条裂缝处
        * 印出一道暗/亮描边（用户圈出的"低能态暗轮廓线"）。侧壁只在展开后
        * 才有意义（那时它就是碎片的断裂面），因此随 u_deploy 淡入。 */
-      float wallVis = smoothstep(0.02, 0.30, u_deploy);
+      /* v5.21：显现门控也要有下限 —— 原 smoothstep(0.02,0.30,u_deploy) 在渐显渐隐
+       * 全程（u_deploy=0）恒为 0，把侧壁的 c 与 alpha 一起抹成 0。给 WALL_VIS_FLOOR
+       * 后闭合/渐显态侧壁保持可见；内部裂纹侧壁双面贴合的叠加量被压到 0.60 档，
+       * 不会重现 v5.5 修掉的"低能态暗轮廓线"。 */
+      float wallVis = mix(WALL_VIS_FLOOR, 1.0, smoothstep(0.02, 0.30, u_deploy));
       c *= mix(1.0, wallVis, vWall);
       alpha *= mix(1.0, wallVis, vWall);
 
@@ -1133,11 +1326,11 @@ void main() {
                                    0.26 * u_hitR, 0.10 * u_hitR);
         /* v5.18：线宽 0.055·u_hitR → **0.024·u_hitR**（用户："撞击……脉冲线宽度都过于大了"）。
          * 峰值由 HIT_LINE_GAIN 0.62 → 1.05 补回 → 更细但更锐，不是更细也更暗。 */
-        float hLine = crystalBand(hsd, 0.024 * u_hitR)
+        float hLine = crystalBand(hsd, 0.016 * u_hitR)
           * smoothstep(0.0, 0.12, u_hitT) * (1.0 - smoothstep(0.90, 1.0, u_hitT));
         /* v5.18：往内（指向击中点）的数据流拖尾 —— hsd<0 的一侧是线已扫过的区域。 */
-        float hTrail = dataTrail(-hsd, haz * 2.2, 0.070 * u_hitR, 0.62, vShard * 4.7,
-                                 0.55 * u_hitR, DATA_TRAIL_DUTY)
+        float hTrail = dataTrail(-hsd, haz * 2.2, 0.042 * u_hitR, 0.62, vShard * 4.7,
+                                 0.34 * u_hitR, DATA_TRAIL_DUTY)
           * smoothstep(0.0, 0.12, u_hitT) * (1.0 - smoothstep(0.90, 1.0, u_hitT));
         // 前沿接近片边界 → 沿片自身轮廓再醒一道（"碎片形状即脉冲线形状"）
         float hShape = seamEdge * smoothstep(0.45, 0.90, u_hitT) * (1.0 - smoothstep(0.94, 1.0, u_hitT));
@@ -1149,8 +1342,12 @@ void main() {
 
       /* v5.17：水晶壳显现的**顶面亮折线** —— 放在最末尾叠加，避开上面对 c 的乘性压暗
        * （reveal / shellVis / coolShift），保证"脉冲线"本身是干净锐利的细线。 */
-      c += mix(u_emissive_color, vec3(0.82, 0.93, 1.0), 0.45)
-         * shellLine * SHELL_FORM_EDGE * (0.45 + 0.55 * lambert);
+      /* 脉冲线颜色抽出来 —— 柱面必须与顶面**同色**，否则就读成两块不相干的面。 */
+      vec3 shellPulseCol = mix(u_emissive_color, vec3(0.82, 0.93, 1.0), 0.45);
+      /* v5.21：乘上 shellArc（周长补偿） —— 前沿越长单位亮度越低，抹掉到达边缘时的过冲。 */
+      c += shellPulseCol * shellLine * SHELL_FORM_EDGE * shellArc * (0.45 + 0.55 * lambert);
+      /* v5.20：柱面（侧壁）**不在这里画** —— 它是真实几何（见 _buildPulseColumns）。
+       * 面内加色永远只是"同一平面上的第二道亮带"，用户实测两轮都判为"和面一样"。 */
       /* v5.18：冰蓝数据细流 —— 固定冷色，不掺能量色（数据感与主视觉的暖色分族）。 */
       c += vec3(0.42, 0.80, 1.0) * shellTrail * u_data_trail * (0.35 + 0.65 * lambert);
 
@@ -1415,9 +1612,17 @@ void main() {
   vec3 c = plasma * contain * coreExpose;
   c += u_emissive_color * eGainCore * rim * 0.55 * u_plasma_gain * contain * coreExpose;
   c += vec3(1.0) * specP * eGainCore * 0.08 * u_plasma_gain;
-  // 核心亮度上限（防体积核过曝成纯白，保留湍流结构）
+  /* v5.21c：核心亮度上限 —— 硬钳（旧式 if (_lc>2.6) c *= 2.6/_lc，注意旧式那句
+   * 本身写在模板字符串里，注释里绝不能再用反引号包代码 —— 会直接截断 GLSL 字符串）
+   * 换成**软拐点**。
+   * 硬钳把所有越界像素压成同一个值（2.6 的平板），相对结构在这一步就被抹平，
+   * 再经 bloom 就是一张均匀白盘 = 用户说的"这坨屎 / 超新星爆发变成一团白色光团"。
+   * 软压保留亮度序关系 → 只有最亮的湍流丝越过 bloom 阈值，结构活得下来。 */
   float _lc = max(max(c.r, c.g), c.b);
-  if (_lc > 2.6) c *= 2.6 / _lc;
+  if (_lc > CORE_KNEE) {
+    float _k = CORE_KNEE + CORE_HEAD * (1.0 - exp(-(_lc - CORE_KNEE) / CORE_HEAD));
+    c *= _k / _lc;
+  }
   gl_FragColor = vec4(c, 1.0);
 }
 `;
@@ -1879,6 +2084,9 @@ export class L5Core {
     this._fragRingW = [];
     this._faceShards = [];          // Round G：按面索引的裂片表（面级脉冲一次写全这一面）
     for (let k = 0; k < 12; k++) this._faceShards.push([]);
+    /* v5.19：按面索引的**最外圈**碎片表 —— 撞击队列按面组织，
+     * 才能做"每个转动间隔内本面外圈每片至少一次"的保证（全局池做不到）。 */
+    this._faceRing = [];
     let _wAcc = 0, _ringWAcc = 0;
     for (let fi = 0; fi < this.fragments.length; fi++) {
       const f = this.fragments[fi];
@@ -1914,6 +2122,36 @@ export class L5Core {
         }
         f.boundR = Math.sqrt(r2max);
       }
+      /* v5.19（储能粒子流）：预计算**片内正交基** t1/t2（都垂直于面法线）。
+       * 能量粒子要"在水晶里面绕圈"，轨道平面就必须躺在碎片所在的面平面上；
+       * 每帧现算正交基太浪费，且会引入不一致 → 建片时算一次。 */
+      {
+        const nx = f.normal.x, ny = f.normal.y, nz = f.normal.z;
+        let ax = 0, ay = 1, az = 0;
+        if (Math.abs(ny) > 0.9) { ax = 1; ay = 0; az = 0; }
+        let t1x = ay * nz - az * ny, t1y = az * nx - ax * nz, t1z = ax * ny - ay * nx;
+        const l1 = Math.hypot(t1x, t1y, t1z) || 1e-6;
+        t1x /= l1; t1y /= l1; t1z /= l1;
+        const t2x = ny * t1z - nz * t1y, t2y = nz * t1x - nx * t1z, t2z = nx * t1y - ny * t1x;
+        f.t1 = new THREE.Vector3(t1x, t1y, t1z);
+        f.t2 = new THREE.Vector3(t2x, t2y, t2z);
+      }
+      /* v5.19（撞击队列）：预取 3 个**片内**采样点（质心 → 随机顶点 的 35%~85% 处），
+       * 供队列定时发射的命中脉冲当作"击中点"。
+       * 目的：命中点必须**逐次不同**（否则每次都在同一处，一眼假），
+       * 且必须落在片内（否则脉冲覆盖不到整片）。用顶点内插而不是纯随机方向 ——
+       * 后者会落到片外，脉冲半径仍然覆盖，但读起来像"从空气里冒出来的"。 */
+      {
+        f.hitPts = [];
+        for (let s = 0; s < 3; s++) {
+          const k = (Math.random() * pa.count) | 0;
+          const t = 0.35 + Math.random() * 0.50;
+          f.hitPts.push(new THREE.Vector3(
+            f.centroid.x + (pa.getX(k) - f.centroid.x) * t,
+            f.centroid.y + (pa.getY(k) - f.centroid.y) * t,
+            f.centroid.z + (pa.getZ(k) - f.centroid.z) * t));
+        }
+      }
       if (this._faceShards[f.faceIdx]) this._faceShards[f.faceIdx].push(f);
       _wAcc += 0.06 + f.radialN * f.radialN;
       this._fragW.push(_wAcc);
@@ -1924,6 +2162,9 @@ export class L5Core {
         this._fragRingIdx.push(fi);
         _ringWAcc += f.radialN * f.radialN;
         this._fragRingW.push(_ringWAcc);
+        /* v5.19：**按面**分组的外圈池 —— 撞击队列是"每个转动间隔内，本面外圈每片至少
+         * 一次"，所以必须按面组织，全局池做不到"每面各一次"这个保证。 */
+        (this._faceRing[f.faceIdx] ?? (this._faceRing[f.faceIdx] = [])).push(fi);
       }
     }
     /* 兜底：若阈值抬高后池为空（radialN 分布不达预期），退回 0.72，
@@ -2066,18 +2307,55 @@ export class L5Core {
     this._IMPACT_FADE = 0.55;     // v-fix：受击冷光衰减时长（秒）—— 略延长使撞击可读，仍不糊面
     this._faceAbsorbed = new Array(12).fill(0);  // Phase1d：每面吸收粒子之和
     this.buildAmbientParticles();
+    this._buildChargeField();   // v5.19：储能态能量粒子流（依赖 fragments / t1 / t2，须在其后）
 
-
-    this.coreRodMaterial = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(0x00f2fe),
+    /* ---------- v5.20：脉冲柱面（真实几何侧壁） ---------- */
+    this.pulseColumnMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        u_color: { value: new THREE.Color(0.82, 0.93, 1.0) },
+        u_gain: { value: 0.0 }
+      },
+      vertexShader: `
+        varying float vZ;
+        void main() {
+          vZ = uv.y;                       // 0 = 下沿（基准面），1 = 上沿（晶体板顶面）
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }`,
+      fragmentShader: `
+        uniform vec3 u_color;
+        uniform float u_gain;
+        varying float vZ;
+        void main() {
+          /* 顶沿最亮、向下渐隐 —— 读作"从板底漫下来的光"。
+           * 没有任何均匀常数底：越靠近基准面越暗 → 与"雾"彻底分家。 */
+          float g = mix(0.34, 1.0, smoothstep(0.0, 1.0, vZ));
+          g *= smoothstep(0.0, 0.10, vZ);
+          gl_FragColor = vec4(u_color * u_gain * g, 1.0);
+        }`,
       transparent: true,
-      opacity: 0.95,
       depthWrite: false,
+      depthTest: true,
+      side: THREE.DoubleSide,
       blending: THREE.AdditiveBlending
     });
-    this.coreRods = new THREE.Mesh(edgeRods(R_CORE, 0.015), this.coreRodMaterial);
-    this.coreRods.name = 'L5_Rods_Core';
-    this.coreRods.renderOrder = 31;
+    // 每面几何计划（含 e1/e2 面内基、apo、五边形顶点方位、板的 z 范围）
+    this._facePlans = [];
+    for (let fi = 0; fi < 12; fi++) this._facePlans.push(buildFaceFracturePlan(R_SHELL_OUT, fi));
+    this._faceApoUnit = this._facePlans[0] ? this._facePlans[0].apo / R_SHELL_OUT : 0;
+    this._buildPulseColumns();
+
+
+    /* ---------- ★ v5.21e：「棱线光导管」L5_Rods_Core 已**整体移除** ----------
+     * 它原是沿核心正十二面体（R_core = 0.8u）30 条棱铺的加色实体圆柱
+     * （`edgeRods(R_CORE, 0.015)`，管径 0.03u）。历次用户反馈：
+     *   · "这一堆莫名其妙加上去的粗线是什么"（v5.21 全量视角）
+     *   · "我很好奇这些白色的刻线是什么……我记得我从来没要求过这种刻线吧"（只留基准面）
+     *   · "这个光导管已经严重影响视觉效果了"（v5.21e）
+     * 判定：该元素从未在任何一轮定标里被要求，且在 30 棱 + 加色 + 跟随核心微抖动
+     * 的组合下必然读作"与面无关的乱线"。故**不留开关、不留死代码**，整体删除；
+     * 相关引用（材质 / 逐帧颜色驱动 / 抖动跟随 / 层级开关 / dispose）一并清掉。
+     * 若将来真要做"硬表面发光棱"，重做时须：贴在**基准面的棱**上（与外甲对齐）、
+     * 线宽 ≤2px、亮度压在 bloom 阈值以下、且不跟随核心抖动。 */
 
     /* ---------- 约束框骨架：前框 + 后框幽灵 ---------- */
     const cageGeo = new THREE.EdgesGeometry(dodeca(R_SHELL_OUT), 1);
@@ -2105,7 +2383,7 @@ export class L5Core {
     this.cageGhost.renderOrder = 29;
 
     this.group.add(
-      this.coreMesh, this.coreRods,
+      this.coreMesh,
       this.shellInner, ...this.fragments.map((f) => f.mesh),
       this.cage, this.cageGhost
     );
@@ -2230,6 +2508,210 @@ export class L5Core {
     this.group.add(this.ambientTrails);
   }
 
+  /* ==================== v5.19：储能态能量粒子流 ==================== *
+   * 用户原话："粒子撞击水晶碎块后，脉冲覆盖的同时，水晶进入储能态，表现是水晶内有
+   *   能量粒子在规律流动和发光（**需要粒子来模拟能量粒子流**）。"
+   *
+   * 设计要点：
+   *  · 必须是**真实粒子**（Points），不是着色器里的假流动 —— 用户明确点名要粒子；
+   *  · "**规律**流动" = 匀速圆周 + 等分相位（每片 CHARGE_PER_FRAG 颗，相位均分 2π/K）
+   *    → 读作有组织的环流，而不是乱窜的尘埃；
+   *  · 轨道平面 = 碎片所在的**面平面**（法线 = f.normal，片内正交基 t1/t2 预计算），
+   *    再加一点沿法线的起伏 → 粒子真的"在水晶里"，不是贴在表面；
+   *  · 只有被击中过（stored ≥ 1）的片才亮 → 储能态是**逐片**的，不是整个壳一起。 */
+  _buildChargeField() {
+    const K = CHARGE_PER_FRAG;
+    const N = this.fragments.length * K;
+    const g = new THREE.BufferGeometry();
+    const pos = new Float32Array(N * 3);
+    const al = new Float32Array(N);
+    const sz = new Float32Array(N);
+    for (let i = 0; i < N; i++) sz[i] = 1.6 + Math.random() * 1.4;
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('aAlpha', new THREE.BufferAttribute(al, 1));
+    g.setAttribute('aSize', new THREE.BufferAttribute(sz, 1));
+    const m = new THREE.ShaderMaterial({
+      uniforms: {
+        u_time: { value: 0 },
+        u_zoom: { value: 1.0 },
+        u_color: { value: new THREE.Color(0.42, 0.80, 1.0) },  // 冰蓝能量色
+        u_gain: { value: 1.0 }
+      },
+      vertexShader: AMBIENT_VERT,
+      fragmentShader: AMBIENT_FRAG,
+      transparent: true, depthWrite: false, depthTest: false,
+      blending: THREE.AdditiveBlending
+    });
+    this.chargePoints = new THREE.Points(g, m);
+    this.chargePoints.name = 'L5_ChargeFlow';
+    this.chargePoints.frustumCulled = false;
+    this.chargePoints.renderOrder = 41;      // 在碎片之上叠加（碎片 depthWrite=false）
+    this.group.add(this.chargePoints);
+    // 每片一个确定性相位偏移，避免所有片的粒子同步（否则读作"整体一起转"）
+    this._chargePhase = new Float32Array(this.fragments.length);
+    for (let i = 0; i < this.fragments.length; i++) {
+      this._chargePhase[i] = ((i * 0.6180339887) % 1.0) * Math.PI * 2.0;
+    }
+  }
+
+  /** 逐帧推进储能粒子：位置随碎片（平移 + 齿轮自转）走，亮度随储存量渐入。 */
+  updateChargeField(simTime, zoom) {
+    const pts = this.chargePoints;
+    if (!pts) return;
+    const pa = pts.geometry.attributes.position;
+    const aa = pts.geometry.attributes.aAlpha;
+    pts.material.uniforms.u_time.value = simTime;
+    if (zoom) pts.material.uniforms.u_zoom.value = zoom;
+    const K = CHARGE_PER_FRAG;
+    const v = this._cv || (this._cv = new THREE.Vector3());
+    let active = 0;
+    for (let fi = 0; fi < this.fragments.length; fi++) {
+      const f = this.fragments[fi];
+      const st = f.stored || 0;
+      const on = st >= CHARGE_MIN_STORED;
+      if (on) active++;
+      // 亮度随储存量渐入（6 次打满），避免"刚中一发就全亮"
+      const lvl = Math.min(1, st / 6);
+      const bw = f.boundR || 0.05;
+      for (let k = 0; k < K; k++) {
+        const i = fi * K + k;
+        if (!on) { aa.array[i] = 0; continue; }
+        const ang = this._chargePhase[fi] + simTime * CHARGE_OMEGA + k * (Math.PI * 2 / K);
+        const rr = bw * (CHARGE_RADIUS_LO
+          + (CHARGE_RADIUS_HI - CHARGE_RADIUS_LO) * (((fi + k) % 3) / 2));
+        /* 片内坐标 → 世界：先按片自身旋转（齿轮自转），再加上 mesh 位置。
+         * 用 matrixWorld 一步到位最稳（含父级 Group 变换），代价是滞后一帧，不可见。 */
+        v.set(
+          f.centroid.x + f.t1.x * Math.cos(ang) * rr + f.t2.x * Math.sin(ang) * rr
+            + f.normal.x * Math.sin(ang * 2.0) * bw * 0.14,
+          f.centroid.y + f.t1.y * Math.cos(ang) * rr + f.t2.y * Math.sin(ang) * rr
+            + f.normal.y * Math.sin(ang * 2.0) * bw * 0.14,
+          f.centroid.z + f.t1.z * Math.cos(ang) * rr + f.t2.z * Math.sin(ang) * rr
+            + f.normal.z * Math.sin(ang * 2.0) * bw * 0.14
+        );
+        f.mesh.localToWorld(v);
+        pa.array[i * 3] = v.x; pa.array[i * 3 + 1] = v.y; pa.array[i * 3 + 2] = v.z;
+        aa.array[i] = lvl * (0.55 + 0.45 * (k === 0 ? 1 : 0.7));
+      }
+    }
+    pa.needsUpdate = true;
+    aa.needsUpdate = true;
+    this._chargeStats = { active, total: this.fragments.length, gain: 1 };
+  }
+
+  /* ==================== v5.20：脉冲柱面（真实几何的侧壁） ==================== *
+   * 见文件顶部 COLUMN_* 的说明。要点：
+   *  · 每面一根**五边形管**（5 边、无端盖），轴向 = 该面法线；
+   *  · 半径取该面五边形**外接半径**（与晶体板边缘对齐），方位对齐该面第 0 个顶点；
+   *  · 下沿钉在基准面（R_SHELL_IN + u_lift），上沿钉在晶体板顶面
+   *    （R_SHELL_OUT 面半径 + 该面平均抬升 off + CRYST_Z1）→ 高度随板上升而长；
+   *  · 颜色与脉冲线同源（u_emissive_color ↔ 冰蓝的 0.45 混合），更暗 → 亮顶面 + 同色暗侧壁；
+   *  · renderOrder = 30（在基准面 31 / 碎片 32 之前）→ 柱面画在板的**后面**，
+   *    加色合成下读作"板下面的一圈厚度"，而不是糊在板顶面上。 */
+  _buildPulseColumns() {
+    this.pulseColumns = [];
+    if (!this._faceApoUnit) return;
+    for (let fi = 0; fi < 12; fi++) {
+      const P = this._facePlans[fi];
+      if (!P) { this.pulseColumns.push(null); continue; }
+      const Rc = P.apo / Math.cos(Math.PI / 5) * COLUMN_R_GAIN;   // 五边形外接半径
+      const g = new THREE.CylinderGeometry(1, 1, 1, 5, 1, true);   // 无端盖 → 只见侧壁
+      g.rotateX(Math.PI / 2);                                      // 轴 +Y → +Z（局部 Z = 面法线）
+      g.rotateZ(P.vertAz[0] + Math.PI / 2);                        // 顶点 0 对齐该面五边形顶点
+      g.scale(Rc, Rc, 1);                                          // 半径定型；高度留给 scale.z
+      const mesh = new THREE.Mesh(g, this.pulseColumnMaterial);
+      mesh.name = 'L5_PulseColumn_' + fi;
+      /* ★★ 绘制次序是这里最容易翻车的地方（实测踩了两次，见 skill）：
+       *   · 全场景 depthWrite:false，遮挡完全由**绘制顺序**决定；
+       *   · 更狠的是**晶体板用预乘混合**（blendDst = OneMinusSrcAlpha）——
+       *     板会把**它之前画的所有像素**按 (1−alpha) 乘一遍，而板 alpha 高达 0.42~0.92
+       *     → 任何画在板**之前**的层等于被整片抹掉。
+       * 实测：renderOrder 给 30 / 31.5（板 32 之前）时，柱面 gain 拉到 6.0，
+       *   全屏 Δmean 只有 ±0.0001（等于没有），甚至因为"板压暗"而更暗。
+       * 故必须画在板**之后**：取 33（碎片 32 之后、片内芯 34 之前）。
+       * 柱面本来就在板的外围/下方，画在板之后不会遮住板的顶面。 */
+      mesh.renderOrder = 33;
+      mesh.frustumCulled = false;
+      mesh.visible = false;
+      this.group.add(mesh);
+      this.pulseColumns.push({
+        mesh, normal: P.center.clone().normalize(), apoUnit: P.apo / R_SHELL_OUT,
+        z0: P.CRYST_Z0, z1: P.CRYST_Z1
+      });
+    }
+  }
+
+  /** 逐帧：把柱面钉在两块板之间。gap 由「基准面抬升 + 晶体板上升」共同决定。 */
+  updatePulseColumns(simTime) {
+    const cols = this.pulseColumns;
+    if (!cols) return;
+    const sf = this.uniforms.u_shell_form ? this.uniforms.u_shell_form.value : 0;
+    // 板（= 水晶壳）出现后柱面才存在；不随脉冲前沿回落 → 它是板的"厚度"，不是脉冲
+    const env = THREE.MathUtils.smoothstep(sf, 0.05, 0.45);
+    const lift = this.shellInnerUniforms ? this.shellInnerUniforms.u_lift.value : 0;
+    const rotGate = THREE.MathUtils.smoothstep(this._deploy, 0.60, 0.95);
+    const em = this.uniforms.u_emissive_color ? this.uniforms.u_emissive_color.value : null;
+    // 与 GLSL 里 shellPulseCol 完全同源：mix(u_emissive_color, (0.82,0.93,1.0), 0.45)
+    const col = this._columnColor || (this._columnColor = new THREE.Color());
+    if (em) col.setRGB(
+      em.r * 0.55 + 0.82 * 0.45,
+      em.g * 0.55 + 0.93 * 0.45,
+      em.b * 0.55 + 1.00 * 0.45);
+    else col.setRGB(0.82, 0.93, 1.0);
+    this.pulseColumnMaterial.uniforms.u_color.value.copy(col);
+
+    /* ★ v5.21c：**柱高归一** —— 修"水晶碎片一往外推就直接超新星爆发变成一团白色光团"。
+     * 柱面是**加色**几何，而它的高度随展开从静止的 0.038 涨到 ≈0.20（面积 ×5.3）：
+     *   · 面积 ∝ h        → 展开时加色总量线性上涨；
+     *   · 12 根一起涨、且提亮后每根再吃 bloom → 整块壳外缘变成一圈白光 = "超新星"。
+     * 这与核心的 contain 上涨是**同一时刻**发生的（都由 _deploy 驱动）→ 两个叠加。
+     * 修法：以静止柱高 COLUMN_H0 为基准，超出部分按 1/(1 + k·超量) 收回单位亮度 ——
+     * 于是「面积×亮度」在展开全程基本恒定，柱子只是**变长**，不会**变亮**。 */
+    const hs = []; let hSum = 0, hN = 0;
+    for (let fi = 0; fi < cols.length; fi++) {
+      const c = cols[fi];
+      if (!c) { hs.push(null); continue; }
+      const grp = this._faceRot ? this._faceRot[fi] : null;
+      const offFace = (grp && grp.offN) ? grp.offSum / grp.offN : 0;   // 该面平均抬升
+      const dBase = c.apoUnit * R_SHELL_IN + lift;                     // 基准面（含抬升）
+      const dTop = c.apoUnit * R_SHELL_OUT + offFace + c.z1;           // 晶体板顶面
+      hs.push({ h: Math.max(COLUMN_MIN_H, dTop - dBase), dBase, grp });
+      hSum += hs[hs.length - 1].h; hN++;
+    }
+    const hAvg = hN ? hSum / hN : COLUMN_H0;
+    const hOver = Math.max(0, hAvg / COLUMN_H0 - 1);
+    const hComp = 1 / (1 + COLUMN_H_COMP * hOver);
+    const gain = COLUMN_GAIN * env * hComp;
+    this.pulseColumnMaterial.uniforms.u_gain.value = gain;
+    this._columnStats = { env: +env.toFixed(3), lift: +lift.toFixed(4),
+      gain: +gain.toFixed(3), hAvg: +hAvg.toFixed(4), hComp: +hComp.toFixed(3), h: [] };
+
+    for (let fi = 0; fi < cols.length; fi++) {
+      const c = cols[fi];
+      if (!c) continue;
+      const on = gain > 0.001;
+      c.mesh.visible = on;
+      if (!on) continue;
+      const { h, dBase, grp } = hs[fi];
+      const mid = dBase + h * 0.5;
+      c.mesh.position.copy(c.normal).multiplyScalar(mid);
+      /* ★★ v5.21 修的**致命**朝向 bug：
+       * 原来是 `quaternion.setFromAxisAngle(c.normal, grp.angle * rotGate)` ——
+       * 这只是**绕法线自转**，完全没有把柱面的轴从局部 +Z 转到该面的法线方向！
+       * 结果 12 根管子全部朝着世界 +Z（互相平行），贴在各自面心处 →
+       * 合成视图里根本读不出"某个面的侧壁"，这正是用户说的
+       * "两个面中间我没有看到任何侧壁"的直接原因（M1 隔离测试能看见，
+       * 是因为那时 12 根平行管在空场景里没有参照物）。
+       * 正确做法：先 setFromUnitVectors 把 +Z 转到面法线，再绕（已经指向法线的）
+       * 局部 Z 叠加面旋转角 —— 面内自转才是"齿轮转动"该有的效果。 */
+      c.mesh.quaternion.setFromUnitVectors(COL_AXIS_Z, c.normal);
+      const spin = (grp ? grp.angle : 0) * rotGate;
+      if (spin) c.mesh.rotateZ(spin);
+      c.mesh.scale.set(1, 1, h);
+      this._columnStats.h.push(+h.toFixed(3));
+    }
+  }
+
   /** 按 radialN² 加权随机选一片碎片（0.06 基数保证面心片偶被选中，不出现死区）。
    *  radialN∈[0,1]（0=面心片，1=外缘片）→ 平方加权后绝大多数落在外缘环。 */
   _pickFragmentIndex() {
@@ -2293,6 +2775,9 @@ export class L5Core {
     this._zoom = z;
     if (this.ambientPoints && this.ambientPoints.material) {
       this.ambientPoints.material.uniforms.u_zoom.value = z;
+    }
+    if (this.chargePoints && this.chargePoints.material) {
+      this.chargePoints.material.uniforms.u_zoom.value = z;   // v5.19：储能粒子同步放大
     }
   }
 
@@ -2624,6 +3109,17 @@ export class L5Core {
     let eMin = Infinity, eMax = -Infinity;
     let rotSpinning = 0, rotReturning = 0, rotMaxDeg = 0, rotSample = null;
     const rotGate = THREE.MathUtils.smoothstep(d, 0.60, 0.95);   // 展开→1，闭合→0
+    /* v5.20b：这里**曾经**有一个 `_plateLift`（凭空加的推离），已被用户否决并删除 ——
+     * 用户原话："为什么要推开，水晶面底部正好和基准面贴合，只有上面和基准面有一定距离，
+     *   就是线框划定的厚度。现在直接就是在现线框框定的厚度的外面推离，然后再画两个面，
+     *   这不搞笑吗。"
+     * 正确的几何关系是：水晶面**底面本来就贴在基准面上**，顶面距基准面 = 线框划定的壁厚
+     * （R_SHELL_IN → R_SHELL_OUT 那一层）。柱面就是这层壁的侧壁 —— 不需要任何额外位移。
+     * 保留 `_plateLift = 0` 只是为了让 updatePulseColumns 的算式不必分支。 */
+    this._plateLift = 0;
+    /* v5.20：柱面的上沿要钉在**该面晶体板的平均抬升**上 —— 逐片 off 不同（pushAmt 有
+     * 噪声），故每帧先清零再累加，循环结束后在 updatePulseColumns 里取均值。 */
+    for (const key in this._faceRot) { const g = this._faceRot[key]; if (g) { g.offSum = 0; g.offN = 0; } }
     for (const f of this.fragments) {
       // 每片自己的缓动进度（同一条曲线，不同终点）
       const u = THREE.MathUtils.clamp(d / (f.arrive ?? 1.0), 0, 1);
@@ -2631,8 +3127,13 @@ export class L5Core {
       if (eP < eMin) eMin = eP;
       if (eP > eMax) eMax = eP;
       const floatAmp = 0.034 * (0.35 + 0.65 * hot) * eP;
-      const off = eP * f.pushAmt + Math.sin(waveT * f.floatFreq + f.floatPhase) * floatAmp;
+      const off = eP * f.pushAmt
+                + Math.sin(waveT * f.floatFreq + f.floatPhase) * floatAmp;
       const bob = Math.sin(waveT * f.floatFreq + f.floatPhase + 1.1) * floatAmp * 0.45;
+      {
+        const g = this._faceRot[f.faceIdx];
+        if (g) { g.offSum = (g.offSum || 0) + off; g.offN = (g.offN || 0) + 1; }
+      }
       f.mesh.position.copy(f.faceCenter).addScaledVector(f.normal, off);
       f.mesh.position.y += bob;
 
@@ -2682,6 +3183,20 @@ export class L5Core {
         grp.nextAt = simTime + 1.2 + Math.random() * 2.8;
         rt.angle = 0; rt.vel = 0; rt.rampT = 0; rt.settled = false; rt.retFrom = 0;
       }
+      /* v5.19：转动资格的**上升沿**排期（修"面上升后所有面同时转动一次"）。
+       * nextAt 是绝对时刻，而能量 <80 期间下面那个触发条件根本不参与判定 →
+       * nextAt 一直停在很久以前。等 d 越过 0.98 时 12 个面全都已过期 → 同一帧齐转。
+       * 故在资格从 false 变 true 的那一帧，按**当前时刻**重排，并用分层随机分槽
+       * （帧内序号 + 随机数）/12 —— 保证摊开，而不是纯随机（纯随机可能扎堆）。
+       * 注：grp 被本面 ~24 片共享，但 wasEligible 在第一片处理完就被置 true，
+       * 同帧后续片会跳过 → 每面每帧只排一次。 */
+      if (this._rotFrameTag !== simTime) { this._rotFrameTag = simTime; this._rotFrameSeq = 0; }
+      const rotEligible = wantSeq && d >= 0.98;
+      if (rotEligible && !grp.wasEligible) {
+        const slot = (this._rotFrameSeq++ + Math.random()) / 12;
+        grp.nextAt = simTime + ROT_FIRST_DELAY_BASE + slot * ROT_FIRST_STAGGER;
+      }
+      grp.wasEligible = rotEligible;
       /* v5.13c：触发条件必须同时看**能量阈值**（wantSeq），不能只看 d>=0.98 ——
        * 回归期间 deploy 被冻结在 ~1，d 一直满足 0.98，只看 d 的话已经回原位的面会
        * 立刻排下一次、在收拢过程中继续转（实测降能 3.3s 后仍有 21 片在转）。 */
@@ -2805,6 +3320,10 @@ export class L5Core {
       maxDeg: +rotMaxDeg.toFixed(2), sample: rotSample,
       events: this._rotEvents ?? [], ease: this._rotEaseRange ?? null,
       boost: +rotBoost.toFixed(2) };
+
+    /* v5.19：撞击队列 —— 与转动**同窗口**（wantSeq && d>=0.98），
+     * 于是"一个转动间隔"正好就是队列的一个排期窗口 → 天然满足"间隔内每片至少一次"。 */
+    this._updateHitQueues(simTime, wantSeq && d >= 0.98);
 
     /* —— 轮廓线一次性渐显（v5.9，用户定标）——
      * 能量越过 SEAM_SHOW_P（0.20）→ 轮廓线按**固定 SEAM_FADE_DUR 秒**渐显一次
@@ -2987,6 +3506,94 @@ export class L5Core {
     return true;
   }
 
+  /* ==================== v5.19：撞击队列（每面外圈 · 每转动间隔各中一次） ==================== *
+   * 起因：旧逻辑是"粒子撞到谁就打谁"，命中分布完全由粒子轨道决定 ——
+   * 实测有的外圈片几秒都轮不到一次，有的被连击。用户要的是**保证覆盖**。
+   *
+   * 队列构造（严格按用户给的算法）：
+   *   ① 队列长度 L = n + 1 或 n + 2（随机），n = 本面最外圈碎片数；
+   *   ② 把 L 个槽位洗牌，取前 n 个**互不相同**的位置；
+   *   ③ 把 n 个外圈碎片洗牌后依次放进这 n 个位置 → 保证"每片至少一次"，且顺序随机；
+   *   ④ 剩下 1~2 个空位用随机外圈碎片填 → 少数片被击中两次，节奏不机械。
+   * 时间：在整个转动间隔里**分层随机**铺开（不是纯随机，纯随机可能扎堆）。 */
+  _buildHitQueue(ring, t0, span) {
+    const n = ring.length;
+    if (!n) return null;
+    const L = n + HIT_QUEUE_EXTRA_MIN
+      + ((Math.random() * (HIT_QUEUE_EXTRA_MAX - HIT_QUEUE_EXTRA_MIN + 1)) | 0);
+    // ① 槽位洗牌
+    const slots = [];
+    for (let i = 0; i < L; i++) slots.push(i);
+    for (let i = L - 1; i > 0; i--) {
+      const j = (Math.random() * (i + 1)) | 0;
+      const t = slots[i]; slots[i] = slots[j]; slots[j] = t;
+    }
+    // ② 碎片洗牌
+    const shuf = ring.slice();
+    for (let i = shuf.length - 1; i > 0; i--) {
+      const j = (Math.random() * (i + 1)) | 0;
+      const t = shuf[i]; shuf[i] = shuf[j]; shuf[j] = t;
+    }
+    const items = new Array(L).fill(null);
+    for (let k = 0; k < n; k++) items[slots[k]] = shuf[k];      // 每片一个互不相同的随机位
+    for (let i = 0; i < L; i++) if (items[i] == null) items[i] = ring[(Math.random() * n) | 0];
+    // ③ 时间分层随机铺开
+    return items.map((fIdx, i) => ({
+      fIdx, done: false,
+      at: t0 + ((i + 0.5 + (Math.random() - 0.5) * 0.7) / L) * span
+    }));
+  }
+
+  /** 队列定时发射：只发**到点**的项；队列本身就是密度控制，故不走 HIT_GLOBAL_GAP。 */
+  _fireQueuedHit(fi, simTime) {
+    const f = this.fragments[fi];
+    if (!f || !f.mesh) return false;
+    if (this._basePulseBusy === true) return false;   // 基准面"渐显"期间不叠事件（v5.16 老规矩）
+    const pts = f.hitPts;
+    const p = (pts && pts.length) ? pts[(Math.random() * pts.length) | 0] : f.centroid;
+    const u = f.mesh.material.uniforms;
+    u.u_hitP.value.set(p.x, p.y, p.z);
+    const dr = Math.hypot(p.x - f.centroid.x, p.y - f.centroid.y, p.z - f.centroid.z);
+    u.u_hitR.value = Math.max(0.02, dr + (f.boundR ?? 0.05));
+    u.u_hitT.value = 0.0;
+    f.hitAt = simTime;
+    this._hitEvents = (this._hitEvents ?? 0) + 1;
+    this._queuedHits = (this._queuedHits ?? 0) + 1;
+    return true;
+  }
+
+  /** 每帧推进：窗口到期就重建队列，并发射到点的项。 */
+  _updateHitQueues(simTime, active) {
+    if (!this._faceRing) return;
+    if (!active) {                       // 未展开：清空，下次进入重新排期
+      for (const grp of this._faceRot) if (grp) { grp.hitQ = null; grp.hitQEnd = 0; }
+      return;
+    }
+    let fired = 0, pending = 0;
+    for (let fi = 0; fi < this._faceRing.length; fi++) {
+      const ring = this._faceRing[fi];
+      if (!ring || !ring.length) continue;
+      const grp = this._faceRot[fi];
+      if (!grp) continue;
+      if (grp.hitQ == null || simTime >= grp.hitQEnd) {
+        /* 窗口 = 到下一次转动为止（转动间隔）；太短就兜底到 HIT_QUEUE_MIN_SPAN，
+         * 否则 n+1 个脉冲会挤在一瞬间糊成噪声。 */
+        const span = Math.max(HIT_QUEUE_MIN_SPAN, (grp.nextAt ?? simTime) - simTime);
+        grp.hitQ = this._buildHitQueue(ring, simTime, span);
+        grp.hitQEnd = simTime + span;
+      }
+      const q = grp.hitQ;
+      if (!q) continue;
+      for (const it of q) {
+        if (it.done) continue;
+        if (simTime < it.at) { pending++; continue; }
+        it.done = true;
+        if (this._fireQueuedHit(it.fIdx, simTime)) fired++;
+      }
+    }
+    this._hitQueueStats = { fired, pending, faces: this._faceRing.length };
+  }
+
   /** 视觉标定通道（非规格项）：?tk_core=0.3&tk_field=0.8 ... 交互调参用 */
   setTune(t = {}) {
     const u = this.uniforms;
@@ -3020,7 +3627,7 @@ export class L5Core {
     }
     if (t.density != null) u.u_density.value = t.density;
     if (t.steps != null) u.u_vol_steps.value = Math.round(t.steps);
-    this._rodGain = t.rod ?? this._rodGain ?? 1.0;
+    // v5.21e：`?tk_rod=`（棱线光导管增益）随该元素一并删除
     if (t.field != null) {
       this._plateGain = t.field;      // v5.10：基线值，实际增益 = _plateGain × head
       if (this.fieldGlowMaterial) this.fieldGlowMaterial.uniforms.u_gain.value = t.field;
@@ -3046,9 +3653,12 @@ export class L5Core {
   /** 视觉增强总开关：false → 回退到规格字面渲染 */
   setEnhancements(on) {
     this.coreMaterial.uniforms.u_vol_steps.value = on ? 32 : 0;
-    if (this.fieldGlow) this.fieldGlow.visible = !!on;
-    this.coreRods.visible = on;
-    this.cageGhost.visible = on;
+    /* v5.21：这三条**必须回读 setLayer 的记录**再决定 —— 否则 FX 总开关一开
+     * 就把用户在「几何与分层」里取消勾选的诊断线框 / 棱线光导管重新点亮。 */
+    const lf = this._layerFlags || {};
+    if (this.fieldGlow) this.fieldGlow.visible = !!on && lf.fieldGlow !== false;
+    // v5.21e：棱线光导管已整体移除，这里不再需要处理它
+    this.cageGhost.visible = !!on && lf.cage !== false;
     // 规格字面档：内壳不做展开形变（v5.3：散热鳍已按用户要求整体移除）
     this._deployAllowed = !!on;
     this.shellUniforms.u_bump.value = on ? 0.85 : 0.0;
@@ -3071,13 +3681,18 @@ export class L5Core {
    */
   setLayer(name, on) {
     const v = !!on;
+    /* v5.21：记录层级开关状态 —— setEnhancements 会重写 coreRods / cageGhost 的
+     * visible，若不回读这份记录，"默认关掉的诊断线框"会被 FX 总开关重新打开。 */
+    this._layerFlags = this._layerFlags || {};
+    this._layerFlags[name] = v;
     switch (name) {
       case 'fragments':        // 水晶碎块 / 外壳（285 片外甲，含其内芯发光子层）
         for (const f of this.fragments) f.mesh.visible = v;
         break;
-      case 'core':             // 等离子核心 + 核心棱线
+      /* v5.21e：'core' 现在只对应核心本体（棱线光导管已整体删除，
+       * 不再需要 v5.21d 那套父子层同步）。 */
+      case 'core':
         this.coreMesh.visible = v;
-        this.coreRods.visible = v;
         break;
       case 'particles':        // 能量环粒子流（环截面内漂移的点）
         for (const rg of this.ringGroups) if (rg.flow) rg.flow.visible = v;
@@ -3097,6 +3712,9 @@ export class L5Core {
         break;
     }
   }
+
+  /* v5.21e：`_syncCoreLayers()` 已删除 —— 它存在的唯一理由是维护
+   * 「核心 ↔ 棱线光导管」的父子可见性，而光导管已整体移除。 */
 
   /** 每帧同步 CPU 侧解算结果 → uniform */
   sync({ mainParam, simTime, phase, intensity, color, shellAlpha, jitter, jitterVec }) {
@@ -3130,8 +3748,7 @@ export class L5Core {
     } else {
       this.coreMesh.position.set(jitter, jitter * 0.6, jitter * 0.4);
     }
-    this.coreRods.position.copy(this.coreMesh.position);
-    this.coreRods.rotation.copy(this.coreMesh.rotation);
+    // v5.21e：棱线光导管已移除 —— 原先在这里让两根管子跟随核心的微抖动位移/姿态
 
     const p = Math.min(1.0, Math.max(0.0, mainParam));
     this._energyP = p;
@@ -3162,6 +3779,8 @@ export class L5Core {
     // 激发态：内层壳展开为散热模式（必须在 p / hot 求值之后）
     this._animateDeploy(p, simTime, hot);
     this.updateAmbientParticles(simTime, dt);
+    this.updateChargeField(simTime);   // v5.19：储能态能量粒子流（逐帧跟随碎片平移+自转）
+    this.updatePulseColumns(simTime);  // v5.20：脉冲柱面（钉在基准面与晶体板顶面之间）
 
     /* v5.13e → v5.16（A1，用户本轮拍板）：外甲裂片外推后，基准面**不再完全隐藏**，
      * 改为淡到 **BASE_GHOST_FLOOR(0.40)** 的"幽灵态"。
@@ -3213,18 +3832,7 @@ export class L5Core {
     this.cageGhostMaterial.color.copy(coldC);
     this.cageGhostMaterial.opacity = (0.12 + 0.26 * p) * head * (this._cageMul ?? 1.0);
 
-    // 棱线亮度必须显著高于核心本体，否则被 ACES 压平后不可辨
-    const rg = this._rodGain ?? 1.0;
-    // 棱线同样压在 bloom 阈值附近：它们在画面上只有 1~2px 宽，亮度却最容易冲过 1.0
-    // v5.7：高能量态整体过曝 → 棱线的能量斜率下调（0.98/1.15 → 0.62/0.72）；
-    // v5.10：再乘展开余量 head（棱线只让出 60%，保证机械骨架仍可读）。
-    const rodHead = 1.0 - 0.60 * (1.0 - head);
-    // v-new：展开（冷却模式）后核心棱线随热辐射一同约束，避免橙色棱线从碎片缝隙透出染色
-    // v5.17：约束过狠（0.72 → 展开态只剩 28%）加剧了用户报的"高能态核心很暗"。
-    //       放宽到 0.42（展开态保留 58%）—— 仍高于闭合态透出量，但不会一片黑。
-    const rodContain = 1.0 - 0.42 * (this._deploy || 0);
-    this.coreRodMaterial.color.copy(coldC).multiplyScalar(rg * (0.58 + 0.72 * p) * rodContain);
-    this.coreRodMaterial.opacity = (0.55 + 0.26 * hot) * rodHead;
+    // v5.21e：棱线光导管的逐帧颜色/透明度驱动（rodGain / rodHead / rodContain）已随之删除
   }
 
   dispose() {

@@ -398,13 +398,37 @@ function bindStateSeg() {
   });
 }
 
+/* 视口缩放的**唯一入口** —— 滑条 / 快捷档 / URL 参数 / 键盘 全部走这里，
+ * 免得四条通路各自 setZoom 之后 UI 状态互相打架。
+ * v5.21：上限 4× → **20×**（用户："建议最大缩放倍数调到20倍并加滑条，你不觉得现在的缩放很搞笑吗"）。
+ * 20× 下 half = H_WORLD/2/20 = 0.5，视野高度只有 1 个世界单位 —— 相当于贴到单个面的
+ * 五边形边上做微距，这正是"看柱面/侧壁"需要的档位。 */
+const ZOOM_MIN = 0.5;
+const ZOOM_MAX = 20;
+const ZOOM_DEFAULT = 2.5;
+function applyZoom(z) {
+  const v = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Number.isFinite(z) ? z : ZOOM_DEFAULT));
+  stage.setZoom(v);
+  l5.setZoom(v);                       // 同步粒子像素尺寸缩放（u_zoom）
+  const range = $('zoom-range');
+  if (range && range.value !== String(v)) range.value = String(v);
+  const out = $('zoom-out');
+  if (out) out.textContent = `${v.toFixed(2)}×`;
+  document.querySelectorAll('#seg-zoom button').forEach((b) => {
+    b.classList.toggle('is-active', Math.abs(parseFloat(b.dataset.zoom) - v) < 1e-6);
+  });
+  return v;
+}
+
 function bindZoomSeg() {
+  const range = $('zoom-range');
+  if (range) {
+    range.addEventListener('input', () => applyZoom(parseFloat(range.value)));
+    // 双击滑条回到默认倍率
+    range.addEventListener('dblclick', () => applyZoom(ZOOM_DEFAULT));
+  }
   document.querySelectorAll('#seg-zoom button').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      stage.setZoom(parseFloat(btn.dataset.zoom));
-      l5.setZoom(parseFloat(btn.dataset.zoom));   // v-fix：同步粒子像素尺寸缩放
-      document.querySelectorAll('#seg-zoom button').forEach((b) => b.classList.toggle('is-active', b === btn));
-    });
+    btn.addEventListener('click', () => applyZoom(parseFloat(btn.dataset.zoom)));
   });
 }
 
@@ -434,6 +458,10 @@ function bindFxSeg() {
 /** 层级显示开关：把几何与分层面板里的复选框接到 L5Core.setLayer */
 function bindLayers() {
   const boxes = document.querySelectorAll('#layer-list input[data-layer]');
+  const apply = () => {
+    if (!l5 || typeof l5.setLayer !== 'function') return;
+    boxes.forEach((cb) => l5.setLayer(cb.dataset.layer, cb.checked));
+  };
   boxes.forEach((cb) => {
     cb.addEventListener('change', () => {
       if (l5 && typeof l5.setLayer === 'function') {
@@ -441,6 +469,12 @@ function bindLayers() {
       }
     });
   });
+  /* v5.21：初始化必须把面板里的**当前勾选状态**下发一次 —— 原来只绑了 change，
+   * 于是"默认不勾选"的层（诊断骨架线框）在 three 侧仍是 visible=true，开关形同虚设。
+   * 补一次 next-frame 是为了避开后面 stage.setFx() → setEnhancements() 的重写
+   * （setEnhancements 现在会回读 setLayer 的记录，所以这一补是保险而非必需）。 */
+  apply();
+  requestAnimationFrame(apply);
 }
 
 let dragging = false;
@@ -502,6 +536,16 @@ function bindKeyboard() {
     }
     if (e.code === 'KeyP' || e.code === 'Space') {
       $('btn-pause').click();
+      e.preventDefault();
+      return;
+    }
+    /* v5.21：缩放快捷键 —— 近景检查侧壁/柱面时不必去够滑条。
+     * Q/E 缩放一档（×1.25 / ÷1.25，等比手感），R 回到默认 2.5×。 */
+    if (e.code === 'KeyQ' || e.code === 'KeyE' || e.code === 'KeyR') {
+      const cur = stage.zoom || ZOOM_DEFAULT;
+      if (e.code === 'KeyQ') applyZoom(cur / 1.25);
+      else if (e.code === 'KeyE') applyZoom(cur * 1.25);
+      else applyZoom(ZOOM_DEFAULT);
       e.preventDefault();
     }
   });
@@ -576,12 +620,11 @@ function boot() {
       document.querySelectorAll('#seg-state button').forEach((b) => b.classList.toggle('is-active', b.dataset.state === st));
       syncSliderTo(STATE_TABLE[st].mainParam, true);
     }
+    /* ?zoom= 支持到 20×（会被 applyZoom 夹到 [0.5, 20]）。
+     * 注意：浏览器里**视口越放大、swiftshader 软渲染越慢**（覆盖像素变多），
+     * 高倍验收截图请用小窗口（如 480×360）而不是大窗口。 */
     const z = parseFloat(urlQ.get('zoom'));
-    if (Number.isFinite(z) && z > 0) {
-      stage.setZoom(z);
-      l5.setZoom(z);   // v-fix：同步粒子像素尺寸缩放
-      document.querySelectorAll('#seg-zoom button').forEach((b) => b.classList.toggle('is-active', parseFloat(b.dataset.zoom) === z));
-    }
+    if (Number.isFinite(z) && z > 0) applyZoom(z);
     if (urlQ.get('fx') === '0') {
       fxEnabled = false;
       stage.setFx(false, l5);
