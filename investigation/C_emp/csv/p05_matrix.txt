@@ -1,0 +1,8 @@
+﻿baseline       WHITE= 315 ( 1.017%)
+fac_off        WHITE= 301 ( 0.972%)
+shell_off      WHITE=   8 ( 0.026%)
+core_off       WHITE= 294 ( 0.949%)
+pulse_off      WHITE= 177 ( 0.571%)
+dataflow_off   WHITE= 204 ( 0.659%)
+cool0          WHITE= 339 ( 1.094%)
+cool05         WHITE= 389 ( 1.256%)

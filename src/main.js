@@ -88,6 +88,8 @@ const camFwd = new THREE.Vector3();
 let probe = null;
 let probeFrameN = 0;
 let frameIndex = 0;
+let dropFrameN = -1;      // v5.22：正常帧循环的能量跌落验收通道（?pDropAt=<帧>&pDrop=<能量>）
+let dropFrameTo = 0;
 
 function runProbe() {
   try {
@@ -239,13 +241,18 @@ function tick(tsMs) {
 
   // 后处理 / 辐射链：核心屏幕投影中心 + 光度/色相 + E0 溢出闸门（附录 B.6）
   l5.coreMesh.getWorldPosition(coreWorld);
+  /* v5.24-lens：把黑洞的**视界半径**（不是外径 —— 外径会把加色光子环一起涂黑）
+   * 与冻结星变暗量交给屏幕空间引力透镜 pass。 */
   stage.syncFx({
     coreWorld,
     simTime: clock.simTime,
     intensity: etNow,
     e0: e0Now,
-    color: tmpColor
+    color: tmpColor,
   });
+
+  // v5.27：黑洞中心的立方探针必须在 sync 之后、composer.render 之前更新
+  l5.updateProbe(stage.renderer, stage.scene);
 
   stage.render();
   frameIndex++;
@@ -260,6 +267,11 @@ function tick(tsMs) {
 
 function frame(tsMs) {
   frameHandle = requestAnimationFrame(frame);
+  // v5.22：正常帧循环的"能量跌落"验收通道（无需 probe；probe 模式走同步 warm 自带 pDropAt）
+  if (dropFrameN >= 0 && frameIndex === dropFrameN) {
+    mainParam.setTarget(dropFrameTo, 1, [1, 0.5, 0, 1]);
+    dropFrameN = -1;   // 只触发一次
+  }
   tick(tsMs);
   if (probe) {
     document.documentElement.setAttribute('data-frames', String(frameIndex));
@@ -588,6 +600,7 @@ window.addEventListener('unhandledrejection', (e) => {
 });
 
 function boot() {
+  const urlQ = new URLSearchParams(location.search);
   stage.resize();
   drawGeometryPolygons();
   icore = drawIcoreChart(document.getElementById('chart-icore'));
@@ -603,6 +616,16 @@ function boot() {
   bindShowSeg();
   bindFxSeg();
   bindLayers();
+  /* ?layers=0：验收/排查用 —— 等同在「几何与分层」里把**全部**层级取消勾选
+   * （v-内容4-开：基准面现在也可关，所以这一档是全空场景，只剩背景与后处理）。
+   * 与 ?fx=0 / ?state= / ?zoom= 同一套 URL 直控套路；
+   * 必须在 bindLayers() 之后执行（先让默认勾选态下发，再覆盖为全关）。 */
+  if (urlQ.get('layers') === '0') {
+    document.querySelectorAll('#layer-list input[data-layer]').forEach((cb) => {
+      cb.checked = false;
+      if (l5 && typeof l5.setLayer === 'function') l5.setLayer(cb.dataset.layer, false);
+    });
+  }
   bindInject();
   bindPause();
   bindClampTest();
@@ -612,7 +635,6 @@ function boot() {
   bindResize();
 
   // URL 直控（演示/验收用）：?state=OVERDRIVE&zoom=4&fx=0&p=0.8[&instant=1][&fast=1]
-  const urlQ = new URLSearchParams(location.search);
   const applyUrlParams = () => {
     const st = urlQ.get('state');
     if (st && STATE_TABLE[st]) {
@@ -625,6 +647,12 @@ function boot() {
      * 高倍验收截图请用小窗口（如 480×360）而不是大窗口。 */
     const z = parseFloat(urlQ.get('zoom'));
     if (Number.isFinite(z) && z > 0) applyZoom(z);
+    /* ?stored=N：调试/验收用 —— 强制所有碎片储存量 = N（验证"撞击后变冷/变亮"的
+     * shader 效果是否肉眼可见；N 经 _COOL_PER 折算成 u_cool，0.5 封顶）。 */
+    const storedN = parseFloat(urlQ.get('stored'));
+    if (Number.isFinite(storedN) && l5.fragments) {
+      for (const f of l5.fragments) f.stored = Math.max(0, Math.min(storedN, 60));
+    }
     if (urlQ.get('fx') === '0') {
       fxEnabled = false;
       stage.setFx(false, l5);
@@ -638,6 +666,12 @@ function boot() {
     }
   };
   const instantParams = urlQ.get('instant') != null;
+
+  if (urlQ.get('probe') == null) {
+    const _dAt = parseInt(urlQ.get('pDropAt') || '-1', 10);
+    const _dTo = parseFloat(urlQ.get('pDrop'));
+    if (_dAt >= 0 && Number.isFinite(_dTo)) { dropFrameN = _dAt; dropFrameTo = _dTo; }
+  }
 
   if (urlQ.get('probe') != null) {
     probeFrameN = parseInt(urlQ.get('probeFrame') || '150', 10);

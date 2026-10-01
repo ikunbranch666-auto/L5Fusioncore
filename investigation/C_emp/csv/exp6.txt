@@ -1,0 +1,23 @@
+﻿white% over 8 samples: 1.72 1.91 2.18 2.01 1.58 1.73 1.89 1.78
+mean=1.85%  min=1.58  max=2.18
+
+Cell persistence map (over 8 samples):
+# = persistent white (>=6/8), + = intermittent (3-5), . = transient (1-2), space = never
+                        
+                        
+                        
+                        
+                        
+               ######+  
+             .######### 
+             +##+######+
+             ##++#######
+             ##+++#++##+
+             .###+++### 
+               #######  
+                        
+                        
+                        
+                        
+
+persistent cells(#)=50  intermittent(+)=15  transient(.)=2

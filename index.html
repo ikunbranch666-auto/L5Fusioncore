@@ -114,16 +114,16 @@
       </table>
 
       <h3 class="sub">层级显示开关</h3>
-      <p class="lead tight">关闭即<strong>彻底隐藏</strong>：不渲染、不写深度、不参与拾取与后处理掩膜，避免"隐藏了但干涉还在"。基准面为旋转基石，按设计常显（展开后自动淡出），故不提供关闭。</p>
+      <p class="lead tight">关闭即<strong>彻底隐藏</strong>：不渲染、不写深度、不参与拾取与后处理掩膜，避免"隐藏了但干涉还在"。</p>
       <ul class="layer-list" id="layer-list">
         <li><label><input type="checkbox" data-layer="fragments" checked /> 水晶碎块（外甲裂片）</label></li>
+        <li><label><input type="checkbox" data-layer="base" checked /> 基准面（旋转基准 · 观察核心/粒子时可关）</label></li>
         <li><label><input type="checkbox" data-layer="core" checked /> 核心（等离子核）</label></li>
         <li><label><input type="checkbox" data-layer="particles" checked /> 粒子（能量环粒子流）</label></li>
         <li><label><input type="checkbox" data-layer="ambient" checked /> 能量粒子（吸附 / 冷却）</label></li>
         <li><label><input type="checkbox" data-layer="fieldGlow" checked /> 场辉（约束场辉光板）</label></li>
-        <li><label><input type="checkbox" data-layer="rods" /> 棱线光导管（核心 30 棱实体管 · 默认关）</label></li>
+        <!-- v5.21e：棱线光导管 L5_Rods_Core 已整体移除，此复选框一并删除 -->
         <li><label><input type="checkbox" data-layer="cage" /> 线框（诊断骨架 · 默认关）</label></li>
-        <li class="locked"><label><input type="checkbox" checked disabled /> 基准面（旋转基准 · 常显）</label></li>
       </ul>
     </div>
 

@@ -1,0 +1,9 @@
+condition,p05_white_pct,p09_white_pct
+baseline,1.017,1.601
+fac_off,0.972,1.795
+shell_off,0.026,1.395
+core_off,0.949,2.476
+pulse_off,0.571,2.134
+dataflow_off,0.659,1.776
+cool0,1.094,1.605
+cool05,1.256,1.740

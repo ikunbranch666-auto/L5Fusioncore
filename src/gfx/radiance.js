@@ -106,7 +106,7 @@ export class L5Particles {
       fragmentShader: PARTICLE_FRAG,
       uniforms: {
         u_time: { value: 0 },
-        u_size: { value: 3.4 },
+        u_size: { value: 1.8 },   // v5.25：3.4 → 1.8（粒子过大 = 廉价感）
         u_gain: { value: 0 },
         u_color: { value: new THREE.Color(0x00f2fe) }
       },
@@ -213,7 +213,7 @@ export class L5EdgeFlow {
       fragmentShader: FLOW_FRAG,
       uniforms: {
         u_time: { value: 0 },
-        u_size: { value: 4.2 },
+        u_size: { value: 2.2 },   // v5.25：4.2 → 2.2
         u_gain: { value: 0 },
         u_color: { value: new THREE.Color(0x00f2fe) }
       },

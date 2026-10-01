@@ -1,0 +1,66 @@
+[
+ {
+  "name": "baseline",
+  "shellAlpha": 0.45,
+  "storedAvg": 0,
+  "shellVis": true,
+  "coreVis": true,
+  "facetJit": 1
+ },
+ {
+  "name": "fac_off",
+  "shellAlpha": 0.45,
+  "storedAvg": 0,
+  "shellVis": true,
+  "coreVis": true,
+  "facetJit": 0
+ },
+ {
+  "name": "shell_off",
+  "shellAlpha": 0.45,
+  "storedAvg": 0,
+  "shellVis": false,
+  "coreVis": true,
+  "facetJit": 1
+ },
+ {
+  "name": "core_off",
+  "shellAlpha": 0.45,
+  "storedAvg": 0,
+  "shellVis": true,
+  "coreVis": false,
+  "facetJit": 1
+ },
+ {
+  "name": "pulse_off",
+  "shellAlpha": 0.45,
+  "storedAvg": 0,
+  "shellVis": true,
+  "coreVis": true,
+  "facetJit": 1
+ },
+ {
+  "name": "dataflow_off",
+  "shellAlpha": 0.45,
+  "storedAvg": 0,
+  "shellVis": true,
+  "coreVis": true,
+  "facetJit": 1
+ },
+ {
+  "name": "cool0",
+  "shellAlpha": 0.45,
+  "storedAvg": 0,
+  "shellVis": true,
+  "coreVis": true,
+  "facetJit": 1
+ },
+ {
+  "name": "cool05",
+  "shellAlpha": 0.45,
+  "storedAvg": 0,
+  "shellVis": true,
+  "coreVis": true,
+  "facetJit": 1
+ }
+]

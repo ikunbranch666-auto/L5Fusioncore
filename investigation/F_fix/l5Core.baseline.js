@@ -27,159 +27,11 @@
  */
 import * as THREE from 'three';
 import { buildFaceFragments } from './dodecaKit.js';
-import { BH_B_CRIT_RS, buildDeflectionLUT } from './geodesic.js';
 
 export const R_CORE = 0.8;      // 5.6.1 内层外接半径
 export const R_SHELL_OUT = 1.0; // 附录 B.7 外层外接半径
 export const SHELL_WALL = 0.04; // 附录 B.7 外层壁厚
 export const R_SHELL_IN = R_SHELL_OUT - SHELL_WALL;
-
-/* v-内容4：黑洞体（核心内部）—— **带厚度的正十二面体机械外壳（完全不透明）** + 中心黑洞。
- *
- * ★★ v-内容4-形（用户 2026-09-29，本轮最严重问题：**基础形状根本不成立**）
- *   用户原话："现在的实现里，黑洞体看着像是三个五边形叠在一起，甚至都不是立体"
- *   根因（实测定位，四个独立 bug 叠加，缺一不可）：
- *     A 面板**尺寸**错：`bhPanelGeo(BH_SHELL_R, …)` 把十二面体的**外接半径**当成
- *       五边形**面**的外接半径。面上五边形外接半径 = R × 0.60706，故面板大了 1.647×。
- *     B 面板**位置**错：position = n × bhLift，而 bhLift 上限只有 0.085 ——
- *       正确应在**内切半径** BH_SHELL_IN(0.20) 处。12 块板全挤在离体心 0.085 的位置
- *       互相穿插 → 屏幕上就是"几个五边形叠在一起"。
- *     C 面板**朝向**错：`setFromUnitVectors(+Z, n)` 只把 +Z 转到法线，绕法线的滚转
- *       是任意的 → 12 块板各自乱转，棱边对不上，拼不成壳。
- *     D 材质 `transparent + depthWrite:false` → 互相看穿，读不出实体。
- *
- * 形态规格（用户定标）：
- *   · 外壳 = 12 块**带厚度**的五边形机械板，完全不透明，闭合时拼成完整十二面体；
- *   · 中心黑洞初始半径 **0.10u**；
- *   · 0.2–0.8：每块板**沿法线抬升，大小不变**，到体心的距离 = **当前黑洞半径 + 0.10u**
- *     （于是板与黑洞表面恒定留 0.1u 的缝，缝里露黑洞）；
- *   · >80：黑洞把**外壳板和所有粒子**一起塌缩吸入（见下三段式）。
- *
- * ★ v-内容4-塌（用户 2026-09-29 第二轮定标，塌缩改**四段式**，顺序不能错）
- *   用户原话："现在的塌缩动画是：黑洞和外壳整体缩小到一个点，这和普通的缩放有什么区别？
- *            我要的是：外壳和所有粒子被黑洞的超强引力吸引卷曲，被吸收到里面，
- *            随后黑洞本身再缩小塌缩（过程中黑洞本身要有引力扭曲的动效）到一个点，
- *            然后才是闪光和放大"
- *   → 关键：**① 阶段黑洞不缩**（旧实现让黑洞跟外壳一起缩，所以看起来就是整体缩放）；
- *     黑洞自己塌缩是 **②**，且必须带引力扭曲动效（u_bh_warp）。四段绝对时长：
- *     ① 吸入   BH_SUCK_DUR  = 1.10s —— 外壳板被卷曲吸进黑洞、缩到 0；
- *        **所有粒子**在这段内被全部吸入且**不重生**；黑洞半径**保持不变**（略胀，正在吞）
- *     ② 塌缩   BH_PINCH_DUR = 0.55s —— **黑洞本身**缩小到中心点 BH_R_PINCH，
- *        u_bh_warp 0→1 驱动引力扭曲（光子环涟漪 + 光晕外扩拖拽）
- *     ③ 闪光   BH_FLASH_DUR = 0.45s —— 半径钉在中心点，u_bh_flash 走 sin 半周爆白
- *     ④ 爆发   BH_BURST_DUR = 0.55s —— 半径 easeOutCubic 放大到 BH_R_MAX（0.40u）
- *   总时长 2.65s。
- *
- * ★ v-内容4-视（**事件视界 ≠ 引力透镜**）
- *   用户原话："事件视界是中心的一个黑球……在视野里它是一个完全不会透光的黑色球体，
- *            现在的实现上这个球就像个透明的透镜一样，我甚至可以看见它后面的水晶碎片面"
- *   → 旧实现把两者画在**同一个球**上，且 `transparent + depthWrite:false` →
- *     不写深度、不遮挡任何东西，后面的碎片照常透出来。
- *   正确拆成两个 mesh：
- *     · `bhCore` 事件视界 = **纯黑不透明球**（opaque，写深度）
- *       —— 进入视界的光全被吸收，物理上就是"什么都透不过去"
- *     · `bhLens` 引力透镜/光子环 = 视界**外面**的加色壳（光子球 ≈ 1.5 Rs），
- *       只画光子环与透镜光晕，不遮挡
- *   ★ 半径口径（v5.22-尺）：BH_R_* 是**外径**（含光晕），视界 = 外径 / BH_LENS_K；
- *     外径必须顶在用户定标的 BH_R_MAX = 0.40u 上，不能把透镜壳再往外乘 1.5。 */
-/** 正十二面体内切半径 / 外接半径 = 0.79465447…（SDF 支撑函数距离） */
-export const DODEC_INRADIUS_RATIO = 0.79465447;
-/** 面上五边形的外接半径 / 十二面体外接半径 = sqrt(1 − 0.79465447²) */
-export const DODEC_FACE_CIRCUM_RATIO = 0.60706110;
-const BH_R_MIN = 0.10;          // 中心黑洞半径（用户定标 0.1u；原 0.055）
-const BH_PANEL_GAP = 0.10;      // 面板到体心 = 黑洞半径 + 0.1u（用户定标）
-const BH_SHELL_IN = BH_R_MIN + BH_PANEL_GAP;              // 0.20 闭合态面板中心距
-const BH_SHELL_R = BH_SHELL_IN / DODEC_INRADIUS_RATIO;    // 0.2517 外壳外接半径
-const BH_FACE_R = BH_SHELL_R * DODEC_FACE_CIRCUM_RATIO;   // 0.1528 面板五边形外接半径
-const BH_SHELL_K = 0.90;        // 面板内面位似比（机械厚度棱台）
-const BH_SHELL_T = 0.032;       // 面板厚度（棱台高）—— 加厚，"带厚度"要看得出来
-const BH_R_OPEN_MAX = 0.22;     // <80 挡位的黑洞最大半径（20-80 渐开用）
-const BH_R_MAX = 0.40;          // >80 挡位的黑洞最大半径（= 半核心壳 0.8/2）
-const BH_R_PINCH = 0.010;       // ②塌缩到的「中心点」半径
-const BH_FLASH_R = 0.12;        // ③闪光的爆白可视半径（v5.26：0.20 → 0.12，"耀眼但很小"）
-/* v-内容4-视 / v5.22-尺：透镜壳外径与事件视界半径之比（光子球 ≈1.5 Rs）。
- * ★ **BH_R_* 系列半径一律是「整个黑洞（含透镜光晕）的外径」，不是视界半径** ——
- *   视界半径 = 外径 / BH_LENS_K。v5.22 之前把透镜壳做成 bhRDraw × BH_LENS_K，
- *   于是 >80 时外径 0.40 → 0.60u，比用户定标的 0.40u 大了整整 1.5 倍（用户："比之前大了好多"）。
- *   现在改为向内留空间：bhLens.scale = bhRDraw（外径 = BH_R_MAX = 0.40u），
- *   bhCore.scale = bhRDraw / BH_LENS_K（视界 = 0.267u，与 u_bh_vh = 1/1.5 一致）。 */
-const BH_LENS_K = 1.50;
-
-/* ── v5.28：透镜环厚度 —— 这是唯一一项我必须先查资料再定的量 ────────────────────
- * 物理事实（用户指出，我此前没对齐）：**施瓦西黑洞第一层光子环的厚度 ≈ 0.015 × 黑洞半径**。
- * 成因：高阶像径向间距按 e^{−2π} ≈ 1.87e−3 收敛，n 阶子环到临界曲线的距离是
- * bu n ∝ e^{−2πn} —— 所以整叠子环是**指数紧贴**在临界曲线上的，不是一条宽带。
- * v5.27 我做了 u ∈ (1, 2.7)（厚度 0.79 × 阴影半径 ≈ 0.21u），是物理值的 ~50 倍，
- * 而且比黑洞本体还粗 —— 用户定性："这算什么东西"。
- *
- *   · 把真正的临界值（=**不可见**，约半个像素）和"为了让用戶看得見而故意加厚多少"
- *     分成两个数摆在一起，逼自己对得上：
- *       LENS_RING_PHYS = 0.015   ← 文献：施瓦西第一层光子环厚度 / 黑洞半径（别动）
- *       LENS_RING_FRAC = 0.25    ← 本项目实际取的厚度 / 阴影半径（唯一推荐旋钮）
- *     于是夸张倍数 = 0.25 / 0.015 ≈ 17×（v5.27 是 53× —— 那就是"一倍半径厚"的由来）。
- *     外径 0.40u 时环宽 0.0667u ≈ 8px（视口 1u≈120px），黑洞本体直径 ≈64px ——
- *     读起来是一条贴在阴影边缘的环，不是一个盘。 */
-const LENS_RING_PHYS = 0.015;                        // 文献：第一层光子环厚度 / 黑洞半径
-const LENS_RING_FRAC = 0.25;                         // 本项目厚度 / 阴影半径（唯一推荐旋钮）
-const LENS_U_OUT = 1.0 + LENS_RING_FRAC;             // = 1.25 环外缘（u = b/b_c）
-const LUT_UMAX = 6.0;                                // 偏折角查找表的 u 上限（超出用弱场公式）
-
-/* ★ 绘制顺序总表（v5.29）—— 改任何一处 renderOrder 都必须回来对着这张表看：
- *   18 bhCore          不透明视界球（唯一写深度的遮挡者）
- *   24 bhPanels        黑洞自身机械面板
- *   29/30/31/32/34     基准面 / 体积核心 / 内壳 / 水晶碎片本体 / 碎片内芯
- *   33                 笼框 / 环境粒子
- *   35 FRAG_DEPTH_ORDER 隐形遮挡体（碎片的"只写深度"孪生体）← 夹在这里才有意义
- *   36 bhGrav          测地线透镜环（覆盖度 1，纯替换）
- *   38 bhLens          加色光子环 / 挤压亮弧 / 闪光（必须排在透镜之后）
- * 隐形遮挡体之所以是 35：排在它之前的层一个都不会被影响；排在它之后的只有 36 和 38，
- * 而这两层正是"应该被洞前碎片遮住"的部分。 */
-const FRAG_DEPTH_ORDER = 35;
-
-/* ── v5.27：尺度映射（唯一锚点：临界曲线 = 视界球轮廓 ⇒ 视觉尺寸不变）─────────────
- * 物理上阴影半径 = 2.598 × 视界，照搬会把阴影撑到 1.73×外径（用户定标的外径是 0.40u）。
- * → 保留"阴影边缘正好落在视界球轮廓上"这个锚点，用**有效史瓦西半径**
- *   rs_eff = (外径/BH_LENS_K)/b_c 把测地线函数接上去：偏折角随 b 的**形状仍是严格解**
- *   （geodesic.js 数值积分，node 断言 15/15 通过），只是长度基准落在美术预算里。
- *   u ≡ b/b_c：u = 1 → 临界曲线（= 视界球轮廓 = 0.2667u）；u > 1 逃逸。 */
-
-/* v5.25-节奏（用户定标）："整个塌缩时间太长"，而"膨胀推开碎块"那一段要**更长**。
- * 故前三段压缩（吸入/塌缩/闪光 2.10s → 1.42s），把时间让给 ④ 爆发
- * （0.55s → 0.95s）—— 爆发段正是"黑洞膨胀把水晶碎块面与基准面顶开"的那一段。 */
-const BH_SUCK_DUR = 0.70;       // ① 吸入：外壳 + 所有粒子（黑洞本身不缩）
-const BH_PINCH_DUR = 0.42;      // ② 塌缩：黑洞本身缩小到中心点 + 引力扭曲动效
-const BH_FLASH_DUR = 0.30;      // ③ 闪光
-const BH_BURST_DUR = 0.95;      // ④ 爆发：放大到 BH_R_MAX（同时顶开碎块/基准面）
-const BH_COLLAPSE_DUR = BH_SUCK_DUR + BH_PINCH_DUR + BH_FLASH_DUR + BH_BURST_DUR; // 2.65s
-/* v5.23-form（用户定标，<80 回落三段，取代旧的 0.85s 一段缩）：
- * 用户原话："能量降下 0.8 阈值后，黑洞先塌缩成一个点，再膨胀到对应能量的大小，
- * 外壳在黑洞膨胀到对应大小后渐显（先出现数据流虚影，随着数据填充逐渐变为实体）到对应位置。"
- * ① crush ② bloom ③ form —— 面板只在 ③ 段成形，位置从内侧连续浮升到位，绝无瞬移。 */
-const BH_RESURGE_CRUSH_DUR = 0.50;  // ① 被自身引力压进中心奇点（带引力扭曲）
-const BH_RESURGE_BLOOM_DUR = 0.60;  // ② 从奇点膨胀到当前能量对应的尺寸（easeOutCubic）
-const BH_RESURGE_FORM_DUR = 0.95;   // ③ 外壳数据化成形：数据流虚影 → 实体 + 浮升到位
-const BH_RESURGE_DUR = BH_RESURGE_CRUSH_DUR + BH_RESURGE_BLOOM_DUR + BH_RESURGE_FORM_DUR; // 2.05s
-/** v-内容4-形：外壳板中心到体心的距离 = **当前黑洞半径 + 0.1u**（用户定标），
- *  但不小于闭合态 BH_SHELL_IN —— 闭合时 12 块板正好拼成完整十二面体。 */
-const bhPanelDist = (r) => Math.max(BH_SHELL_IN, r + BH_PANEL_GAP);
-
-/* v-内容5：高能数据立方体粒子（核心外壳内的能量粒子云）。
- * 微小立方体，颜色随能量 0-100 渐变（冰蓝 → 橙黄 → 亮橙），速度越快拖尾越长。
- * 与黑洞体行为联动：0-20 自由缓慢随机移动（黑洞紧闭无法激发）；20-80 板壳缝隙渐大、
- * 粒子越来越频繁被吸入缝隙被黑洞吞噬（先选粒子 → 吸引 → 吞噬 → 回收：随机位置+
- * 随机初速度新粒子）；**>80 全部粒子被黑洞塌缩吸入（v-内容4-形：不再有两股环流）**；
- * 降回 <80 粒子散开均匀分布在核心壳体内绕中心旋转。 */
-const DP_COUNT = 400;           // 粒子数
-const DP_SIZE = 0.020;          // v5.25：立方体边长 0.045 → 0.020（用户："大小太大，称不上精密"）
-const DP_TRAIL_W = 0.014;       // 拖尾宽度（u）
-const DP_WANDER_SPD = 0.030;    // 自由游走速度（u/s）
-const DP_INNER = 0.34;          // 粒子环带内半径（避开黑洞体外壳 + 余量）
-const DP_OUTER = 0.66;          // v5.25：粒子环带外半径 0.78 → 0.66（用户："有些粒子超出核心外壳"）
-const DP_INHALE_MAX = 10;       // 20-80 段 80 时的每秒吸入数
-/* v-内容4-塌：>80 不再走"每秒名额"，而是**一次性把全部粒子转入 attract** 并在
- * 0 ~ 55%×BH_SUCK_DUR 内错峰被拽走 —— 保证"一定时间内被全部吸入，不重生"。 */
-/* v-内容4-形：DP_FLOW_R1 / DP_FLOW_R2（>80 双股环流轨道半径）已随 flow 模式一并删除
- * —— 用户定标">80 是全部被吸入，不存在环流"。 */
 
 /** 内壳展开的 MainParam 阈值区间（激发态切换点） */
 // v5.4：用户指定能量档位 —— <20 不显示分割线 / 20~80 显示切割线 / >80 展开
@@ -212,17 +64,19 @@ export const FRAG_ROT_STEP = (Math.PI * 2) / 5;   // 72°
  *     （≈35% 过冲，偏橡胶感）；回调到 ζ=0.34~0.42 后实测 ~18°（≈25%），
  *     既有明确的卡位顿挫又不至于晃。要再调只动 ζ 一个数即可。 */
 export const FRAG_ROT_RAMP = 0.30;                // 基准时长（秒）；实际 = RAMP / (片速率 × 能量加速)
-/* v-内容2（用户修订）：**放弃阻尼弹簧模型**（zeta 欠阻尼 → 终点来回震荡才停），
- * 改为"过冲-齿轮卡位"解析两段式：
- *   · 驱动段：每片从当前角 easeOutCubic 冲到「终点 + 自己的过冲幅度」，顶点速度=0；
- *   · 回位段：从过冲顶点沿 cos 半周期被拉力（加速度 ∝ 偏离，即"偏离越大拉力越大"，
- *     回位前一直存在）拽回终点，到位瞬间**速度直接归零**（硬卡停，不震荡）。
- * 过冲幅度按 radialN 分档：面心片大、外缘片小（0=面心 1=外缘）→ 形成
- * "基准台→中心碎片→外围碎片"的内带动外层次。 */
-export const FRAG_ROT_OVER_MAX = 0.13;            // 面心片过冲幅度（rad ≈ 7.4°，最大档）
-export const FRAG_ROT_OVER_MIN = 0.05;            // 外缘片过冲幅度（rad ≈ 2.9°，最小档）
-/** v-内容2：回位段时长 = 驱动段时长 × 该系数（短促有力，"咔"地卡住） */
-export const FRAG_ROT_RET_FRAC = 0.38;
+export const FRAG_ROT_K = 180.0;                  // 弹簧刚度
+/* v5.13b（用户修订）：旋转改为**按面协同** —— 同一面的所有碎片同一时刻、同方向
+ * 转 72°（否则各转各的，碎片再也拼不回五边形）。面内仍保留机械感：
+ *  · 每片的**缓动系数**不同 —— 由该片到面中心的距离决定（内圈快、外圈慢，
+ *    旋转像一道波从面心扫出去）；
+ *  · 每片的**过冲量**不同 —— 各片自己的阻尼比在小区间内随机，过冲约 8~12°
+ *    （≈4° 的浮动带宽，压在用户"5 度之内"的带宽要求里），回位时错落收拢，
+ *    像一排齿轮齿依次卡进位。
+ *    注：ζ 理论过冲 = 72°·exp(-ζπ/√(1-ζ²))，ζ=0.46~0.55 时本应 9~14°，但
+ *    smoothstep 斜坡对弹簧是缓输入，实测只剩 2~5°（用户定标 5~15°，不达标）；
+ *    ζ 下调到 0.32~0.40 后实测回到 8~12°。 */
+export const FRAG_ROT_ZETA_MIN = 0.34;
+export const FRAG_ROT_ZETA_MAX = 0.42;
 /* v5.13c/d：**缓动速率**（不是时长倍率）—— 走**面内归一化距离** radialN（0=面心 1=外缘）。
  * v5.13c 之前用世界单位 radial 做 `0.70+0.60*radial`，带宽只有 0.79~1.09 ——
  * 用户反馈"每个面的所有碎片缓动系数看起来也是一样的"。
@@ -346,7 +200,7 @@ export const HIT_OUTER_RADIAL = 0.86;   // v5.23 起仅供探针/参考，不再
  * ★ 时长约束（用户定标）："基准面脉冲扩散完全时间应小于水晶碎块的脉冲高亮开始蔓延
  *   ～ 水晶碎块开始升起的时间"。碎块那段 = SEAM_BURST_DUR(0.72s) → 取 0.42s，
  *   与爆发**并发**起跑，基准面先扫完，碎块才升起。 */
-export const BASE_PULSE_DUR = 0.85;  // v5.25：抬升行程 0.42 → 0.85s（与④爆发 0.95s 对齐）
+export const BASE_PULSE_DUR = 0.42;
 
 /* —— v5.19：撞击队列（用户定标）——
  * 用户原话："保证每个水晶碎块面的最外围一圈碎片，在转动间隔时间内至少各被打中一次
@@ -404,22 +258,14 @@ export const BASE_WIPE_SOFT = 0.16;
 export const BASE_WIPE_POW = 1.35;
 /** 擦除前沿的不规则扰动幅度（方位向）—— "不规则脉冲"，不是正圆 */
 export const BASE_WIPE_JIT = 0.10;
-/* —— A1（用户拍板）：基准面在展开态保留 **~30% 幽灵态**，不再完全隐藏 ———
+/* —— A1（用户拍板）：基准面在展开态保留 **~20% 幽灵态**，不再完全隐藏 ———
  * 实现上拆成两级相乘，避免"擦除"与"展开淡出"两次相乘把基准面压到看不见：
  *   · BASE_HIDE_LEVEL  = 擦除前沿扫过后基准面保留的比例（0.50 = "半隐"）
- *   · BASE_GHOST_FLOOR = 碎块外推（_deploy→0.55）后 innerFade 的下限（0.60）
- *   两级乘积 = 0.50 × 0.60 = **0.30** —— v-幽灵态调亮：用户"能量高时基准面
- *   不明显，稍微调高一点"（原 0.40×0.50=0.20）。
+ *   · BASE_GHOST_FLOOR = 碎块外推（_deploy→0.55）后 innerFade 的下限（0.40）
+ *   两级乘积 = 0.50 × 0.40 = **0.20** —— 正是用户要的"20% 不透明度左右"。
  * 注：2026-09-25 的"水晶外推后基准面完全隐藏、核心暴露"设定**已由用户本轮舍弃**。 */
 export const BASE_HIDE_LEVEL = 0.50;
-export const BASE_GHOST_FLOOR = 0.60;
-/* v-穿帮三次修复：下降同步期间的幽灵下限 —— 高能态幽灵（0.60）是展开态特色
- * （用户认可"半隐但亮"）；但跌破 80 的下降中段，水晶还全显（_shellT=1）时若仍保持
- * 0.60 幽灵，基准面结构线（勾边/刻痕，基础亮度本身可观）乘 0.60 依然是浅白框架，
- * 用户实机读作"白色片在水晶消失前出现"（2026-09-29 用户截图：半透明浅蓝白框架）。
- * 下降时基准面本就要随水晶收回闭合，把下限压到 0.30 —— 中段结构线明显变暗淡出，
- * 末尾（_shellT→0）仍闭合到 1，同步关系不变。 */
-export const DROP_GHOST_FLOOR = 0.30;
+export const BASE_GHOST_FLOOR = 0.40;
 /* —— v5.17：幽灵态结构线亮度补偿 ——
  * 起因：`u_shell_fade` 同时乘 c 与 alpha → 高能态把基准面的发光结构线也压暗了，
  * 用户判定"核心+半隐基准面的颜色就变得很暗，一点不像高能状态该有的样子"。
@@ -452,31 +298,8 @@ export const BASE_BOOST_MAX = 8.0;
  *   做法是把"回到严丝合缝"塞进**已存在的渐显冻结窗口**内 —— BASE_PULSE_DUR(0.42s)
  *   期间 _deployT 本来就被 holdDeploy 冻住，让 u_lift 随同一个 _baseProg 归零，
  *   碎片开始下落时基准面早已合拢 → **总时长一分不增**（见 sync 内实现）。 */
-export const BASE_FLOAT_AMP = 0.32;   // 浮动幅度（相对抬升量的比例）
-/** v5.7 碎块外推量的**下限**：per-piece 0.16~0.34u（大板推得少、小碎屑推得远） */
-export const FRAG_PUSH_MIN = 0.16;
-/* ★ 硬约束（用户定标）：基准面**最上**的位置必须低于水晶碎块**最下**的位置。
- * 几何关系：闭合态二者沿**同一条面法线**贴合；外推时碎块走 D ∈ [0.16, 0.34]，
- * 基准面走 L·(1 ± BASE_FLOAT_AMP)。两者同向、起点贴合 → 只要
- *     L · (1 + BASE_FLOAT_AMP) < D_min
- * 就**永远**不会穿模（余量就是 D − L(1+AMP)）。
- * 于是抬升量由碎块外推量反推，留 20% 余量 ≈ 0.097u（≈ 原来的 0.10，长期验证无穿模）。
- * ⚠️ 复盘（v5.26 的错）：我曾把 L 直接改成 0.20 → 上摆 0.264 > 0.16 → 穿模；
- * 然后又**错误地**把抬升删掉（那是在改需求，不是在修 bug）。
- * 以后要调抬升高度：**改下面的余量系数（0.80，最大 0.99）**，或者先加大碎块外推量下
- * 限 FRAG_PUSH_MIN；不要直接写死一个数，也不要把 u_lift 归零（归零 = 删掉用户的设计）。 */
-export const BASE_LIFT = FRAG_PUSH_MIN / (1.0 + BASE_FLOAT_AMP) * 0.80;  // ≈ 0.097
-
-/* —— v-内容1：基准面棱台化（位似厚度）——
- * 用户规格："基准面抬升的同时为它带上厚度；不是沿法线推出全等面做柱体，而是以
- *   能量核心中心为位似中心，形成带很小厚度的棱台；靠外一侧的面上有刻痕纹路
- *   （= 基准面本身），靠内一侧没有纹路；位似面以合拢态基准面为标准一次定死，之后
- *   不再改。>80：碎片面抬升时基准面向上抬升并扫掠出棱台（以基准面为基础向内推出
- *   无纹路的略小面，直到与基准面以核心中心成位似，再以上下底面扫掠出棱台）；
- *   <80：逆过程。"
- * BASE_FRUSTUM_K：内侧面的位似比（外面 = 合拢态基准面 R_SHELL_IN 为 1）。
- * 0.96 → 面法线方向厚度 ≈ (1−0.96)·R_SHELL_IN·内切比 0.795 ≈ 0.030u，
- * 2.5× 视口（1u≈100px）下约 3px —— 读作"壳带了一层很薄的厚度"。 */
+export const BASE_LIFT = 0.10;
+export const BASE_FLOAT_AMP = 0.32;
 
 /* v5.18：内芯层（白雾源）的结构窗口下移量。
  * 0 = 最稀疏（冷光几乎消失，实测 Δmean 只剩 0.00026、壳体均亮 0.126→0.093 —— 过头）；
@@ -526,9 +349,8 @@ export const RETRACT_BURST_FADE = 0.34;
 export const R_FIELD_A = 1.16;
 export const R_FIELD_B = 1.38;
 
-/* 正十二面体内切半径 / 外接半径 = 0.79465447…（SDF 支撑函数距离）
- * v-内容4-形：该常量已上移到文件顶部常量区（黑洞体外壳尺寸要用它，const 有 TDZ，
- * 不能在使用点之后声明），此处不再重复声明。 */
+/** 正十二面体内切半径 / 外接半径 = 0.79465447…（SDF 支撑函数距离） */
+export const DODEC_INRADIUS_RATIO = 0.79465447;
 
 /* —— 共享 GLSL：3D value noise + fbm（100% 程序化，38.5 无外部贴图）——
  * v5.7：能量环雾带同样需要噪声，抽成公共块注入各着色器，杜绝第二份实现漂移。 */
@@ -576,28 +398,6 @@ uniform vec3 u_cam_forward;      // 世界空间相机朝向（由 CPU 每帧写
 uniform float u_time;
 uniform float u_lift;            // 抬升距离（物体空间）；0 = 严丝合缝
 uniform float u_float_amp;       // 抬升态下的上下浮动幅度（相对 u_lift 的比例）
-/* v-内容1：基准面棱台（位似厚度）——
- * u_sweep：0 = 内侧面与外面完全重合（零厚度，闭合态不可见）；1 = 内侧面到位似
- *   最终位置（R_SHELL_IN·BASE_FRUSTUM_K）。随基准面抬升/收回同一包络扫掠。
- * u_frustum_r：外面半径（= R_SHELL_IN），用于把内/侧壁顶点沿位似射线拉回外面。
- * aKind / aLiftN：棱台几何专用 —— aKind=1 的顶点（内侧面 + 侧壁全部顶点）在
- *   u_sweep 下沿位似射线扫掠，并沿所属五边形的**外面法线**刚性抬升（外/内/侧壁
- *   作为一个整体随外面浮沉，不撕裂）；其余材质无这两个属性 → 默认 0，行为不变。 */
-uniform float u_sweep;
-uniform float u_frustum_r;
-attribute float aKind;
-attribute vec3 aLiftN;
-/* v-内容2：基准台（基准面棱台）跟随对应水晶碎块面旋转 ——
- * 绕**所属五边形面外法线**自旋，方向与碎片一致、缓动 = 最大碎片速率（无过冲无卡位，
- * 直接缓动到终点）。旋转角打包在 3 个 vec4（面 0-3 / 4-7 / 8-11）；**只有基准台
- * 材质（shellInnerUniforms 独立副本）由 sync 每帧写入**，其余材质读默认 0 → 不动。
- * aFaceIdx：所属面 0..11（dodeca() 108 顶点按 9 顶点/面分组、dodecaFrustum() 420
- * 顶点按面循环均烘焙；缺失 attribute 的几何（碎片/核心/笼）默认 0 + 材质 uniform 0
- * → 旋转恒 0，无影响）。 */
-uniform vec4 u_faceRotA;   // 面 0..3
-uniform vec4 u_faceRotB;   // 面 4..7
-uniform vec4 u_faceRotC;   // 面 8..11
-attribute float aFaceIdx;
 #define BASE_FLOAT_FREQ 1.9      // 浮动角频率（rad/s）
 /* 面级种子：与片元侧 hash13 同构，但 VERT 不注入 NOISE_GLSL，故自带一份 */
 float vertHash13(vec3 p) {
@@ -612,7 +412,6 @@ varying vec3 vTanWorld;      // 面切线（世界空间，顶点着色器里已
 varying vec3 vBitanWorld;    // 板材凹凸法线在片元里拼装；modelMatrix 只在顶点可用
 varying vec3 vViewDir;
 varying vec3 vObjPos;
-varying vec3 vLiftWorld;   // v-内容1：棱台内面/侧壁所属五边形外法线（世界系），FRAG_BACK 用它区分侧壁与内面
 // v5.2 面裂片：片自身的轮廓环。非裂片几何不提供这两个属性 → WebGL 通用属性默认 0，无害。
 /* v5.18 修正：本行旧注释把语义写反了，与生成器 dodecaKit.js:250 冲突。
  * 以生成器为准：aSeam = 「到本片轮廓的距离 / 带宽 W」——
@@ -643,6 +442,7 @@ void main() {
   // 正交相机下 normalize(-mvPosition.xyz) 是错误的：相机在 z=50 处、物体横向偏离时
   // 会得到最多 ~5° 的视线偏角，恰好把边缘光算歪。正确做法是用真实的前向向量。
   vViewDir = -normalize(mat3(viewMatrix) * u_cam_forward);
+  vObjPos = position;
   vSeam = aSeam;
   vRim = aRim;
   vThick = aThick;
@@ -653,46 +453,11 @@ void main() {
    * 面板/擦除花纹锁在面自身坐标上，面抬起来时花纹跟着走而不是在面上滑动。
    * 浮动幅度乘在 u_lift 上：u_lift=0 时严格归零，闭合态绝不破坏严丝合缝。
    * 面级相位只错开 1.2 rad（不是整周期随机）→ 读作"整体起伏 + 轻微错相"，
-   * 而不是 12 块板各自乱飘。
-   * v-内容1：棱台顶点（aKind=1）的种子法线与抬升方向改用 aLiftN（所属五边形
-   * 的外法线）→ 内面/侧壁与外面同相浮动、刚性抬升；并先按 u_sweep 沿位似射线
-   * 从外面（u_frustum_r）推入内面（闭合态 u_sweep=0 时与外面完全重合）。 */
-  vec3 _base = position;
-  /* v-内容2：基准台面自旋 —— 绕所属面外法线（外壳=逐面法线 normal；棱台=aLiftN）
-   * Rodrigues 旋转。旋转角由 aFaceIdx 经常量分支选出（GLSL ES 1.0 不允许 attribute
-   * 索引 uniform 数组，故用 if-else 常量链）。旋转发生在位似扫掠**之前**：位似与
-   * 绕面法线旋转关于原点可交换，顺序无影响；闭合态零厚度仍保持重合。
-   * vObjPos 改用旋转后的 _base —— 刻痕/面板纹路跟着基准台面一起转（与碎片 mesh
-   * 整体旋转时纹路跟随的语义一致）。 */
-  float _fr = 0.0;
-  if (aFaceIdx < 0.5) _fr = u_faceRotA.x;
-  else if (aFaceIdx < 1.5) _fr = u_faceRotA.y;
-  else if (aFaceIdx < 2.5) _fr = u_faceRotA.z;
-  else if (aFaceIdx < 3.5) _fr = u_faceRotA.w;
-  else if (aFaceIdx < 4.5) _fr = u_faceRotB.x;
-  else if (aFaceIdx < 5.5) _fr = u_faceRotB.y;
-  else if (aFaceIdx < 6.5) _fr = u_faceRotB.z;
-  else if (aFaceIdx < 7.5) _fr = u_faceRotB.w;
-  else if (aFaceIdx < 8.5) _fr = u_faceRotC.x;
-  else if (aFaceIdx < 9.5) _fr = u_faceRotC.y;
-  else if (aFaceIdx < 10.5) _fr = u_faceRotC.z;
-  else _fr = u_faceRotC.w;
-  if (abs(_fr) > 1e-4) {
-    vec3 _ax = (aKind > 0.5) ? normalize(aLiftN) : normalize(normal);
-    float _c = cos(_fr), _s = sin(_fr);
-    _base = _base * _c + cross(_ax, _base) * _s + _ax * dot(_ax, _base) * (1.0 - _c);
-  }
-  if (aKind > 0.5) {
-    _base = mix(normalize(_base) * u_frustum_r, _base, u_sweep);
-  }
-  vObjPos = _base;   // v-内容2：面自旋后使用旋转坐标 → 刻痕/面板纹路跟随基准台面转动
+   * 而不是 12 块板各自乱飘。 */
   vec3 _nrm = normalize(normal);
-  vec3 _seedN = (aKind > 0.5) ? normalize(aLiftN) : _nrm;
-  float _fseed = vertHash13(floor(_seedN * 16.0 + 0.5));
+  float _fseed = vertHash13(floor(_nrm * 16.0 + 0.5));
   float _lift = u_lift * (1.0 + u_float_amp * sin(u_time * BASE_FLOAT_FREQ + _fseed * 1.2));
-  vec3 _liftN = (aKind > 0.5) ? normalize(aLiftN) : _nrm;
-  vLiftWorld = (aKind > 0.5) ? normalize(mat3(modelMatrix) * aLiftN) : vec3(0.0, 0.0, 1.0);
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(_base + _liftN * _lift, 1.0);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position + _nrm * _lift, 1.0);
 }
 `;
 
@@ -758,12 +523,6 @@ uniform float u_hitGain;
  * 0 = 整壳不显示（用户定标："初始0能量时：水晶碎块不显示，仅留外壳基准面包裹住核心"）；
  * ≥1.35 = 整面完全显现。是一条**空间径向**前沿，不是全局淡入。 */
 uniform float u_shell_form;
-/* v-穿帮四次修复：下降同步信号（CPU _dropSync 锁存）。碎块 reveal（闭合/展开实心度）
- * 原来只随 u_deploy：等高能态展开到位（deploy=1 → reveal=1 实白）后拉 0，收拢中段
- * deploy 1→0.4 仍保持 reveal=1 → 冰白碎块重叠成"白色片"（用户 2026-09-29 实测，
- * "属于水晶碎块的，根本不是基准面"）。u_retract=1 时 reveal 提前随 deploy 淡出，
- * 收拢=淡出，重叠不炸白；展开/闭合态（=0）保持原曲线。 */
-uniform float u_retract;
 /* v5.16：**基准面（shellInner）**的「细线环脉冲 + 擦除式半隐」。
  * 用户定标：这些行为属于基准面，不属于水晶碎块；且"不要环内半隐"。
  *   x = 全局擦除行程 0→1（1 = 全部面扫完；静止态恒 1）
@@ -773,7 +532,6 @@ uniform float u_retract;
 uniform vec4  u_revB;
 uniform float u_revBGain;            // 基准面细线环的高亮强度（BASE_RING_GAIN 量级，冷青白）
 uniform float u_base_boost;          // v5.17：幽灵态下的结构线亮度补偿（只作用颜色，不作用 alpha）
-uniform float u_sweep;               // v-内容1：棱台扫掠包络（0=零厚度；1=位似到位）——片元擦除门控用
 
 /* —— Round G-fix：半隐的两个系数（G2 实测标定，勿随手改）——
  * HIDE_DEPTH       环内砍掉的亮度比例：0.62 → 环内保留 0.38（用户基准面要求"半隐到 ~38%"）。
@@ -851,9 +609,6 @@ uniform float u_wall_amp;             // v5.11：断口（断裂侧壁）反光�
 uniform float u_burst;                // v5.12：0.80 爆发包络（0..1）
 uniform float u_burst_c;              // v5.12：爆发起始位置（触发瞬间冻结的脉冲相位）
 uniform float u_burst_w;              // v5.12：爆发已向两侧铺开的半宽（0.05→1.25）
-uniform float u_core_shell;           // v-内容3：1=核心壳体分支（基准面等比缩小版）
-uniform float u_core_alpha;           // v-内容3：核心透明度分档（0..1，CPU 按 p 算）
-uniform vec4  u_core_wipe;            // v-内容3：核心擦除前沿（x=行程 y=方向 z=环增益）
 uniform float u_pulse_gain;           // v5.13：循环脉冲幅度（消融/调参，默认 1）
 
 // —— v3 显式光照预算（详见文件头注释）——
@@ -1207,8 +962,7 @@ void main() {
       // ① 表面反射（环境灯带在棱面上的锐利成像）
       vec3 R = reflect(-Vd, N);
       // v5.11：环境反射整体降一档 —— 两条灯带的白是外壳发白成片的主要来源
-      // 白块修复 F2：envR 系数 0.76→0.45，并加冷色偏 vec3(0.78,0.88,1.0)（压 R，保蓝水晶感；envProc 仅碎片侧使用，不影响核）
-      vec3 envR = envProc(R) * 0.45 * vec3(0.78, 0.88, 1.0);
+      vec3 envR = envProc(R) * 0.76;
 
       // ② 折射进入晶体 + 在底面反弹一次后出射（宝石的"内部火"）
       float ior = 1.62;
@@ -1284,7 +1038,7 @@ void main() {
        * 关键在于这是**预乘 alpha 混合**：dst = c + dst·(1−alpha)。c 压低而 alpha 不变
        * → 片体从"发亮的薄纱"变成"能遮挡的暗玻璃"，背后的等离子核不再透上来把整壳
        * 顶成一片白；壳体退到中低亮度，刻线/脉冲才有对比空间。 */
-      c *= 0.52 * u_body_gain;   /* 白块修复 F2：本体增益 0.72→0.52（正面 envT 透射压暗，R 从 ~150 sRGB 推到阈值下；保留蓝水晶+橙缝） */
+      c *= 0.72 * u_body_gain;
 
       /* —— 分割线（v5.9 修订：阈值后**一次性**渐显，随后亮度呼吸）——
        * v5.5 的做法是"填充前沿随能量 20→80 持续推进"—— 轮廓线的亮度因此一直挂在
@@ -1334,7 +1088,7 @@ void main() {
         * (1.0 - smoothstep(0.62, 0.88, ph));            // 抵达边界前耗散
       // 脉冲色设计：峰 = 能量色向矿物白提亮（mix 到白 0.55，再掺 30% 水晶矿物色），
       // 尾随段自然落回能量色 → 亮头有实体感、又不脱离同源色族。
-      vec3 pulseCol = mix(u_emissive_color * 1.55, vec3(1.0), 0.22);   /* 白块修复 F4：脉冲环白注入 0.35→0.22（保留能量色脉冲环，减少纯白） */
+      vec3 pulseCol = mix(u_emissive_color * 1.55, vec3(1.0), 0.35);   // 恢复脉冲色相叙事：能量色向白提亮（青→橙随能量迁移）
       /* v5.12：0.80 触发的轮廓线爆发（蓄势）—— 从脉冲当前位置向两侧同时延伸，
        * u_burst_w 由 CPU 从 0.05 推到 1.25 直到铺满全部轮廓线 → 高亮一下 → 变暗。
        * u_burst_c 是触发瞬间冻结的脉冲相位（保证"从哪里开始铺"连续，不会跳）。 */
@@ -1373,7 +1127,7 @@ void main() {
        * 这是"冷色暗玻璃 + 发光线条"与"整壳白雾"的分水岭。 */
       {
         float _slc = max(max(c.r, c.g), c.b);
-        if (_slc > 0.70) c *= 0.70 / _slc;   /* 白块修复 F2：本体硬钳 0.85→0.70（降低亮面天花板，展开态掠射棱面不再成片过白） */
+        if (_slc > 0.85) c *= 0.85 / _slc;
       }
       /* v5.19：白雾删除 + 用户定标"35-80 阶段的轮廓线太淡、脉冲高亮不明显"
        * → 底线幅度 (0.26+0.09·pC) → (0.46+0.20·pC)，脉冲 0.60 → 1.05。
@@ -1484,13 +1238,7 @@ void main() {
       alpha *= shellVis;
       // v-new（用户选 A）：闭合态碎片退为半透晶纱 —— 预乘(OneFactor)混合下只降 alpha
       // 不压 c 时颜色仍整强度叠加，基准面五边形轮廓照样被冲掉；必须两者同乘。
-      // v-穿帮四次修复：u_retract（下降同步）时 reveal 提前随 deploy 淡出 ——
-      // 原 mix(0.42,1.0,smoothstep(0.0,0.40,u_deploy)) 在收拢中段（deploy 1→0.4）恒为 1，
-      // 等高能态展开到位后拉 0 会读到"冰白碎块重叠白色片"；下降收拢应=淡出。
-      // 下降用二次曲线（收拢后半程显著变淡，重叠最重的中后段最淡）；u_retract=0 保持原曲线。
-      float reveal = u_retract > 0.5
-        ? mix(0.42, 1.0, u_deploy * u_deploy)
-        : mix(0.42, 1.0, smoothstep(0.0, 0.40, u_deploy));
+      float reveal = mix(0.42, 1.0, smoothstep(0.0, 0.40, u_deploy));
       c *= reveal;
       alpha *= reveal;
       /* —— 断裂侧壁的显现门控（v5.5，消除低能态暗轮廓线）——
@@ -1515,8 +1263,8 @@ void main() {
       // 冷色调+储能辉亮：随储存粒子量升高，碎片整体变冷（深蓝偏移）且**更亮**
       vec3 coolShift = vec3(0.74, 0.86, 1.00);          // v-fix：变冷=红绿压暗（更蓝更沉），蓝通道封顶 1.0 —— 旧值 1.45 会把蓝推到 1.22 越过 bloom，储存越多整面越白
       c *= mix(vec3(1.0), coolShift, u_cool);
-      c += vec3(0.10, 0.16, 0.28) * u_cool;             /* 白块修复 F3：储能辉亮 0.07/0.12/0.20→0.10/0.16/0.28（增强击中冷蓝可见反馈；R 被 coolShift 压暗，不产 R>140 白） */
-      alpha = clamp(alpha * (1.0 + 0.60 * u_cool), 0.0, 0.97);   /* 白块修复 F3：储能增透 0.45→0.60（击中片更透亮，黑底不透白） */
+      c += vec3(0.07, 0.12, 0.20) * u_cool;             // v5.22：储能辉亮项（高能态撞击变亮可见；白块问题由 _STORED_DRAIN 根治，不再靠压低幅度）
+      alpha = clamp(alpha * (1.0 + 0.45 * u_cool), 0.0, 0.97);   // v5.22：储能增透（v5.22 交付验收幅度；闭合态残留由 drain 清除）
 
       /* ==================== v5.17：片级撞击脉冲（用户重构） ====================
        * 用户定标："现在粒子打在碎块上，整个碎块面的中心出来一道脉冲，这是完全错误的。
@@ -1661,8 +1409,8 @@ void main() {
     // Round G：脉冲的**空间相位去掉**（原来 rad·6.5 让它沿半径外跑），只留时间脉动，
     // 且整项受 appearB 门控 —— "扩散"这一读法从此只由下面 R4/R5 的脉冲环承担。
     float pulse = 0.78 + 0.30 * sin(u_time * 2.1 + pid * 2.3);
-    c += u_emissive_color * groove * (0.24 + 0.55 * pC) * pulse
-       * (0.55 + 0.45 * lambert) * (0.65 + 0.35 * plateVar) * appearB;   /* 白块修复 F1b：缝渗光功率降约 25%（缝仍可见为暗绿，不再叠加过 R>140 白阈值） */
+    c += u_emissive_color * groove * (0.30 + 0.80 * pC) * pulse
+       * (0.55 + 0.45 * lambert) * (0.65 + 0.35 * plateVar) * appearB;
     // 倒角高光（沿槽沿，随主光方向）—— 这是"金属板材"读感的主要来源，
     // 也是 B1 里**静态花纹**的主力（中央枢纽小五边形 + 5 条角部锁扣刻线的亮边）。
     c += (u_emissive_color * 0.55 + vec3(0.14, 0.17, 0.21)) * bevel * u_shell_gain
@@ -1673,7 +1421,7 @@ void main() {
     // B1：同样降为**部分常亮**（0.50）—— 0 能量时五边形边框仍可读。
     c += u_emissive_color * pxLine(sdPentagon(fuv, u_face_apothem * 0.985), 2.3)
        * mix(0.28, 1.00, u_petal) * (0.45 + 0.55 * pC) * (0.55 + 0.45 * lambert)
-       * (1.0 + 0.45 * closed) * mix(0.50, 1.0, appearB);   /* 白块修复 F1：闭合态勾边 ×2.15→×1.45（保留勾边轮廓透出，不再过曝成片） */
+       * (1.0 + 1.15 * closed) * mix(0.50, 1.0, appearB);   /* 闭合态(20-80 能量)轮廓加亮（冰蓝）—— 透过半透碎片读出带轮廓线的外壳 */
 
     /* —— v5.2 裂片专属：结构线贴合「片自身的形状」 ——
      * 片外缘（aSeam→1）即裂纹面：能量从裂缝里漏出；其中落在原五边形边界上的
@@ -1695,7 +1443,7 @@ void main() {
     }
 
     c += u_emissive_color * rim * u_shell_gain * (0.20 + 0.50 * pC) * lit;
-    c += vec3(1.0) * spec * u_shell_gain * (0.14 + 0.36 * pC) * 0.5 * lit;   /* 白块修复 F1：基准面唯一纯白 spec 系数 ×0.5（闭合态透过半透碎片的主白源） */
+    c += vec3(1.0) * spec * u_shell_gain * (0.14 + 0.36 * pC) * lit;
 
     /* ==================== v5.16：基准面的「细线环脉冲 + 擦除式半隐」 ====================
      * 用户定标："上升到达80阈值：……同时每个基准面从中心向外扩散不规则、极薄的细线环脉冲，
@@ -1713,15 +1461,9 @@ void main() {
     float rb = clamp(length(fuv) / max(u_face_apothem, 1e-6), 0.0, 1.4);
     float azb = atan(fuv.y, fuv.x);
     // v5.17（全局规则）：擦除前沿也走水晶破碎折线 —— 旧式是正弦扰动（平滑、读不出"碎"）
-    /* v-棱台删除后：移除 _wipeGate 擦除门控 —— 该门控是"升起前一刻三角面"排查期
-     * 的临时措施（把擦除推迟到升起中），但棱台已删、三角面根因已除，门控反而造成
-     * 用户最新反馈的时序错误："碎片面都要升起来了，基准面才脉冲渐隐"。
-     * 恢复原始时序：演出起跑即擦除（u_revB 0→1），0.42s 擦除完毕 → 全亮 →
-     * 0.72s 后基准面抬升/展开 —— 擦除先于升起完成。 */
     float bJit = BASE_WIPE_JIT * crystalSegJitter(azb, 8.0, faceSeed * 3.0 + 1.9);
-    float bUraw = clamp((u_revB.x - faceSeed * BASE_FACE_STAGGER)
+    float bU = clamp((u_revB.x - faceSeed * BASE_FACE_STAGGER)
                      / (1.0 - BASE_FACE_STAGGER), 0.0, 1.0);
-    float bU = bUraw;
     float bFront = (1.0 - pow(1.0 - bU, BASE_WIPE_POW)) * BASE_WIPE_END;
     // bBehind：0 = 已被前沿扫过；1 = 前沿尚未扫到
     float bBehind = smoothstep(bFront - 0.05, bFront + BASE_WIPE_SOFT + bJit, rb);
@@ -1850,63 +1592,6 @@ void main() {
     c *= _k / _lc;
   }
   gl_FragColor = vec4(c, 1.0);
-
-  /* ==================== v-内容3：核心外壳（基准面等比缩小的无厚度壳体） ====================
-   * 旧等离子体积核（上面的 u_vol_steps>0 射线步进）已对 core 停用（u_vol_steps=0）。
-   * 新核心 = 缩小版基准面：板材主体 + 五边形勾边 + 面板缝 + fresnel 边缘，预乘半透明。
-   * 透明度分档（CPU 算好 u_core_alpha）：
-   *   0 能量 → 完全不透明；0-35 → 1→0.75；35-80 → 0.75→0.40；
-   *   >80 → 与基准面同款「细线环脉冲」，只是脉冲渐隐（前沿扫过 → 完全透明、线内隐藏），
-   *   露出其内的真正能量核心（能量核心设计在下一内容，此处先做外壳）。
-   * u_core_wipe 与基准面 u_revB 同构、同一 _baseProg/_baseDir 驱动 → 跨 80 与基准面
-   * 同时起脉冲、同波形；唯一差异是扫过的落点：基准面半隐(0.50)、核心全隐(0.0)。 */
-  if (u_core_shell > 0.5) {
-    float cA = u_core_alpha;
-    // —— 分支完全自包含（v-内容5f 修复）：fuv/plateVar/groove/lambert 等不再依赖
-    //    外层板材路径的作用域（旧版 GLSL 编译器报 undeclared → 编译失败、壳面消失）。
-    //    所有局部量在分支内从 varyings/uniforms 重算，保证任何构建下编译通过。
-    vec3 _nC = normalize(vObjNrm);
-    if (!gl_FrontFacing) _nC = -_nC;
-    vec3 _tC = faceTangent(_nC);
-    vec3 _bC = cross(_nC, _tC);
-    vec3 _qC = vObjPos - _nC * dot(vObjPos, _nC);
-    vec2 fuv = vec2(dot(_qC, _tC), dot(_qC, _bC));
-    float _pidC;
-    float _seamC = mix(2.10, 1.45, u_panel_mode);
-    float groove = panelHeight(fuv, u_face_apothem, u_panel_mode, _seamC, _pidC);
-    float plateVar = 0.88 + 0.24 * hash11(_pidC * 1.37 + 3.1);
-    float lambertC = max(dot(_nC, normalize(KEY_LIGHT_DIR)), 0.0);
-    float rimC = pow(1.0 - facing, 2.0);
-    // 细线环擦除前沿（复制 u_revB 机制）：面级错相 → 12 面不同时起跑
-    float csSeed = hash13(floor(normalize(vObjNrm) * 16.0 + 0.5));
-    float crb = clamp(length(fuv) / max(u_face_apothem, 1e-6), 0.0, 1.4);
-    float cazb = atan(fuv.y, fuv.x);
-    float cJit = BASE_WIPE_JIT * crystalSegJitter(cazb, 8.0, csSeed * 3.0 + 1.9);
-    float cU = clamp((u_core_wipe.x - csSeed * BASE_FACE_STAGGER)
-                     / (1.0 - BASE_FACE_STAGGER), 0.0, 1.0);
-    float cFront = (1.0 - pow(1.0 - cU, BASE_WIPE_POW)) * BASE_WIPE_END;
-    // cBehind：0 = 已被前沿扫过；1 = 前沿尚未扫到
-    float cBehind = smoothstep(cFront - 0.05, cFront + BASE_WIPE_SOFT + cJit, crb);
-    // 方向>0 = 渐隐（扫过 → 全透明，脉冲线内隐藏）；方向<0 = 渐显（扫过 → 恢复 cA）
-    float cTarget = (u_core_wipe.y > 0.0) ? cBehind : (1.0 - cBehind);
-    cA *= mix(0.0, 1.0, cTarget);
-    // 极薄细线环（渐隐脉冲线本身）：冷青白，σ 同基准面
-    float cBand = exp(-pow((crb - cFront) / BASE_RING_SIGMA, 2.0))
-       * u_core_wipe.z * (1.0 - smoothstep(0.80, 1.0, cU));
-    // 外观 = 缩小版基准面板材：冷钢蓝板体 + 能量色渗光 + 五边形勾边 + fresnel rim + 细线环
-    vec3 cBody = mix(vec3(0.012, 0.028, 0.048), vec3(0.085, 0.135, 0.205), lambertC) * plateVar;
-    vec3 cCore = cBody;
-    cCore += u_emissive_color * (0.55 + 0.45 * lambertC) * (0.30 + 0.55 * pC) * (1.0 - 0.55 * groove);
-    cCore += u_emissive_color * pxLine(sdPentagon(fuv, u_face_apothem * 0.985), 2.3)
-          * (0.45 + 0.55 * pC) * (0.55 + 0.45 * lambertC) * 0.9;
-    cCore += u_emissive_color * rimC * 0.28 * (0.20 + 0.50 * pC);
-    cCore += mix(vec3(0.62, 0.86, 1.0), u_emissive_color, 0.25) * cBand * 0.30 * (0.40 + 0.60 * lambertC);
-    // 亮度预算：同板材分支防炸白
-    float _cMax = max(max(cCore.r, cCore.g), cCore.b);
-    if (_cMax > 1.25) cCore *= 1.25 / _cMax;
-    gl_FragColor = vec4(cCore * cA, cA);
-    return;
-  }
 }
 `;
 
@@ -1967,6 +1652,7 @@ void main() {
  *          ③ 覆盖半径要继续增大；④ 能量到 0.8 时走一段固定 ~1s 的成形动画。
  *  本版删除 RING_TUBE（精密导管）全部代码，改为粗管径环体上的雾丝着色。
  * ------------------------------------------------------------------ */
+
 
 /* 粒子：GPU 顶点着色器解算环行位置；粒子散布在**雾带的整个截面**内（不是排成一条线），
  * 与雾丝共同构成环状构造 —— 没有管道，粒子本身就是环的一部分。 */
@@ -2079,461 +1765,9 @@ void main() {
 }
 `;
 
-/* v-内容1：基准面棱台的**内侧面 + 侧壁**片元 —— 无纹路的暗面，只做：
- * 内面 = 深色板体（法线朝内，只有朝向微差、**无任何刻痕**）；
- * 侧壁 = 厚度带（法线⊥所属五边形外法线 → isWall≈1），比内面亮一档、更实，
- *   在掠射角读作"壳的侧面厚度"。与外面同一套 u_shell_alpha / u_shell_fade。 */
-
-/** v-内容4：黑洞体外壳的单个五边形面板（机械棱台，有厚度）。
- * 本地坐标：五边形在 XY 平面（法线 +Z，外表面），内面位似 ×k 下沉 -T（法线 -Z），
- * 侧壁 5 个梯形。attribute aFaceUV = 顶点映射到 [0,1]²（蚀刻/数字/微光用），
- * aFaceSeed = 面编号（"01" 蚀刻刻在 seed 0 面板），aFaceN = 面法线（本地 +Z，
- * mesh 旋转对齐后即世界面法线——抬升位移沿它走）。 */
-/** v-内容4-形：一块**带厚度**的五边形机械板（棱台：外面 + 内面 + 5 面侧壁，闭合实体）。
- * @param {number} R **面上五边形的外接半径**（= 十二面体外接半径 × 0.60706，
- *   不是十二面体的外接半径 —— 旧实现传错了，面板大了 1.647 倍）
- * @param {number} T 板厚（棱台高）
- * @param {number} k 内面位似比（<1 → 内面略小，形成机械倒角）
- * @param {number} seed 面板序号（0 号刻 "01"）
- * 局部坐标：五边形平铺在 XY 平面，**顶点 0 沿 +X**，外表面法线 +Z。
- * 调用方必须用「面心→顶点0」作局部 +X、面法线作 +Z 来摆放，否则 12 块板朝向乱转。 */
-function bhPanelGeo(R, T, k, seed) {
-  const Z = new THREE.Vector3(0, 0, 1);
-  const verts = [];
-  // 顶点 0 落在 +X（角度 0），绕序与十二面体面的 CCW 一致
-  for (let i = 0; i < 5; i++) {
-    const a = i * 1.2566371;              // 2π/5 = 72°
-    verts.push(new THREE.Vector3(Math.cos(a) * R, Math.sin(a) * R, 0));
-  }
-  const uvOf = (p) => new THREE.Vector2(p.x / (2 * R) + 0.5, p.y / (2 * R) + 0.5);
-  const P = [], N = [], UV = [], Seed = [], FN = [];
-  const push = (p, n, uv) => {
-    P.push(p.x, p.y, p.z); N.push(n.x, n.y, n.z);
-    UV.push(uv.x, uv.y); Seed.push(seed); FN.push(0, 0, 1);
-  };
-  const C = new THREE.Vector3(0, 0, 0);
-  const cUV = uvOf(C);
-  // 外表面（法线 +Z，蚀刻面）
-  for (let i = 0; i < 5; i++) {
-    push(C, Z, cUV);
-    push(verts[i], Z, uvOf(verts[i]));
-    push(verts[(i + 1) % 5], Z, uvOf(verts[(i + 1) % 5]));
-  }
-  // 内表面（位似 ×k、下沉 -T，法线 -Z，暗面）
-  /* v-内容4-形：内表面必须有**自己的中心点** —— 旧实现拿 inner[0]（一个角顶点）
-   * 当扇心，扇出的前/后两个三角形是退化的，内侧出现破面。 */
-  const CI = new THREE.Vector3(0, 0, -T);
-  const ciUV = uvOf(CI);
-  const inner = verts.map((v) => new THREE.Vector3(v.x * k, v.y * k, -T));
-  const nZ = Z.clone().negate();
-  for (let i = 0; i < 5; i++) {
-    push(CI, nZ, ciUV);
-    push(inner[(i + 1) % 5], nZ, uvOf(inner[(i + 1) % 5]));
-    push(inner[i], nZ, uvOf(inner[i]));
-  }
-  // 侧壁（5 个梯形，法线朝外）
-  for (let i = 0; i < 5; i++) {
-    const a = verts[i], b = verts[(i + 1) % 5];
-    const ai = inner[i], bi = inner[(i + 1) % 5];
-    const e = b.clone().sub(a);
-    const d = ai.clone().sub(a);
-    const wn = new THREE.Vector3().crossVectors(e, d).normalize();
-    const mid = a.clone().add(b).multiplyScalar(0.5).sub(new THREE.Vector3(0, 0, -T * 0.5));
-    if (wn.dot(mid) < 0) wn.negate();
-    push(a, wn, uvOf(a)); push(b, wn, uvOf(b)); push(bi, wn, uvOf(bi));
-    push(a, wn, uvOf(a)); push(ai, wn, uvOf(ai)); push(bi, wn, uvOf(bi));
-  }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
-  g.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
-  g.setAttribute('aFaceUV', new THREE.Float32BufferAttribute(UV, 2));
-  g.setAttribute('aFaceSeed', new THREE.Float32BufferAttribute(Seed, 1));
-  g.setAttribute('aFaceN', new THREE.Float32BufferAttribute(FN, 3));
-  return g;
-}
-
-const BH_PANEL_VERT = /* glsl */ `
-  attribute vec2 aFaceUV;
-  attribute float aFaceSeed;
-  varying vec2 vUV;
-  varying float vSeed;
-  varying float vLocalZ;
-  varying vec3 vN;
-  varying vec3 vV;
-  void main() {
-    vUV = aFaceUV; vSeed = aFaceSeed;
-    vLocalZ = normal.z;                       // 本地法线 z：外表面 +1 / 内表面 -1 / 侧壁 ~0
-    vN = normalize(normalMatrix * normal);
-    vec4 mv = modelViewMatrix * vec4(position, 1.0);
-    vV = normalize(-mv.xyz);
-    gl_Position = projectionMatrix * mv;
-  }
-`;
-
-const BH_PANEL_FRAG = /* glsl */ `
-  uniform float u_bh_glow;      // 板壳微光 0..1（20-80 随抬升）
-  uniform float u_bh_reveal;    // 面板可见 alpha（塌缩 1→0；常态 1）
-  uniform float u_bh_burn;      // 塌缩撕裂增亮 0..1
-  /* v5.23-form：数据化成形 0..1 —— <80 回落 ③ 段用。
-   * 用户定标："先出现数据流虚影，随着数据填充逐渐变为实体"。
-   * 0 = 不成形（由 u_bh_reveal 管），0..1 = 全息虚影 + 自下而上的"数据填充"线扫过
-   * （扫过处变实体），1 = 完全实体。塌缩路径不受影响（form 恒 0）。 */
-  uniform float u_bh_form;
-  uniform float u_time;
-  uniform vec3 u_emissive_color;
-  varying vec2 vUV;
-  varying float vSeed;
-  varying float vLocalZ;
-  varying vec3 vN;
-  varying vec3 vV;
-  float _bhCircle(vec2 p, float r) { return length(p) - r; }
-  float _bhBox(vec2 p, vec2 b) { vec2 d = abs(p) - b; return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0); }
-  void main() {
-    vec2 uv = vUV;
-    vec2 c = uv - 0.5;
-    float r = length(c);
-    bool outerFace = vLocalZ > 0.5;           // 只有外表面有蚀刻/数字
-    // 金属底色：暗冷灰钢（外表面略亮）
-    vec3 col = mix(vec3(0.022, 0.030, 0.042), vec3(0.060, 0.075, 0.095),
-      smoothstep(0.0, 0.45, r));
-    if (outerFace) {
-      // 同心机械蚀刻环（3 道）
-      float etch = 1.0;
-      for (int i = 0; i < 3; i++) {
-        float rr = 0.115 + float(i) * 0.115;
-        etch = min(etch, smoothstep(0.0018, 0.0, abs(r - rr)));
-      }
-      // 径向蚀刻线（12 条，从内环到外缘）
-      float ang = atan(c.y, c.x);
-      for (int i = 0; i < 12; i++) {
-        float a = float(i) * 0.5236;
-        float dd = abs(ang - a); dd = min(dd, 6.28318 - dd);
-        etch = min(etch, smoothstep(0.020, 0.0, dd) * smoothstep(0.38, 0.02, r));
-      }
-      // 角部机械符号：5 个小铆钉
-      for (int i = 0; i < 5; i++) {
-        float a = float(i) * 1.2566 + 0.6283;
-        vec2 p = vec2(cos(a), sin(a)) * 0.40;
-        etch = min(etch, smoothstep(0.010, 0.0, abs(_bhCircle(c - p, 0.018))));
-      }
-      // "01" 面板（seed 0）：蚀刻数字 —— "0" = 圆环，"1" = 竖线 + 底座
-      if (vSeed < 0.5) {
-        float d0 = abs(_bhCircle(c - vec2(-0.145, 0.0), 0.055)) - 0.013;
-        float d1 = _bhBox(c - vec2(0.070, 0.012), vec2(0.012, 0.062));
-        d1 = min(d1, _bhBox(c - vec2(0.070, -0.058), vec2(0.042, 0.012)));
-        float dd = min(d0, d1);
-        etch = min(etch, smoothstep(0.012, 0.0, abs(dd)));
-      }
-      // 蚀刻凹槽（暗线）
-      col = mix(col, vec3(0.010, 0.014, 0.020), etch * 0.92);
-    } else {
-      // 内表面/侧壁：无蚀刻，暗金属 + 微弱能量渗光（缝隙边缘）
-      col *= 0.62;
-      col += u_emissive_color * 0.05;
-    }
-    // 面板边缘微光（能量色，随 u_bh_glow：20 起微光 → 80 高亮）
-    float rim = smoothstep(0.465, 0.30, r);
-    col += u_emissive_color * rim * (0.10 + 0.90 * u_bh_glow) * (0.30 + 0.70 * u_bh_glow);
-    // 塌缩撕裂：泛能量白热
-    col += u_emissive_color * u_bh_burn * 1.6 + vec3(u_bh_burn) * 0.22;
-    // 透视边缘阴影
-    col *= 0.55 + 0.45 * smoothstep(0.45, 0.38, r);
-    // 能量色微光环境反射（面板整体随 glow 微亮）
-    col += u_emissive_color * u_bh_glow * 0.06;
-    /* v5.23-form：数据化成形 —— 全息虚影（扫描线 + 轮廓框线）被一条自下而上的
-     * "数据填充"线逐步实体化；虚影部分带轻微闪烁（全息不稳定感）。
-     * m：该像素的实体化程度（uv.y 越小越先填满 → 读作"数据从底部往上灌"）。 */
-    float m = clamp(u_bh_form * 1.45 - uv.y * 0.45, 0.0, 1.0);
-    if (u_bh_form > 0.001) {
-      float scan = 0.5 + 0.5 * sin(uv.y * 130.0 - u_time * 10.0 + vSeed * 7.0);
-      vec3 ghost = u_emissive_color * (0.38 + 0.50 * scan);
-      // 全息轮廓框线（比面亮得多 → 读作"线框虚影"而不是"半透明板"）
-      float frame = smoothstep(0.47, 0.43, r) - smoothstep(0.42, 0.38, r);
-      ghost += u_emissive_color * max(frame, 0.0) * 1.1;
-      col = mix(ghost, col, m);
-      float flick = 0.82 + 0.18 * sin(u_time * 31.0 + vSeed * 11.0);
-      col *= mix(flick, 1.0, m);
-    }
-    float ghostA = smoothstep(0.0, 0.06, u_bh_form) * mix(0.60, 1.0, u_bh_form);
-    float alpha = max(u_bh_reveal, ghostA);
-    // v-内容4-形：外壳是完全不透明的实体 → **非预乘**输出（材质是 NormalBlending）
-    gl_FragColor = vec4(col, alpha);
-  }
-`;
-
-/* v5.23-crush（用户定标）：**"黑洞被不同方向的、不同大小的巨大的力（失控的自身引力）
- * 向内挤压，塌缩到奇点"** —— 不是等比缩放、也不是整体压成椭圆。
- * 做法：一组 6 路**方向不同 / 大小不等 / 相位各异**的定向压痕场叠加 —— 球面被
- * 这边压得深、那边压得浅，并且持续抖动（"失控"）。
- * 视界球（顶点位移）与透镜壳（顶点位移 + 环半径调制）共用同一个场 → 二者一致。 */
-const BH_CRUSH_GLSL = /* glsl */ `
-  float bhCrushField(vec3 n, float t) {
-    float d = 0.0;
-    for (int i = 0; i < 6; i++) {
-      float fi = float(i);
-      vec3 ax = normalize(vec3(sin(fi * 2.37 + 1.7), cos(fi * 1.91 + 0.6), sin(fi * 3.13 + 2.3)));
-      /* v5.25-churn：压痕轴绕 Y **缓慢自转**（各 lobe 转速不同）→ 凹坑在球面上迁移、
-       * 互相撕扯，读作"失控"，而不是一张静止的凹凸贴图。 */
-      float rot = t * (0.55 + 0.31 * fi);
-      float cr = cos(rot), sr = sin(rot);
-      ax = vec3(ax.x * cr - ax.z * sr, ax.y, ax.x * sr + ax.z * cr);
-      float amp = 0.45 + 0.55 * abs(sin(fi * 4.71 + 0.9));          // 大小不等
-      float lobe = pow(max(dot(n, ax), 0.0), 2.0);                  // 定向压痕（指数 2 = 覆盖面更广，压得更"肉眼可见"）
-      float jit = 0.72 + 0.28 * sin(t * (9.0 + fi * 2.3) + fi * 1.9); // 失控抖动
-      d += amp * lobe * jit;
-    }
-    return d;
-  }
-`;
-
-/* 事件视界本体：纯黑 + 按挤压场往里凹（仍然 opaque + 写深度 = 物理职责不变） */
-const BH_HORIZON_VERT = /* glsl */ `
-  uniform float u_bh_crush;   // 失控引力挤压量 0..1
-  uniform float u_time;
-  varying vec3 vN;
-  varying vec3 vV;
-  varying float vD;           // 该处被压进去的深度 0..1
-  ${BH_CRUSH_GLSL}
-  void main() {
-    vec3 n = normalize(position);
-    float dent = min(u_bh_crush * 0.62 * bhCrushField(n, u_time), 0.78);  // 别压过球心
-    vD = dent;
-    vN = normalize(normalMatrix * n);
-    vec4 mv = modelViewMatrix * vec4(position - n * dent, 1.0);
-    vV = normalize(-mv.xyz);
-    gl_Position = projectionMatrix * mv;
-  }
-`;
-/* ★ v5.25-readable：**纯黑球在黑底上没有任何形状信息** —— 以前塌缩"看不出压痕"
- * 的真正原因不是压痕不存在，而是**没有任何可读的明暗**把它显示出来（黑压黑）。
- * 物理上对应"光在被挤压的临界曲线外侧堆积"：给视界加一圈**沿轮廓的压缩亮边**，
- * 且压得越深越亮。轮廓线会随凹坑起伏 → 挤压过程终于看得见。
- * 注意：仍然是不透明、写深度的实体球，遮挡职责不变。 */
-const BH_HORIZON_FRAG = /* glsl */ `
-  varying vec3 vN;
-  varying vec3 vV;
-  varying float vD;
-  void main() {
-    float rim = pow(1.0 - max(dot(normalize(vN), normalize(vV)), 0.0), 3.0);
-    float glow = rim * vD * 1.35;   // v5.25b：**只在挤压时**有亮边（常态 vD=0 → 严格无环）
-    vec3 c = vec3(0.52, 0.74, 1.0) * glow;
-    gl_FragColor = vec4(c, 1.0);
-  }
-`;
-
-const BH_CORE_VERT = /* glsl */ `
-  uniform float u_bh_crush;   // 与视界球同一个场，保证轮廓一致
-  uniform float u_time;
-  varying vec3 vN;
-  varying vec3 vV;
-  varying vec3 vP;    // v5.23：视空间位置 —— 多普勒束射的方位角从它取
-  varying vec3 vON;   // v5.23-crush：物体空间法线 —— 环半径按挤压场扭曲
-  ${BH_CRUSH_GLSL}
-  void main() {
-    vec3 n = normalize(position);
-    float dent = min(u_bh_crush * 0.52 * bhCrushField(n, u_time), 0.72);
-    vON = n;
-    vN = normalize(normalMatrix * normal);
-    vec4 mv = modelViewMatrix * vec4(position - n * dent, 1.0);
-    vV = normalize(-mv.xyz);
-    vP = mv.xyz;
-    gl_Position = projectionMatrix * mv;
-  }
-`;
-
-/* v5.23-lens（按调研重写）：旧版被用户定性"一直闪瞎眼睛的黄色极度高亮光环，
- * 根本不是引力透镜"。调研结论（Gargantua / EHT M87* / 测地线渲染器的共识）：
- *   · 光子环 = **贴着阴影边缘的一条极细亮带**（临界曲线 b=3√3/2·rs 处光的堆积），
- *     宽度是"几像素"量级，不是一条粗环；
- *   · 外面还有**指数衰减的次级子环**（光子多绕半圈再逃逸的更弱像）——结构感来自这里；
- *   · 多普勒束射：朝向观察者一侧更亮（I_obs = g^4·I_emit，取弱化版cos调制防爆bloom）；
- *   · 引力透镜的本体是"背景被弯折"，没有屏幕空间折射就**不该用大光晕去假装** ——
- *     旧版的 fat ring + 大 halo + 高增益正是"闪瞎眼"的根因，全部删掉。
- * 环半径：视界在本球投影里占 u_bh_vh，光子球在 1.5 rs → 环贴在 u_bh_vh 外侧一点点。 */
-const BH_CORE_FRAG = /* glsl */ `
-  uniform float u_bh_swallow;   // 塌缩吞噬 0..1（>80 后维持；环略增强）
-  uniform float u_bh_size;      // 黑洞尺寸归一 0..1（小黑洞环更弱）
-  uniform float u_bh_flash;     // ③「闪光」sin 半周 0→1→0
-  uniform float u_bh_vh;        // 视界盘在本球投影半径中的占比 = 1/BH_LENS_K ≈ 0.667
-  uniform float u_bh_warp;      // 引力扭曲 0..1（压入奇点：环被往里拽 + 方位涟漪）
-  uniform float u_bh_crush;     // v5.23-crush：多向不等巨力的挤压量 0..1
-  uniform float u_bh_dim;       // v5.24-crush：「冻结星」变暗量 0..1（1 = 彻底变黑）
-  uniform float u_time;
-  uniform vec3 u_emissive_color;
-  varying vec3 vN;
-  varying vec3 vV;
-  varying vec3 vP;
-  varying vec3 vON;
-  ${BH_CRUSH_GLSL}
-  void main() {
-    vec3 n = normalize(vN);
-    vec3 v = normalize(vV);
-    float dp = max(dot(n, v), 0.0);
-    float r = sqrt(max(1.0 - dp * dp, 0.0));    // 0 = 盘心, 1 = 球轮廓
-    float az = atan(vP.y, vP.x);                // 视线方位角（多普勒不对称）
-    // 引力扭曲：环被往里拽 + 方位涟漪（时空往里塌的湍流感）
-    float rip = sin(az * 6.0 + u_time * 9.0) * sin(r * 34.0 - u_time * 13.0);
-    // v5.23-crush：挤压深的方位环被压得更靠里（与视界的凹痕同场 → 轮廓一致）
-    float cf = bhCrushField(normalize(vON), u_time);
-    float ringR = u_bh_vh + 0.020 - 0.030 * u_bh_warp + 0.012 * u_bh_warp * rip
-                - 0.10 * u_bh_crush * cf;       // v5.24：挤压深的方位环被压得更靠里（幅度加大 → 看得见）
-    ringR = max(ringR, u_bh_vh + 0.006);        // 环绝不能掉进视界里
-    // 光子环：贴着视界外缘的**极细**亮环（宽度 0.010 ≈ 数像素）
-    float pr = exp(-pow((r - ringR) / 0.010, 2.0));
-    // 多普勒束射：一侧更亮（g^4 的弱化余弦调制；不对称 = 真实感来源）
-    float dop = 1.0 + 0.42 * cos(az - 0.6);
-    vec3 ringCol = mix(vec3(1.0), u_emissive_color, 0.55);
-    float amp = (0.85 + 0.55 * u_bh_swallow) * (0.55 + 0.45 * u_bh_size) * dop;
-    vec3 col = ringCol * pr * amp;
-    // 次级子环：光子多绕半圈的更弱像（指数衰减，物理带出来的结构）
-    float sr = exp(-pow((r - ringR - 0.045) / 0.014, 2.0));
-    col += ringCol * sr * amp * 0.22;
-    /* v5.24-crush：**挤压亮弧** —— 黑球本身在黑底上没有任何可读信息，压痕只能靠
-     * 轮廓和环的形状读出来。所以在"被压得最深"的方位额外加一道亮弧，
-     * 读作"这一侧正被巨力按进去"（物理上对应光在被挤压的临界曲线外侧堆积）。 */
-    float press = smoothstep(0.30, 1.15, cf) * u_bh_crush;
-    col += ringCol * (pr + sr * 0.5) * press * (0.85 + 0.55 * u_bh_swallow);
-    // 透镜聚光：临界曲线外侧被弯折光的快速衰减辉光（很淡，只给"弯折感"）
-    float bend = exp(-max(r - ringR - 0.045, 0.0) * 10.0) * step(ringR + 0.045, r);
-    col += mix(vec3(1.0), u_emissive_color, 0.35) * bend * (0.10 + 0.10 * u_bh_swallow) * dop;
-    // 视界内不贡献（由不透明黑球负责）
-    col *= 1.0 - step(r, ringR - 0.004);
-    // v5.24-crush：冻结星 —— 塌缩末段整个环迅速熄灭（远处的观察者看到的正是"变暗消失"）
-    col *= 1.0 - u_bh_dim;
-    /* ③闪光（v5.26，用户定标"耀眼但很小，像小型超新星爆发"）：**不是一团雾**。
-     * 结构（超新星/恒星耀光的标准三件套）：
-     *   · 白炽小核：r≈0.085 的陡高斯，HDR 幅值 1.6 → 交给 bloom 炸成刺眼的亮点；
-     *   · 衍射芒刺：|cos(2az)|^50 → 4 道正交细芒，随半径指数衰减（锐利、有方向性）；
-     *   · 残余晕圈：极淡暖色辉光，只做过渡，不再撑起形状。
-     * 旧版 = 0.45 常底 + 0.42 半径的大高斯 → 一团规则雾化光团（用户否）。 */
-    float coreF = exp(-pow(r / 0.085, 2.0));
-    float spike = pow(abs(cos(az * 2.0)), 50.0) * exp(-r * 3.2);
-    float haloF = exp(-pow(r / 0.30, 2.0)) * 0.16;
-    col += (vec3(1.60, 1.52, 1.34) * coreF
-          + vec3(0.90, 0.96, 1.10) * spike * 0.90
-          + vec3(1.00, 0.86, 0.62) * haloF) * u_bh_flash;
-    float alpha = 1.0 - smoothstep(0.75, 1.02, r);
-    alpha = max(alpha, u_bh_flash * (1.0 - smoothstep(0.32, 1.02, r)));
-    gl_FragColor = vec4(col * alpha, alpha);
-  }
-`;
-
-/* ── v5.27：真·引力透镜（测地线偏折）────────────────────────────────────────────
- * 旧做法（v5.24 屏幕空间径向偏移 / v5.23 描一个环）都被用户否掉，根因是同一个：
- * **它们没有"黑洞身后到底有什么"这份数据**，只能靠加亮去假装 → 用户看到的就是
- * "凭空多出一个大圆环"（v5.24）或"闪瞎眼的黄色光环"（v5.23）。
- *
- * 这次的做法分两步，缺一不可：
- *  ① 在黑洞中心放一个**立方探针**（渲染不含黑洞自身的场景六面）→ 拿到"洞后有什么"；
- *  ② 每个片元：由它到洞心的世界径向偏移得碰撞参数 b（盘面⊥视线 ⇒ 偏移即 b），
- *     查测地线表得偏折角 α（严格 Schwarzschild 零测地线数值积分，见 geodesic.js），
- *     把视线绕"指向洞心"的方向转 α，再去采样立方探针 —— 采样到的就是**被弯折过来的
- *     身后场景**。b < b_c → 被捕获 → 阴影。
- *
- * 为什么能"把洞后的内容压缩成一圈"：α 在临界曲线处对数发散（实测 b=1.001·b_c 时
- * α=6.51 rad ≈ 373°），逃逸方向绕洞扫过一整圈还多 → 身后整片场景被卷进薄薄一环。
- *
- * ★ 形状选择：**过洞心且垂直于视线的薄圆环**（v5.28 由圆盘改成环），不是球壳。
- *   球壳的前半球比洞心还近，会把"洞前、靠近视角那一侧"的碎块也一起涂掉 —— 正是
- *   用户反复强调的错（"黑洞前面并不会被引力透镜影响，可以正常遮住黑洞"）。
- *   过洞心的平面深度就是洞心深度 ⇒ 洞前的东西深度更近、正常遮住它；洞后的东西被它接管。
- *   它是**场景内的网格**，深度测试照常生效 —— 不做任何全屏 pass，绝不越权画在最前面。
- * ★ v5.28 覆盖语义：**alpha 恒为 1，整条环做纯替换**。
- *   v5.27 用 alpha<1 做 Crossfade，等于在同一个像素里同时输出"沿直线来的光"和
- *   "被弯折来的光"——一个光子只能走一条测地线，所以那是错的（用户："能同时看到弯折后的
- *   景象和原来的景象？这都不符合物理规律了"）。
- *   "远处的透镜看起来和没透镜一样"这件事，靠的是**偏折角趋于 0**（见片段 ②），
- *   不是靠两张图半透明叠加。代价写在 renderOrder 的那段注释里。 */
-const BH_GRAV_VERT = /* glsl */ `
-  varying vec3 vW;
-  void main() {
-    vec4 wp = modelMatrix * vec4(position, 1.0);
-    vW = wp.xyz;
-    gl_Position = projectionMatrix * viewMatrix * wp;
-  }
-`;
-const BH_GRAV_FRAG = /* glsl */ `
-  uniform samplerCube t_probe;   // 黑洞中心处的立方探针（渲染时已排除黑洞自身）
-  uniform sampler2D  t_lut;      // 测地线偏折角查找表（r 通道 0..255 ↔ 0..2π）
-  uniform vec3  u_gv_center;     // 黑洞中心（世界坐标）
-  uniform vec3  u_gv_fwd;        // 视线方向（世界；正交相机 ⇒ 全场同一条）
-  uniform float u_gv_rs;         // 有效史瓦西半径（世界单位）
-  uniform float u_gv_uout;       // 环外缘（窗函数在此归零）
-  varying vec3 vW;
-
-  const float B_CRIT  = 2.5980762;   // 3√3/2
-  const float PI      = 3.14159265;
-  const float TWO_PI  = 6.28318531;
-  const float LUT_UMAX = 6.0;
-
-  void main() {
-    /* 环面严格垂直于视线 ⇒ 世界径向偏移本身就是碰撞参数 b */
-    vec3 off = vW - u_gv_center;
-    float b = length(off);
-    float u = b / max(u_gv_rs * B_CRIT, 1e-6);      // 归一碰撞参数（1 = 临界曲线）
-    /* ① 偏折角查表：非均匀采样 s = ((u−1)/(uMax−1))^(1/3) —— 临界曲线附近最密 */
-    float s = pow(clamp((u - 1.0) / (LUT_UMAX - 1.0), 0.0, 1.0), 1.0 / 3.0);
-    float a = texture2D(t_lut, vec2(s, 0.5)).r * TWO_PI;
-    if (u > LUT_UMAX) a = 2.0 / (u * B_CRIT);       // 远场弱场 α ≈ 4M/b = 2/b_Rs
-    /* ② 窗：把**偏折角本身**乘窗（不是把颜色混淡）。到环外缘 α 连续回到 0 ⇒
-     *    "偏折后的采样方向 = 原视线"，于是最外一圈的输出就是它本来就该有的样子，
-     *    与环外的场景**逐像素连续** —— 既不会多出硬边，也不需要用到半透明。 */
-    a *= 1.0 - smoothstep(1.0, u_gv_uout, u);
-    /* ③ 高阶像：绕行超过半圈的光每多绕一圈亮度 × e^{−2π} ⇒ 靠近临界曲线急剧变暗。
-     *    既符合物理，又避免发散区采样出噪点；最亮的那条细环由既有 bhLens 负责。 */
-    float dim = exp(-max(a - PI, 0.0) * 1.6);
-    /* ④ 罗德里格斯旋转：把视线朝"指向洞心"的方向转 a（几何上二者严格正交，
-     *    u = rd·cos a + bhDir·sin a 就是旋转结果）。 */
-    vec3 bhDir = -off / max(b, 1e-6);
-    vec3 rd = normalize(u_gv_fwd);
-    vec3 rd2 = rd * cos(a) + bhDir * sin(a);
-    vec3 col = textureCube(t_probe, rd2).rgb * dim;
-    /* ⑤ **覆盖度恒为 1** —— 一个像素只能有一张像。
-     *    若用 alpha<1 把"弯曲像"和"直影像"叠在一起，等于让同一个光子既走直线又被弯折：
-     *    cout = mix(原像, 弯折像, α混) 在物理上不成立（用户原话："能同时看到弯折后的
-     *    景象和原来的景象？这都不符合物理规律了"）。
-     *    "看起来能透出原像"的正确实现，是让**偏折角本身趋于 0**（②），
-     *    而不是让两种结果各占一半不透明度。 */
-    gl_FragColor = vec4(col, 1.0);
-  }
-`;
-
-/** 把测地线偏折角烘成一张 n×1 贴图（r 通道 0..255 ↔ 0..2π）。
- *  ucs：非均匀采样 s∈[0,1] → u = 1 + (uMax−1)·s³，临界曲线附近最密。 */
-function buildLutTexture(n = 256, uMax = LUT_UMAX) {
-  const lut = buildDeflectionLUT(n, uMax);
-  const data = new Uint8Array(lut.n * 4);
-  for (let i = 0; i < lut.n; i++) {
-    const v = lut.data[i];
-    data[i * 4] = v; data[i * 4 + 1] = v; data[i * 4 + 2] = v; data[i * 4 + 3] = 255;
-  }
-  const tex = new THREE.DataTexture(data, lut.n, 1, THREE.RGBAFormat);
-  tex.minFilter = THREE.LinearFilter;
-  tex.magFilter = THREE.LinearFilter;
-  tex.wrapS = THREE.ClampToEdgeWrapping;
-  tex.wrapT = THREE.ClampToEdgeWrapping;
-  tex.needsUpdate = true;
-  return tex;
-}
-
 function dodeca(radius) {
   const g = new THREE.DodecahedronGeometry(radius, 0);
   g.computeVertexNormals(); // 非索引几何 → 逐面法线，保留多面体棱面
-  // v-内容2：按 9 顶点/面分组烘焙所属面索引（0..11）—— 基准台面自旋（aFaceIdx）
-  /* v-旋转错位修复（实测定位）：THREE.DodecahedronGeometry 的**面序** ≠
-   * dodecaKit 的 DODEC_FACE_NORMALS 面序（碎片 faceIdx 用后者）。
-   * 原 floor(i/9) 直接按 THREE 面序编号 → 基准面第 k 面实际用的是碎片
-   * 另一个面的旋转角/事件（2~4s 才触发一次）→ 用户实测"基准面旋转方向和
-   * 开始时间与碎片完全不一样，差好几秒"。
-   * 映射表（脚本对 12 面法线逐一点积 dot=1.000 核验）：
-   *   THREE T0→D4, T1→D0, T2→D10, T3→D11, T4→D3, T5→D6,
-   *   T6→D1, T7→D9, T8→D7, T9→D8, T10→D2, T11→D5
-   * 烘焙时把 THREE 面序翻译回碎片面序 → 同一物理面的旋转角/轴/事件完全对齐。 */
-  const FACE_MAP = [4, 0, 10, 11, 3, 6, 1, 9, 7, 8, 2, 5];
-  const pos = g.attributes.position.array;
-  const faceIdx = new Float32Array(pos.length / 3);
-  for (let i = 0; i < faceIdx.length; i++) faceIdx[i] = FACE_MAP[Math.floor(i / 9)];
-  g.setAttribute('aFaceIdx', new THREE.BufferAttribute(faceIdx, 1));
   return g;
 }
 
@@ -2598,39 +1832,21 @@ export class L5Core {
       u_burst: { value: 0.0 },          // v5.12：0.80 轮廓线爆发包络
       u_burst_c: { value: 0.5 },        // v5.12：爆发中心（触发瞬间冻结的脉冲相位）
       u_burst_w: { value: 0.05 },       // v5.12：爆发已向两侧铺开的半宽
-      u_core_shell: { value: 0.0 },     // v-内容3：1=核心壳体分支（基准面等比缩小版）
-      u_core_alpha: { value: 1.0 },     // v-内容3：核心透明度分档（sync 每帧算）
-      u_core_wipe: { value: new THREE.Vector4(1.0, -1.0, 0.0, 0.0) },  // v-内容3：核心擦除前沿
       u_pulse_gain: { value: 1.0 },     // v5.13：循环脉冲幅度倍率
       // Round G：面内径向脉冲（v5.16：只剩 R4 撞击一路）—— 默认"未启用"，由裂片各自覆盖
       u_rev: { value: new THREE.Vector4(REVEAL_FRONT_END, 0, 0, 0) },
       u_revGain: { value: 0.0 },
       // v5.16：20 阈值 —— 水晶壳"由每个面心向外不规则脉冲渐显"的前沿进度 0→1
       u_shell_form: { value: 0.0 },
-      // v-穿帮四次修复：下降同步信号（_dropSync 锁存）—— 碎块 reveal 提前淡出（收拢=淡出）
-      u_retract: { value: 0.0 },
       // v5.16：基准面（shellInner）的细线环脉冲 + 擦除式半隐
       u_revB: { value: new THREE.Vector4(1.0, -1.0, 0.0, 0.0) },  // x=行程 y=方向 z=环增益
       u_revBGain: { value: BASE_RING_GAIN },
-      /* v-内容3：核心外壳 —— u_core_shell=1 时 FRAG 走「壳体分支」（基准面等比缩小版），
-       * 默认 0 → 其他材质完全不受影响。 */
-      u_core_shell: { value: 0.0 },
       u_base_boost: { value: 1.0 },     // v5.17：幽灵态结构线亮度补偿（基准面专属）
       /* v5.18：抬升/浮动写在顶点着色器里，VERT 被**所有**材质共用，
        * 因此必须在主 uniform 里给出默认 0 —— 除基准面外的一切都保持不动。
        * 基准面用的是 shellInnerUniforms 里的独立副本（见下方），不共享引用。 */
       u_lift: { value: 0.0 },
       u_float_amp: { value: 0.0 },
-      /* v-内容1：棱台扫掠/位似半径 —— 默认 0，仅基准面棱台材质（shellInnerUniforms
-       * 副本）写入；其余材质 aKind=0，这两个 uniform 不参与。 */
-      u_sweep: { value: 0.0 },
-      u_frustum_r: { value: 0.0 },
-      /* v-内容2：基准台面自旋角（打包 3×vec4，面 0-3/4-7/8-11）——
-       * **默认恒 0**：裂片/核心/笼共享本表引用，读 0 → 不转；
-       * 仅 shellInnerUniforms 覆盖为独立引用，由 sync() 每帧写入。 */
-      u_faceRotA: { value: new THREE.Vector4(0, 0, 0, 0) },
-      u_faceRotB: { value: new THREE.Vector4(0, 0, 0, 0) },
-      u_faceRotC: { value: new THREE.Vector4(0, 0, 0, 0) },
       // v5.17：片级撞击脉冲（每片材质克隆后独立）
       u_hitP: { value: new THREE.Vector3(0, 0, 0) },
       u_hitT: { value: -1.0 },
@@ -2663,277 +1879,18 @@ export class L5Core {
     });
     this._shellMaterial = _shellMaterial;
 
-    /* ---------- v-内容3：核心外壳（基准面等比缩小的无厚度壳体） ----------
-     * 舍弃旧"等离子体积核"（u_vol_steps>0 的射线步进分支）—— 那团云不随构造体转动、
-     * 且和整体风格割裂。新核心 = 基准面壳的等比缩小版（dodeca(R_CORE) 面壳），
-     * 透明度随能量分档（0→全不透明 / 0-35→75% / 35-80→40% / >80→细线环脉冲渐隐至
-     * 完全透明、露出内层能量核心——能量核心在下一内容）。u_core_shell=1 走 FRAG 壳体分支。
-     * uniforms 独立 fork：共享项（能量色/时间/主参数等）仍经引用同步，私有项
-     * （u_core_alpha 分档透明度、u_core_wipe 擦除前沿）由 sync() 每帧单独写入。 */
+    /* ---------- 内层：等离子核 ---------- */
     this.coreMaterial = new THREE.ShaderMaterial({
       vertexShader: VERT,
       fragmentShader: FRAG,
-      uniforms: fork({
-        u_core_shell: { value: 1.0 },
-        u_vol_steps: { value: 0 },        // 双保险：壳体分支之前旧等离子分支直接跳过
-        u_petal: { value: 0.0 },          // 板材路径（与基准面同款面板/勾边）
-        u_panel_mode: { value: 1.0 },
-        u_bump: { value: 0.0 },
-        u_shell_gain: { value: 0.28 },
-        u_face_apothem: { value: R_CORE * 0.491105 },
-        u_core_alpha: { value: 1.0 },     // 透明度分档（sync 每帧按 p 算）
-        u_core_wipe: { value: new THREE.Vector4(1.0, -1.0, 0.0, 0.0) }  // 擦除前沿（与 u_revB 同构）
-      }),
-      transparent: true,
-      depthWrite: false,
-      depthTest: true,
-      side: THREE.DoubleSide,
-      blending: THREE.CustomBlending,      // 预乘混合：color 已含 alpha
-      blendSrc: THREE.OneFactor,
-      blendDst: THREE.OneMinusSrcAlphaFactor,
-      blendEquation: THREE.AddEquation
+      uniforms: this.uniforms,
+      transparent: false,
+      depthWrite: true,
+      depthTest: true
     });
     this.coreMesh = new THREE.Mesh(dodeca(R_CORE), this.coreMaterial);
     this.coreMesh.name = 'L5_Core_Inner';
     this.coreMesh.renderOrder = 30;
-
-    /* ---------- v-内容4：黑洞体（核心内部） ----------
-     * 机械壳 12 面板（有厚度棱台、蚀刻纹路、seed 0 面板刻"01"）+ 内部小型黑洞
-     * （事件视界纯黑 + 光子环 + 透镜光晕）。随 p：0-20 紧闭 → 20 起面板沿面法线
-     * 抬升露缝微光 → 20-80 渐开渐亮黑洞渐大 → >80 面板螺旋吸入黑洞（塌缩）→
-     * 降回 <80 黑洞缩至最小、面板随基准面细线环脉冲渐显重现。 */
-    this._bh = { phase: 'normal', colT: 0, resT: 0 };
-    this._bhFaceN = [];      // 12 面单位法线（世界空间，由 dodeca 几何读取）
-    this._bhTang = [];       // 每面切向（塌缩螺旋用）
-    /* v-内容4-形：每面还要解出**真实五边形顶点**，才能得到
-     *   ① 面板五边形的外接半径（不是十二面体外接半径）
-     *   ② 绕法线的正确滚转（把面板的"顶点0方向"对到真实顶点上）
-     * 缺了这两样，12 块板就是一团朝向随机、尺寸超标的五边形 —— 用户看到的那坨。 */
-    this._bhFaceQuat = [];   // 每面的朝向四元数（局部 +X→顶点0，+Z→面法线）
-    this._bhFaceR = 0;       // 面上五边形的外接半径（12 面相同）
-    {
-      const _d = dodeca(BH_SHELL_R);
-      const _n = _d.attributes.normal.array;
-      const _p = _d.attributes.position.array;
-      const _up = new THREE.Vector3(0, 1, 0), _x = new THREE.Vector3(1, 0, 0);
-      for (let f = 0; f < 12; f++) {
-        const fn = new THREE.Vector3(_n[f * 27], _n[f * 27 + 1], _n[f * 27 + 2]).normalize();
-        this._bhFaceN.push(fn);
-        // 本面 9 个顶点（3 个三角形）去重 → 5 个真实五边形顶点，保持原有 CCW 绕序
-        const uniq = [];
-        for (let i = 0; i < 9; i++) {
-          const v = new THREE.Vector3(_p[(f * 9 + i) * 3], _p[(f * 9 + i) * 3 + 1], _p[(f * 9 + i) * 3 + 2]);
-          let dup = false;
-          for (const u of uniq) { if (u.distanceToSquared(v) < 1e-10) { dup = true; break; } }
-          if (!dup) uniq.push(v);
-        }
-        const c = new THREE.Vector3();
-        for (const v of uniq) c.add(v);
-        c.multiplyScalar(1 / Math.max(1, uniq.length));
-        for (const v of uniq) this._bhFaceR = Math.max(this._bhFaceR, v.distanceTo(c));
-        // 朝向：X = 面心→顶点0，Z = 面法线，Y = Z×X（右手系，与 CCW 绕序一致）
-        const ax = uniq[0].clone().sub(c).normalize();
-        const az = fn.clone();
-        const ay = new THREE.Vector3().crossVectors(az, ax).normalize();
-        const mtx = new THREE.Matrix4().makeBasis(ax, ay, az);
-        this._bhFaceQuat.push(new THREE.Quaternion().setFromRotationMatrix(mtx));
-        const t = new THREE.Vector3().crossVectors(fn, _up);
-        if (t.lengthSq() < 1e-6) t.crossVectors(fn, _x);
-        this._bhTang.push(t.normalize());
-      }
-      _d.dispose();
-    }
-    this.bhPanelMaterial = new THREE.ShaderMaterial({
-      vertexShader: BH_PANEL_VERT,
-      fragmentShader: BH_PANEL_FRAG,
-      uniforms: fork({
-        u_bh_glow: { value: 0.0 },
-        u_bh_reveal: { value: 1.0 },
-        u_bh_burn: { value: 0.0 },
-        u_bh_form: { value: 0.0 }    // v5.23-form：数据化成形（resurge ③ 段）
-      }),
-      /* v-内容4-形：机械外壳必须读作**实体** —— 旧配置 transparent + depthWrite:false
-       * 让 12 块板互相看穿，永远读不成"一个壳"。
-       * 面板几何本身是闭合棱台（外面+内面+侧壁）→ 用 FrontSide + 写深度即可；
-       * 混合改回普通 alpha（片元输出非预乘的 vec4(col, alpha)），
-       * 只在塌缩渐显（u_bh_reveal<1）时才真正用到透明。 */
-      transparent: true,
-      depthWrite: true,
-      depthTest: true,
-      side: THREE.FrontSide,
-      blending: THREE.NormalBlending
-    });
-    this.bhPanels = [];
-    for (let f = 0; f < 12; f++) {
-      // v-内容4-形：传 **_bhFaceR（面上五边形外接半径）**，不是 BH_SHELL_R
-      const m = new THREE.Mesh(
-        bhPanelGeo(this._bhFaceR, BH_SHELL_T, BH_SHELL_K, f), this.bhPanelMaterial);
-      m.name = 'L5_BH_Panel_' + f;
-      m.quaternion.copy(this._bhFaceQuat[f]);   // v-内容4-形：对齐真实面的滚转
-      m.renderOrder = 24;
-      this.bhPanels.push(m);
-    }
-    /* v-内容4-视：**事件视界 = 纯黑不透明球**。
-     * 物理事实：进入视界的光全部被吸收 → 视野里就是一个**完全不透光**的黑球。
-     * 旧实现把它和引力透镜画在同一个 `transparent + depthWrite:false` 的球上 →
-     * 不写深度、不遮挡任何东西，用户实测"我甚至可以看见它后面的水晶碎片面"。
-     * 现在：opaque + 写深度 + 早渲染（renderOrder 18，先于所有透明层）
-     * → 位于它背后的一切都被深度测试剔除，凭物理而不是靠叠加黑色来"遮"。 */
-    /* v5.23-crush：视界球改用可位移的 ShaderMaterial（仍然纯黑、opaque、写深度 ——
-     * 事件视界的物理职责不变，只是球面现在会被"失控引力"按多向不等的场往里压凹）。
-     * u_time 由 fork 共享主 uniforms 自动逐帧更新。 */
-    this.bhCoreMaterial = new THREE.ShaderMaterial({
-      vertexShader: BH_HORIZON_VERT,
-      fragmentShader: BH_HORIZON_FRAG,
-      uniforms: fork({ u_bh_crush: { value: 0.0 } }),
-      transparent: false, depthWrite: true, depthTest: true,
-      side: THREE.FrontSide, fog: false
-    });
-    this.bhCore = new THREE.Mesh(new THREE.SphereGeometry(1, 64, 48), this.bhCoreMaterial);
-    this.bhCore.name = 'L5_BlackHole_Horizon';
-    this.bhCore.renderOrder = 18;
-    /* v-内容4-视 / v5.22-尺：**引力透镜 / 光子环** = 视界外面的加色壳，
-     * 本球半径 = 黑洞**外径**（BH_R_MAX 0.40u 就是这个外径），视界球在其内侧 1/1.5 处。
-     * 只画光子环与透镜光晕，**不遮挡**任何东西（这才是"透镜"，不是"黑球"）。 */
-    this.bhLensMaterial = new THREE.ShaderMaterial({
-      vertexShader: BH_CORE_VERT,
-      fragmentShader: BH_CORE_FRAG,
-      uniforms: fork({
-        u_bh_swallow: { value: 0.0 },
-        u_bh_size: { value: 0.0 },
-        u_bh_flash: { value: 0.0 },          // ③ 闪光
-        u_bh_vh: { value: 1 / BH_LENS_K },   // 视界盘在本球投影半径中的占比 ≈0.667
-        u_bh_warp: { value: 0.0 },           // ② 引力扭曲动效
-        u_bh_crush: { value: 0.0 },          // v5.23-crush：多向不等巨力挤压
-        u_bh_dim: { value: 0.0 }             // v5.24-crush：冻结星变暗 0..1
-      }),
-      transparent: true,
-      depthWrite: false,
-      depthTest: true,
-      blending: THREE.CustomBlending,        // 片元输出已预乘 → 纯加色 One/One
-      blendSrc: THREE.OneFactor,
-      blendDst: THREE.OneFactor,
-      blendEquation: THREE.AddEquation
-    });
-    this.bhLens = new THREE.Mesh(new THREE.SphereGeometry(1, 48, 32), this.bhLensMaterial);
-    this.bhLens.name = 'L5_BlackHole_Lens';
-    /* v5.28：26 → 38。原先排在结构层之前，现在必须排在**测地线透镜环(36)之后** ——
-     * 否则它那圈光子环会被覆盖度为 1 的透镜环整条涂掉。
-     * 它是加色层（depthWrite:false / depthTest:true），后移只会让它在同样位置上叠加，
-     * 写深度的东西（视界球/面板/基准面）照样能挡住它。 */
-    this.bhLens.renderOrder = 38;
-    this.bhGroup = new THREE.Group();
-    this.bhGroup.name = 'L5_BlackHole';
-    this.bhGroup.add(this.bhCore, this.bhLens, ...this.bhPanels);
-    this.group.add(this.bhGroup);
-
-    /* ---------- v5.27：真·引力透镜盘 + 中心立方探针 ---------- */
-    this.bhGravMaterial = new THREE.ShaderMaterial({
-      vertexShader: BH_GRAV_VERT,
-      fragmentShader: BH_GRAV_FRAG,
-      uniforms: {
-        t_probe: { value: null },
-        t_lut: { value: buildLutTexture(256, LUT_UMAX) },
-        u_gv_center: { value: new THREE.Vector3() },
-        u_gv_fwd: { value: new THREE.Vector3(0, 0, -1) },
-        u_gv_rs: { value: 0.10 },
-        u_gv_uout: { value: LENS_U_OUT }
-      },
-      transparent: true,
-      /* v5.30：★ 环必须**写深度**（写的是洞心深度）。
-       * 环是这一条视线上**唯一**该被看见的像（沿直线来的光要么被捕获、要么在环外），
-       * 写上洞心深度后，排在它之后的结构层会按各自的深度自动分成两半：
-       *   · 比洞心更远的（洞后碎片的背面、核心壳/基准面的远侧…）
-       *     → 深度测试失败 → 被剔除 ⇒ 环里不会混进"直穿过来的第二张像"；
-       *   · 比洞心更近的（洞前碎片、核心壳/基准面的近侧…）
-       *     → 正常通过，按各自 alpha 叠在环上 ⇒ 前景半透明层照旧看得见。
-       * 这才是"一个像素一张像"与"前景层不被整条替换"同时成立的唯一解。
-       * v5.28 改用 renderOrder 36 做真替换，是把排在它之前的 30/31 两层一起抹掉
-       * —— 缺陷 A（环像是贴在外壳表面上）的根因。 */
-      depthWrite: true,
-      depthTest: true,
-      side: THREE.DoubleSide,   // 面向相机的盘，正反都无所谓
-      blending: THREE.NormalBlending,
-      fog: false
-    });
-    /* v5.28：几何直接就是那条**薄环** —— 内缘 = 阴影半径（u=1），外缘 = u_gv_uout。
-     * 内缘留 1.5% 的重叠（0.985）压在不透明视界球轮廓底下，避免接缝透出背景。 */
-    this.bhGrav = new THREE.Mesh(
-      new THREE.RingGeometry(0.985, LENS_U_OUT, 128, 1), this.bhGravMaterial);
-    this.bhGrav.name = 'L5_BlackHole_GravLens';
-    /* renderOrder 20 = 排在**所有结构层之前**（场辉29/核心壳30/基准面31/碎片32/笼33/内芯34）。
-     * v5.30 修正：v5.28 把它排到 36 是"用排序做真替换"，代价是把排在它之前的
-     * 核心壳(30)/基准面(31) 一起抹掉（缺陷 A：环像是贴在外壳表面上）。
-     * 现在改为**靠深度**做真替换（环写洞心深度，见材质注释），排序不再承担遮挡职责：
-     * 排在它之后的结构层按自身深度自动分流 —— 洞后的被剔除、洞前的照常叠加。
-     * 于是 v5.27 "排在 20 就出现两张像"的问题由深度解决，不再需要靠排序躲。
-     * "洞前碎片挡住加色光子环(38)"仍由 35 号隐形遮挡体负责。 */
-    this.bhGrav.renderOrder = 20;
-    this.bhGrav.visible = false;
-    this.bhGrav.frustumCulled = false;
-    // 透镜里是**背景影像**，不是自发光体 —— 不进辐射链（否则又被糊成一层光晕）
-    this.bhGrav.userData.noGlowMask = true;
-    /* 面向相机：盘必须**过洞心且垂直于视线**才能正确区分洞前/洞后。
-     * onBeforeRender 里改朝向 + 立刻 updateMatrixWorld —— 此时父链 matrixWorld 已是当前帧。 */
-    const _gvQ = new THREE.Quaternion();
-    const _gvQ2 = new THREE.Quaternion();
-    this.bhGrav.onBeforeRender = (renderer, scene, camera) => {
-      camera.getWorldQuaternion(_gvQ);
-      this.bhGrav.parent.getWorldQuaternion(_gvQ2);
-      this.bhGrav.quaternion.copy(_gvQ2.invert().multiply(_gvQ));
-      this.bhGrav.updateMatrixWorld(true);
-      const gu = this.bhGravMaterial.uniforms;
-      this.bhGrav.getWorldPosition(gu.u_gv_center.value);   // 洞心（世界）
-      gu.u_gv_fwd.value.copy(this.uniforms.u_cam_forward.value);
-    };
-    this.bhGroup.add(this.bhGrav);
-    /* 中心立方探针：渲染"不含黑洞自身"的场景六面 → 透镜才有"洞后有什么"可采样。
-     * 分辨率 256 / 隔帧更新 = 可调性能旋钮；只在透镜盘可见时才跑。 */
-    this.bhProbeRT = new THREE.WebGLCubeRenderTarget(256, { type: THREE.HalfFloatType });
-    this.bhProbe = new THREE.CubeCamera(0.02, 200, this.bhProbeRT);
-    this.bhProbe.layers.enableAll();
-    this.bhProbe.children.forEach((c) => c.layers.enableAll());   // 六面子相机各自有 layers
-    this.bhGravMaterial.uniforms.t_probe.value = this.bhProbeRT.texture;
-
-    /* ---------- v-内容5：高能数据立方体粒子 ---------- */
-    this.dpState = [];
-    for (let i = 0; i < DP_COUNT; i++) {
-      const th = Math.random() * Math.PI * 2;
-      const ph = Math.acos(2 * Math.random() - 1);
-      const r = DP_INNER + Math.random() * (DP_OUTER - DP_INNER);
-      this.dpState.push({
-        pos: new THREE.Vector3(
-          r * Math.sin(ph) * Math.cos(th), r * Math.cos(ph), r * Math.sin(ph) * Math.sin(th)),
-        vel: new THREE.Vector3().randomDirection().multiplyScalar(
-          DP_WANDER_SPD * (0.5 + Math.random())),
-        mode: 'wander',   // wander | attract | orbit | gone（flow 环流已删除）
-        r: 0, tilt: 0, w: 0, spin: Math.random() * Math.PI * 2, seed: Math.random() * 100
-      });
-    }
-    const _dpGeo = new THREE.BoxGeometry(DP_SIZE, DP_SIZE, DP_SIZE);
-    this.dpMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false });
-    this.dpTrailMaterial = new THREE.MeshBasicMaterial({
-      color: 0xffffff, transparent: true, opacity: 0.55,
-      blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false
-    });
-    this.dataParticles = new THREE.InstancedMesh(_dpGeo, this.dpMaterial, DP_COUNT);
-    this.dataParticles.name = 'L5_DataParticles';
-    this.particleTrails = new THREE.InstancedMesh(_dpGeo, this.dpTrailMaterial, DP_COUNT);
-    this.particleTrails.name = 'L5_ParticleTrails';
-    this.dpDummy = new THREE.Object3D();
-    this.particleGroup = new THREE.Group();
-    this.particleGroup.name = 'L5_HighEnergyParticles';
-    this.particleGroup.add(this.dataParticles, this.particleTrails);
-    this.group.add(this.particleGroup);
-    const _dpC = new THREE.Color(1, 1, 1);
-    for (let i = 0; i < DP_COUNT; i++) {
-      this.dataParticles.setColorAt(i, _dpC);
-      this.particleTrails.setColorAt(i, _dpC);
-    }
-    this.dataParticles.instanceColor.needsUpdate = true;
-    this.particleTrails.instanceColor.needsUpdate = true;
-    this._dpInhaleAccum = 0;   // 吸入名额积分
-    this._dpInhaleTotal = 0;   // 累计吞噬计数（探针）
 
     /* ---------- 规格外层：硬壳（0.96 / 1.00，预乘混合） ---------- */
     // v5.2：这一套 uniform 现在只服务于「外甲裂片」（外壳已被裂片完全取代）
@@ -2973,16 +1930,7 @@ export class L5Core {
        * shellInnerUniforms 是 Object.assign 浅拷贝，若沿用 this.uniforms.u_lift
        * 就会和所有 fork 出去的材质共享同一个对象 → 整个外壳一起抬起来。 */
       u_lift: { value: 0.0 },
-      u_float_amp: { value: BASE_FLOAT_AMP },
-      /* v-内容1：棱台扫掠 —— 位似半径 = 合拢态基准面 R_SHELL_IN；u_sweep 每帧与
-       * u_lift 同一包络写入（>80 抬升即扫掠推出，<80 逆过程收回）。 */
-      u_frustum_r: { value: R_SHELL_IN },
-      u_sweep: { value: 0.0 },
-      /* v-内容2：基准台面自旋 —— **独立副本**（this.uniforms 默认恒 0，裂片/核心
-       * 共享默认不动）；sync() 每帧写入 12 个面的旋转角。 */
-      u_faceRotA: { value: new THREE.Vector4(0, 0, 0, 0) },
-      u_faceRotB: { value: new THREE.Vector4(0, 0, 0, 0) },
-      u_faceRotC: { value: new THREE.Vector4(0, 0, 0, 0) }
+      u_float_amp: { value: BASE_FLOAT_AMP }
     });
     this.shellMaterial = this._shellMaterial(
       this.shellUniforms
@@ -2997,8 +1945,6 @@ export class L5Core {
     this.shellInner = new THREE.Mesh(dodeca(R_SHELL_IN), this.shellInnerMaterial);
     this.shellInner.name = 'L5_Shell_Inner';
     this.shellInner.renderOrder = 31;
-
-    
 
     /* ---------- 外甲（1.00u）：沿结构线裂开的结构片（v5.2 设计 / v5.3 修订） ----------
      * 每个五边形面沿其结构线裂成 20~26 片大小不一的结构片（v5.3 加密碎化，
@@ -3015,8 +1961,7 @@ export class L5Core {
       u_shell_id: { value: 1.0 },
       u_panel_mode: { value: 2.0 },
       u_petal: { value: 1.0 },
-      u_core_layer: { value: 1.0 },
-      u_retract: { value: 0.0 }   // v-穿帮四次修复：下降同步（_dropSync）置 1，碎块收拢淡出
+      u_core_layer: { value: 1.0 }
     });
     this.fragCoreMaterial = new THREE.ShaderMaterial({
       vertexShader: VERT,
@@ -3028,7 +1973,6 @@ export class L5Core {
       side: THREE.FrontSide,
       blending: THREE.AdditiveBlending
     });
-    this.fragTwins = [];     // v5.29：隐形遮挡体（见下）
     this.fragments = buildFaceFragments(R_SHELL_OUT).map((f) => {
       // Phase1c：每片克隆材质，持有独立的 u_impact / u_cool（共享 uniform 经 fork 引用同步）。
       // v-fix（关键回归修复）：克隆基准必须是**裂片预设 shellUniforms**（u_petal=1 → 晶体分支），
@@ -3061,27 +2005,6 @@ export class L5Core {
       core.renderOrder = 34;          // 本体(32)之后画：内芯叠在晶体表面之下
       core.scale.setScalar(0.86);     // 相对面心缩小 → 藏在晶体体内
       mesh.add(core);
-      /* v5.29：**隐形遮挡体（invisible occluder / depth mask）** —— 让"洞前的碎片"能真正
-       * 遮住透镜。资料依据（三条独立来源一致）：three.js 自 r.71 起把 `renderOrder` +
-       * `colorWrite=false` 作为"不可见但仍遮挡身后物体"的官方做法（也用于 AR 面部遮挡、
-       * 让透明物体仍能遮住身后物体）。做法：同源几何 + 同源 shader + **共享同一份 uniforms**
-       * ⇒ 深度轮廓与可见碎片逐帧完全一致（含顶点位移与 fragment 的 discard），
-       * 但 colorWrite=false 只写深度不写颜色。
-       * ★ 关键：RenderOrder 必须夹在"最后一个结构层(34)"与"透镜环(36)"之间。
-       *   这正是 woodenraft 那篇指出的坑 —— "这会连你不想遮的东西一起遮掉，因为透明的
-       *   东西在 depth mask 之后渲染，you choose your poison"。把深度体排在 35，
-       *   排在它之后的只有透镜环(36)和 bhLens(38) ⇒ 基准面/内芯/碎片自己/笼框/粒子
-       *   **一个都不会受影响**。
-       * ★ transparent 必须为 true：three.js 先整体渲染 opaque 队列再渲染 transparent 队列，
-       *   renderOrder 只在**同一队列内**排序。写成 opaque 会被提前到所有透明层之前。 */
-      const twin = new THREE.Mesh(f.geo, this._makeDepthTwin(fMat));
-      twin.name = 'L5_FaceFragment_DepthMask';
-      twin.userData.noGlowMask = true;      // 在 L5Stage 建 GLOW_LAYER 之前写入即生效
-      twin.renderOrder = FRAG_DEPTH_ORDER;
-      twin.frustumCulled = mesh.frustumCulled;
-      twin.visible = false;
-      mesh.add(twin);
-      this.fragTwins.push(twin);
       this.group.add(mesh);
       return { ...f, mesh, core, mat: fMat, stored: 0, impactW: 0 };
     });
@@ -3209,6 +2132,7 @@ export class L5Core {
 
       const uColor = { value: new THREE.Color(0x00f2fe) };   // 雾带与粒子共享，每帧同步强调色
 
+
       // —— 粒子（散布于雾带截面内）——
       const theta0 = new Float32Array(FLOW_COUNT);
       const spd = new Float32Array(FLOW_COUNT);
@@ -3313,6 +2237,7 @@ export class L5Core {
      * 原实现（_buildPulseColumns / updatePulseColumns / COLUMN_* 常量）一并移除，
      * 不留开关、不留死代码；本段注释仅作历史记录。 */
 
+
     /* ---------- ★ v5.21e：「棱线光导管」L5_Rods_Core 已**整体移除** ----------
      * 它原是沿核心正十二面体（R_core = 0.8u）30 条棱铺的加色实体圆柱
      * （`edgeRods(R_CORE, 0.015)`，管径 0.03u）。历次用户反馈：
@@ -3360,7 +2285,6 @@ export class L5Core {
     this._v = new THREE.Vector3();
     this._deploy = 0;    // 内壳展开进度 0→1（带缓动，见 sync()）
     this._faceRot = [];  // v5.13b：齿轮卡位自转的面级状态机（按 faceIdx 索引）
-    this._faceBaseRot = new Float32Array(12);  // v-内容2：基准台 12 面自旋角（sync 每帧算，写 shellInnerUniforms）
     this._rotBusy = false;       // v5.13c：仍在走格/回归中 → 冻结收拢（先回原位再降）
     this._retHoldT = 0;          // v5.13d：掉能后的收拢冻结计时（上限 FRAG_RET_HOLD）
 
@@ -3770,13 +2694,6 @@ export class L5Core {
     const _wasSeq = this._prevWantSeq;
     this._prevWantSeq = wantSeq;
     this._wantSeq = wantSeq;   // v5.14：sync 里写 u_burst 时据此决定是"重播"还是"单调熄灭"
-    /* v-穿帮二次修复：下降同步锁存 —— 此处有 _wasSeq（真·上一帧 wantSeq）。
-     * 跌破 80（true→false）时锁存 _dropSync=1：整个下降过渡（含 p 0.2~0.8 段）
-     * 基准面恢复与 _shellT 同步，水晶消失完基准面才闭合，杜绝"白色基准面在
-     * 水晶消失之前全亮"（见 sync() 穿帮修复块的使用）。重新展开（wantSeq=true）
-     * 即解除。 */
-    if (wantSeq) this._dropSync = 0;
-    else if (_wasSeq) this._dropSync = 1;
     /* —— v5.16：面级脉冲排程全部作废 ——
      * 用户原话："能量到达80之后，每个五边形面中心会扩散出一道脉冲，然后一直循环……
      *   我怀疑你是把基准面渐隐渐显做到水晶碎块上了，而且没有设置触发条件"
@@ -3889,9 +2806,6 @@ export class L5Core {
      * 齿轮卡得越快。爬升时长 = FRAG_ROT_RAMP / (片速率 × 能量加速)。 */
     const rotBoost = 1.0 + FRAG_ROT_ENERGY * over;
     const rotDur = (rt) => Math.max(0.06, FRAG_ROT_RAMP / (rt.easeMul * rotBoost));
-    /* v-内容2：基准台缓动 = **水晶碎块中缓动系数最大的一档**（RATE_MAX=1.45，
-     * 同吃能量加成）→ 基准台最先到位，再带动面心片、最后外围片。无过冲无卡位。 */
-    const rotDurMax = () => Math.max(0.06, FRAG_ROT_RAMP / (FRAG_ROT_RATE_MAX * rotBoost));
 
     let eMin = Infinity, eMax = -Infinity;
     let rotSpinning = 0, rotReturning = 0, rotMaxDeg = 0, rotSample = null;
@@ -3922,13 +2836,7 @@ export class L5Core {
        * 否则 stored 只在展开态累加、闭合态仍残留 → 低能态外圈碎片带着增亮/增透
        * 残留成"白色色块"（用户实测）。释放速率固定，随能量跌落与面闭合同步消退。 */
       if (!wantSeq && (f.stored || 0) > 0) {
-        // v-穿帮四次修复（碎块侧）：下降同步（_dropSync）期间释放加速 8× ——
-        // 等高能态停留一分钟 stored 可上百，原 40/s 需数秒才清空，下降中段 u_cool
-        // 仍满 → 碎块 alpha 增透（×1.3）实白叠加成"白色片"（用户实测属碎块）。
-        // 8×=320/s：stored 100 约 0.3s 清空，下降开头 u_cool 即归零。
-        const drainRate = ((this._dropSync ?? 0) > 0 && !wantSeq)
-          ? this._STORED_DRAIN * 8 : this._STORED_DRAIN;
-        f.stored = Math.max(0, f.stored - dt * drainRate);
+        f.stored = Math.max(0, f.stored - dt * this._STORED_DRAIN);
       }
       fmat.uniforms.u_cool.value = Math.min((f.stored || 0) * this._COOL_PER, this._COOL_MAX);
       if (f.impactW > 0) f.impactW = Math.max(0, f.impactW - dt / this._IMPACT_FADE);
@@ -3940,22 +2848,21 @@ export class L5Core {
        * 逐像素按面内半径连续成环。这里只保留每面吸收量统计。 */
       this._faceAbsorbed[f.faceIdx] += (f.stored || 0);
 
-      /* —— v-内容2 齿轮卡位自转（**按面协同**，解析两段式：驱动→过冲→回位→硬卡停）——
-       * 用户修订（替换阻尼弹簧）：旧模型 zeta 欠阻尼 → 终点来回震荡才停。
-       * 新模型：
-       *   ① 驱动段：每片 easeOutCubic 从当前角冲到「终点 + 自己的过冲幅度」
-       *      （过冲幅度按 radialN 分档：面心大 0.13、外缘小 0.05），顶点速度=0；
-       *   ② 回位段：沿 cos 半周期被"偏离越大拉力越大"的拉力拽回终点，
-       *      到位瞬间速度直接归零（硬卡停，零震荡、零反弹）。
-       * 面级状态机决定"何时转、往哪转、目标角"；片级保留缓动系数（内圈快、外圈慢）
-       * 与过冲幅度（内大外小）→ 旋转像一道波从面心扫出去，且过冲也内大外小。 */
+      /* —— v5.13c 齿轮卡位自转（**按面协同**，展开完成后才运行）——
+       * 用户修订：碎片必须**同面的所有片一起转、同方向**，否则各转各的就再也拼不回
+       * 五边形。面级状态机决定"何时转、往哪转、目标角"；片级只保留自己的缓动系数
+       * （按面内归一化距离 → 旋转像一道波从面心扫出去）与阻尼比（过冲带宽 ≈4°）。
+       *
+       * v5.13c 修正①：事件结束时**没有把面级 rampT 清零** —— 第二次及以后的触发在
+       *   同一帧就被 `rampT >= 1` 判死（事件只活 1 帧），剩下的位移全由下面 else 分支
+       *   的指数缓动补完 → 过冲只在第一次出现，之后都是"直接缓动到终点"。
+       * v5.13c 修正②：结束条件改为**所有碎片真正停稳**（而不是固定时长兜底），
+       *   否则过冲的尾巴会在弹簧还没走完时被 else 分支接管、被抹平。 */
       if (!f._rot) {
         f._rot = {
-          angle: 0, driveT: 0, retT: 0, phase: 'idle', settled: false,
-          retFrom: 0, from: 0, driveEnd: 0, retEnd: 0,
-          // v-内容2：本片过冲幅度 —— radialN 0=面心 1=外缘 → 面心大、外缘小
-          overMag: FRAG_ROT_OVER_MIN
-            + (FRAG_ROT_OVER_MAX - FRAG_ROT_OVER_MIN) * (1.0 - (f.radialN ?? 0.5)),
+          angle: 0, vel: 0, rampT: 0, settled: false, retFrom: 0, from: 0,
+          // 每片自己的阻尼比（过冲 ≈8~12°，带宽 ≈4°）与缓动系数（内圈快、外圈慢）
+          zeta: FRAG_ROT_ZETA_MIN + Math.random() * (FRAG_ROT_ZETA_MAX - FRAG_ROT_ZETA_MIN),
           // v5.13d：easeMul 是**速率**（越大越快），面心片快、外缘片慢
           easeMul: FRAG_ROT_RATE_MIN
             + (FRAG_ROT_RATE_MAX - FRAG_ROT_RATE_MIN) * (1.0 - (f.radialN ?? 0.5))
@@ -3966,15 +2873,14 @@ export class L5Core {
       const grp = this._faceRot[f.faceIdx] ?? (this._faceRot[f.faceIdx] = {
         nextAt: simTime + 1.2 + Math.random() * 2.8,   // 各面错开，不同时整排齐转
         dir: 1, accum: 0, rampT: 0, active: false, overPeak: 0,
-        baseT: 0, ret: false, retT: 0, shards: []       // v-内容2：baseT=基准台缓动进度
+        ret: false, retT: 0, shards: []                // v5.13c：回归阶段 + 本面片引用
       });
       if (!grp.shards.includes(rt)) grp.shards.push(rt);
       if (d < 0.30 && grp.accum !== 0) {               // 收拢深处复位（此时 rotGate=0，无跳变）
-        grp.accum = 0; grp.rampT = 0; grp.active = false; grp.baseT = 0;
+        grp.accum = 0; grp.rampT = 0; grp.active = false;
         grp.ret = false; grp.retT = 0;
         grp.nextAt = simTime + 1.2 + Math.random() * 2.8;
-        rt.angle = 0; rt.driveT = 0; rt.retT = 0; rt.phase = 'idle';
-        rt.settled = false; rt.retFrom = 0;
+        rt.angle = 0; rt.vel = 0; rt.rampT = 0; rt.settled = false; rt.retFrom = 0;
       }
       /* v5.19：转动资格的**上升沿**排期（修"面上升后所有面同时转动一次"）。
        * nextAt 是绝对时刻，而能量 <80 期间下面那个触发条件根本不参与判定 →
@@ -3997,32 +2903,25 @@ export class L5Core {
         grp.active = true;
         grp.dir = Math.random() < 0.5 ? -1 : 1;        // 整面同方向（顺/逆时针随机）
         grp.accum += grp.dir * FRAG_ROT_STEP;          // 目标角累计（不回原位）
-        grp.rampT = 0;
-        grp.baseT = 0;                                 // v-内容2：基准台同步起步
-        grp.overPeak = 0;
-        /* v5.13c 修正③：斜坡的**起点**必须是本片当前角度，而不是 0。 */
-        for (const s of grp.shards) {
-          s.driveT = 0; s.retT = 0; s.phase = 'drive'; s.settled = false;
-          s.from = s.angle;
-          s.driveEnd = grp.accum + grp.dir * s.overMag;   // v-内容2：过冲顶点（越过终点）
-          s.retEnd = grp.accum;                            // 回位目标 = 终点
-        }
+        grp.rampT = 0;                                 // v5.13c①：必须清零
+        grp.overPeak = 0;                              // 本次事件的过冲峰值（探针可观测）
+        /* v5.13c 修正③：斜坡的**起点**必须是本片当前角度，而不是 0。
+         * 旧式 `ramp = accum * smoothstep(rampT)` 在 rampT=0 时给出 0 —— 第二次及以后
+         * 的事件里，弹簧目标会先被甩回 0 再爬回累计角，等于凭空挨一次反向冲击。
+         * 实测表现：逐次过冲峰值前 8 次 ~10°、之后突增到 21~25°（≈2×）。 */
+        for (const s of grp.shards) { s.rampT = 0; s.settled = false; s.from = s.angle; }
       }
       if (grp.ret) {
-        /* —— 回归：从 retFrom（已折到 (−π,π] 的最短路径）走同样的
-         * 驱动→过冲→回位→硬卡停，只是终点是**原位** —— */
-        if (rt.phase === 'drive') {
-          rt.driveT = Math.min(1, rt.driveT + dt / rotDur(rt));
-          const e = 1.0 - Math.pow(1.0 - rt.driveT, 3.0);
-          rt.angle = rt.from + (rt.driveEnd - rt.from) * e;
-          if (rt.driveT >= 1) { rt.angle = rt.driveEnd; rt.phase = 'ret'; rt.retT = 0; }
-        } else if (rt.phase === 'ret') {
-          const retDur = Math.max(0.05, rotDur(rt) * FRAG_ROT_RET_FRAC);
-          rt.retT = Math.min(1, rt.retT + dt / retDur);
-          /* 拉力 ∝ 偏离（Hooke 单侧）：加速度 = (driveEnd-retEnd)·(π/2)²·cos(...)/retDur²，
-           * 起点（偏离最大）拉力最大、随回位衰减到 0；到位瞬间速度最大 → 硬卡停。 */
-          rt.angle = rt.retEnd + (rt.driveEnd - rt.retEnd) * Math.cos(Math.PI * 0.5 * rt.retT);
-          if (rt.retT >= 1) { rt.angle = rt.retEnd; rt.settled = true; rt.phase = 'idle'; }
+        /* —— 回归：从 retFrom（已折到 (−π,π] 的最短路径）缓动回 0 ——
+         * 与正向同一套 斜坡 → 弹簧过冲 → 卡位，只是终点是**原位**。 */
+        rt.rampT = Math.min(1, rt.rampT + dt / rotDur(rt));
+        const k = rt.rampT * rt.rampT * (3.0 - 2.0 * rt.rampT);
+        const ramp = rt.retFrom * (1.0 - k);
+        rt.vel += (ramp - rt.angle) * FRAG_ROT_K * dt;
+        rt.vel -= rt.vel * 2.0 * rt.zeta * Math.sqrt(FRAG_ROT_K) * dt;
+        rt.angle += rt.vel * dt;
+        if (rt.rampT >= 1 && Math.abs(rt.vel) < 0.03 && Math.abs(rt.angle) < 0.02) {
+          rt.angle = 0; rt.vel = 0; rt.settled = true;
         }
         rotReturning++;
         const degNow = rt.angle * 57.29578;
@@ -4032,18 +2931,15 @@ export class L5Core {
         }
       } else if (grp.active) {
         // 每片自己的速率 → 各片在同一面内先后到位（波从面心扫向边缘）
-        if (rt.phase === 'drive') {
-          rt.driveT = Math.min(1, rt.driveT + dt / rotDur(rt));
-          const e = 1.0 - Math.pow(1.0 - rt.driveT, 3.0);
-          rt.angle = rt.from + (rt.driveEnd - rt.from) * e;
-          if (rt.driveT >= 1) { rt.angle = rt.driveEnd; rt.phase = 'ret'; rt.retT = 0; }
-        } else if (rt.phase === 'ret') {
-          const retDur = Math.max(0.05, rotDur(rt) * FRAG_ROT_RET_FRAC);
-          rt.retT = Math.min(1, rt.retT + dt / retDur);
-          rt.angle = rt.retEnd + (rt.driveEnd - rt.retEnd) * Math.cos(Math.PI * 0.5 * rt.retT);
-          if (rt.retT >= 1) { rt.angle = rt.retEnd; rt.settled = true; rt.phase = 'idle'; }
+        rt.rampT = Math.min(1, rt.rampT + dt / rotDur(rt));
+        const ramp = rt.from + (grp.accum - rt.from) * (rt.rampT * rt.rampT * (3.0 - 2.0 * rt.rampT));
+        rt.vel += (ramp - rt.angle) * FRAG_ROT_K * dt;
+        rt.vel -= rt.vel * 2.0 * rt.zeta * Math.sqrt(FRAG_ROT_K) * dt;
+        rt.angle += rt.vel * dt;
+        if (rt.rampT >= 1 && Math.abs(rt.vel) < 0.03 && Math.abs(ramp - rt.angle) < 0.02) {
+          rt.angle = grp.accum; rt.settled = true;
         }
-        // 过冲 = 越过本次目标角的量（沿行进方向为正）—— 解析峰值即本片 overMag
+        // 过冲 = 越过本次目标角继续前进的量（沿行进方向为正）
         const over = (rt.angle - grp.accum) * grp.dir;
         if (over > grp.overPeak) grp.overPeak = over;
         rotSpinning++;
@@ -4062,22 +2958,18 @@ export class L5Core {
     let anyBusy = false;
     for (const key in this._faceRot) {
       const grp = this._faceRot[key];
-      const fidx = +key;
       if (grp.ret) {
         grp.retT += dt;
-        grp.baseT = Math.min(1, grp.baseT + dt / rotDurMax());   // v-内容2：基准台最大速率缓动
         const allSettled = grp.shards.every((s) => s.settled);
         if ((allSettled && grp.retT > FRAG_ROT_RAMP) || grp.retT > FRAG_RET_TIMEOUT) {
-          grp.ret = false; grp.retT = 0; grp.accum = 0; grp.baseT = 0;
+          grp.ret = false; grp.retT = 0; grp.accum = 0;
           for (const s of grp.shards) {
-            s.angle = 0; s.driveT = 0; s.retT = 0; s.phase = 'idle';
-            s.settled = false; s.retFrom = 0; s.from = 0;
+            s.angle = 0; s.vel = 0; s.rampT = 0; s.settled = false; s.retFrom = 0;
           }
           grp.nextAt = simTime + 1.2 + Math.random() * 2.8;
         } else {
           anyBusy = true;
         }
-        this._faceBaseRot[fidx] += (grp.accum * rotGate - this._faceBaseRot[fidx]) * Math.min(1, dt / rotDurMax());
         continue;
       }
       /* v5.13d：能量退出展开（<0.80）→ **不管这一面此刻是什么状态**（静止 / 走格中 /
@@ -4086,29 +2978,19 @@ export class L5Core {
        * 折角到 (−π,π]：绕面法线转 360° 是恒等变换，画面上没有任何跳变，累计角 k×72°
        * 因此变成 ≤180° 的最短回程 —— 而不是把 k×72° 原路倒转回去。 */
       if (!grp.ret && !wantSeq && (grp.accum !== 0 || grp.active)) {
-        grp.ret = true; grp.retT = 0; grp.active = false; grp.rampT = 0; grp.baseT = 0;
+        grp.ret = true; grp.retT = 0; grp.active = false; grp.rampT = 0;
         for (const s of grp.shards) {
           s.angle -= Math.PI * 2 * Math.round(s.angle / (Math.PI * 2));
-          s.retFrom = s.angle;
-          const dirRet = Math.sign(-s.retFrom) || 1;   // 回归行进方向（沿最短路径）
-          s.driveT = 0; s.retT = 0; s.phase = 'drive'; s.settled = false;
-          s.from = s.angle;
-          s.driveEnd = dirRet * s.overMag;             // v-内容2：越过原位的过冲顶点
-          s.retEnd = 0;                                 // 回位目标 = 原位
+          s.retFrom = s.angle; s.rampT = 0; s.vel = 0; s.settled = false;
         }
         grp.accum = 0;                                 // 目标 = 原位
         anyBusy = true;
-        this._faceBaseRot[fidx] += (0 - this._faceBaseRot[fidx]) * Math.min(1, dt / rotDurMax());
         continue;
       }
-      if (!grp.active) {
-        this._faceBaseRot[fidx] += (grp.accum * rotGate - this._faceBaseRot[fidx]) * Math.min(1, dt / rotDurMax());
-        continue;
-      }
+      if (!grp.active) continue;
       // 走格中（能量仍在阈值以上）
       anyBusy = true;
       grp.rampT += dt / (FRAG_ROT_RAMP * 1.30);
-      grp.baseT = Math.min(1, grp.baseT + dt / rotDurMax());   // v-内容2
       const allSettled = grp.shards.length > 0 && grp.shards.every((s) => s.settled);
       // v5.13c：面内缓动档差的实证 —— 同一面的片 easeMul 应当跨 0.55~1.45，
       // 否则"波从面心扫向边缘"的错落不存在（用户反馈看不出差异化）。
@@ -4120,32 +3002,16 @@ export class L5Core {
         }
         this._rotEaseRange = { min: +mn.toFixed(3), max: +mx.toFixed(3) };
       }
-      // 正常出口 = 全部碎片停稳（回位段走完、硬卡停）；超时只是兜底，不该成为常态出口
+      // 正常出口 = 全部碎片停稳（过冲尾巴走完）；超时只是兜底，不该成为常态出口
       if ((allSettled && grp.rampT >= 1) || grp.rampT > 3.2) {
         grp.active = false;
         grp.rampT = 0;                                 // v5.13c①：清零，否则下次事件只活 1 帧
-        grp.baseT = 0;                                 // v-内容2
         grp.nextAt = simTime + 2.0 + Math.random() * 2.0;   // 之后每 2~4s 一次
-        // 逐次事件的过冲峰值日志（v-内容2：解析峰值 = 各片 overMag 的最大值）
+        // 逐次事件的过冲峰值日志：证明"不是只有第一次过冲"
         if (this._rotEvents == null) this._rotEvents = [];
         this._rotEvents.push(+(grp.overPeak * 57.29578).toFixed(2));
         if (this._rotEvents.length > 12) this._rotEvents.shift();
       }
-      this._faceBaseRot[fidx] += (grp.accum * rotGate - this._faceBaseRot[fidx]) * Math.min(1, dt / rotDurMax());
-    }
-    /* —— v-内容2：基准台面自旋 uniform 写入（shellInnerUniforms 独立副本；
-     * 裂片/核心共享 this.uniforms 默认 0 → 不转）。
-     * v-旋转同步：_faceBaseRot 以"最重碎片"的速率（rotDurMax）做纯三次/指数缓动
-     * 跟随面目标 grp.accum —— 原实现 grp.accum × smoothstep(baseT) 只在首个事件缓动、
-     * 后续事件 baseT=1 直接跳变，且波形与碎片的 drive/ret 不同 → 用户"基准面和
-     * 碎片完全不是同时旋转"。指数跟随：每次面目标变化都重新缓动、无过冲、无跳变，
-     * 与最慢碎片同一速率（"基准台带着碎片转"）。 */
-    {
-      const uf = this.shellInnerUniforms;
-      uf.u_faceRotA.value.fromArray(this._faceBaseRot, 0);
-      uf.u_faceRotB.value.fromArray(this._faceBaseRot, 4);
-      uf.u_faceRotC.value.fromArray(this._faceBaseRot, 8);
-      this._baseRotProbe = Array.from(this._faceBaseRot).map((v) => +v.toFixed(4));
     }
     this._rotBusy = anyBusy;
     this._pushSpread = { min: eMin, max: eMax };        // 探针可观测：>0 即"不同时到位"
@@ -4539,50 +3405,6 @@ export class L5Core {
   /** 正交相机必须显式给出视线方向（见顶点着色器注释） */
   setCameraForward(v) { this.uniforms.u_cam_forward.value.copy(v); }
 
-  /** v5.29：造一个"只写深度、不写颜色"的孪生材质（invisible occluder / depth mask）。
-   *  ★ `uniforms` 必须是**同一份对象引用**（不能用 material.clone() —— 那会把 uniform 的
-   *    value 深拷贝成冻结快照，逐帧更新再也传不进来，顶点位移就会和可见碎片对不上）。 */
-  _makeDepthTwin(srcMat) {
-    return new THREE.ShaderMaterial({
-      vertexShader: srcMat.vertexShader,
-      fragmentShader: srcMat.fragmentShader,
-      uniforms: srcMat.uniforms,          // 共享 ⇒ 自动跟随逐帧更新
-      transparent: true,                  // 必须在 transparent 队列，否则被提前渲染
-      depthWrite: true,
-      depthTest: true,
-      colorWrite: false,                  // ★ 只进深度缓冲，不进颜色缓冲
-      side: srcMat.side,
-      blending: THREE.NormalBlending,     // 反正不写颜色，混合方式无所谓
-      fog: false
-    });
-  }
-
-  /** v5.29：统一开关所有隐形遮挡体。 */
-  _setFragTwins(v) {
-    const a = this.fragTwins;
-    for (let i = 0; i < a.length; i++) a[i].visible = v;
-  }
-
-  /** v5.27：更新黑洞中心的立方探针 —— 渲染"不含黑洞自身"的场景六面，供透镜采样。
-   *  必须由主循环在 sync 之后、composer.render 之前调用（main.js）。
-   *  只在透镜盘可见时才跑，且**隔帧执行一次**：六面各一次完整场景遍历，
-   *  每帧都跑代价太高，而透镜里是剧烈压缩的远景，隔一帧看不出来。 */
-  updateProbe(renderer, scene) {
-    if (!this.bhProbe || !this.bhGrav || !this.bhGrav.visible) return;
-    this._probeTick = (this._probeTick || 0) + 1;
-    if (this._probeTick % 2) return;
-    const bhVis = this.bhGroup.visible;
-    this.bhGroup.visible = false;      // 黑洞自身不能进探针（否则自己透镜自己）
-    /* v5.29：探针里**不能**开隐形遮挡体 —— 探针要的是"抵达洞心的辐射"，而水晶碎片是
-     * 加色半透明（它们在探针里应该是"加一层光"而不是"挡住后面"）。一旦让它们写深度，
-     * 探针六面会被近侧的碎片糊住，透镜环里就什么都看不见了。 */
-    this._setFragTwins(false);
-    this.bhProbe.position.copy(this.bhGravMaterial.uniforms.u_gv_center.value);
-    this.bhProbe.update(renderer, scene);
-    this.bhGroup.visible = bhVis;
-    this._setFragTwins(this.bhGrav.visible);
-  }
-
   /** 视觉增强总开关：false → 回退到规格字面渲染 */
   setEnhancements(on) {
     this.coreMaterial.uniforms.u_vol_steps.value = on ? 32 : 0;
@@ -4608,10 +3430,8 @@ export class L5Core {
   /**
    * 层级显示开关。关闭即彻底隐藏：obj.visible=false 在 three.js 中既不被渲染、
    * 也不写深度缓冲、不参与拾取/后处理掩膜 —— 不会"隐藏了但干涉还在"。
-   * v5.22：基准面（shellInner）改为**可关闭** —— 用户需要关掉它来观察核心与粒子，
-   * 关闭同样是彻底隐藏（不渲染 / 不写深度）；旋转基准由 bhGroup 与各子系统的独立
-   * 四元数维护，不依赖基准面的可见性。
-   * @param {string} name  fragments | core | particles | fieldGlow | base | cage | blackhole
+   * 基准面（shellInner）是旋转基石，按用户要求不提供关闭（几何始终在场，仅随展开淡出）。
+   * @param {string} name  fragments | core | particles | fieldGlow | cage
    * @param {boolean} on
    */
   setLayer(name, on) {
@@ -4625,15 +3445,12 @@ export class L5Core {
         for (const f of this.fragments) f.mesh.visible = v;
         break;
       /* v5.21e：'core' 现在只对应核心本体（棱线光导管已整体删除，
-       * 不再需要 v5.21d 那套父子层同步）。v-内容4：黑洞体（机械壳+黑洞）
-       * 是核心外壳的内部结构 → 跟随 core 层一起开关。 */
+       * 不再需要 v5.21d 那套父子层同步）。 */
       case 'core':
         this.coreMesh.visible = v;
-        if (this.bhGroup) this.bhGroup.visible = v;
         break;
       case 'particles':        // 能量环粒子流（环截面内漂移的点）
         for (const rg of this.ringGroups) if (rg.flow) rg.flow.visible = v;
-        if (this.particleGroup) this.particleGroup.visible = v;  // v-内容5：高能数据立方体粒子
         break;
       case 'fieldGlow':        // 约束场辉光板
         if (this.fieldGlow) this.fieldGlow.visible = v;
@@ -4646,13 +3463,7 @@ export class L5Core {
         this.cage.visible = v;
         this.cageGhost.visible = v;
         break;
-      /* v-内容4-开：基准面改为**可关闭**（用户："为了观察核心和粒子，基准面也需要关掉"）。
-       * 关掉 = 彻底隐藏：不渲染、不写深度 —— 基准面材质是 transparent + depthWrite:true，
-       * 隐藏后核心与粒子不再被它遮挡。 */
-      case 'base':
-        if (this.shellInner) this.shellInner.visible = v;
-        break;
-      default:
+      default:                 // 基准面（shellInner）：旋转基石，始终显示，不提供关闭
         break;
     }
   }
@@ -4725,35 +3536,15 @@ export class L5Core {
     this.updateAmbientParticles(simTime, dt);
 
     /* v5.13e → v5.16（A1，用户本轮拍板）：外甲裂片外推后，基准面**不再完全隐藏**，
-     * 改为淡到 **BASE_GHOST_FLOOR(0.60)** 的"幽灵态"。
+     * 改为淡到 **BASE_GHOST_FLOOR(0.40)** 的"幽灵态"。
      * 用户原话："选项1，也不需要非常非常淡，20%不透明度左右。同时我的描述里说了
      *   基准面和水晶是两个部分，之前完全隐藏的设定可以舍弃了"
-     * 最终展开态的不透明度 = BASE_GHOST_FLOOR(0.60) × BASE_HIDE_LEVEL(0.50) = **0.30**
-     * （v-幽灵态调亮：0.40→0.60，用户"能量高时基准面不明显，稍微调高"）。
+     * 最终展开态的不透明度 = BASE_GHOST_FLOOR(0.40) × BASE_HIDE_LEVEL(0.50) = **0.20**。
      * （BASE_HIDE_LEVEL 由基准面擦除前沿在片元里施加，见 FRAG 的 u_revB 段。）
      * 保留幽灵态后，80 阈值的"细线环脉冲 + 擦除半隐"才有一层可依附的载体 ——
      * 这层原本在旧设定下是不可见的。 */
-    /* v-穿帮修复（二次）：能量 100→0 时碎片用 _shellT 在 ~0.75s（SHELL_FORM_DUR）
-     * 内消失，而基准面恢复一直跟着 _deploy —— 被 rotBusy 收拢冻结（0.45s）+ 慢速
-     * 收回拖到 ~1.2s，造成"水晶没了、白色基准面还在独自变亮约 1 秒"的穿帮。
-     * 修法：跌落路径上，基准面恢复与 _shellT 同步 —— 水晶完全消失的同一时刻
-     * 基准面恰好闭合，读作"碎块收拢回基准面"，不再有孤立亮壳时段。
-     * ★ 二次修复（实测）：旧版只在 p<SHELL_SHOW_P(0.2) 且 _shellT 已开始收回时才
-     *   同步 —— 但能量滑块的 600ms 遥测过渡会**经过 p 0.2~0.8 段**，那段基准面仍走
-     *   _deploy 恢复路径（实测 fade 直接回 1.0、水晶 _shellT 还停在 0.5+ 半显）→
-     *   "白色基准面在水晶消失之前就全亮"的穿帮。
-     *   改法：以 wantSeq **true→false 边沿锁存**下降同步（_dropSync）—— 一旦跌破 80，
-     *   整个下降过渡（含 p 0.2~0.8）基准面恢复都跟 _shellT；_shellT 在 p>0.2 时保持 1
-     *   （水晶全显）→ 基准面维持幽灵态不提前亮；p<0.2 后随 _shellT 一起收。上升路径
-     *   （wantSeq 未发生过 true→false）不受影响，35-80 亮壳观感保持。 */
-    /* _dropSync 锁存已在 _animateDeploy（有 _wasSeq = 真上一帧 wantSeq）完成，
-     * 这里只消费它（wantSeq=true 时锁存必为 0，无需再写）。 */
-    const _dropSync = (this._dropSync ?? 0) > 0 && !this._wantSeq;
-    const innerFade = _dropSync
-      ? 1.0 - (1.0 - DROP_GHOST_FLOOR)
-          * THREE.MathUtils.smoothstep(this._shellT ?? 1, 0.0, 1.0)
-      : 1.0 - (1.0 - BASE_GHOST_FLOOR)
-          * THREE.MathUtils.smoothstep(this._deploy, 0.0, 0.55);
+    const innerFade = 1.0 - (1.0 - BASE_GHOST_FLOOR)
+      * THREE.MathUtils.smoothstep(this._deploy, 0.0, 0.55);
     this.shellInnerUniforms.u_shell_alpha.value = shellAlpha * innerFade;
     this.shellInnerUniforms.u_shell_fade.value = innerFade;   // v-new：真正门控内壳颜色
     /* v5.17：幽灵态结构线亮度补偿 —— 高能段把基准面的**发光框架**提亮，
@@ -4770,29 +3561,8 @@ export class L5Core {
     const _wipeAtten = 1.0 - (1.0 - BASE_HIDE_LEVEL) * _hidden;
     const _atten = Math.max(0.08, innerFade * _wipeAtten);
     const _need = 1.0 / _atten;   // 完全补平所需倍数（settled 时 = 1/0.20 = 5.0）
-    /* v-棱台修复：结构线补偿随展开门控 —— 用户"升起前一刻"（碎片未展开、
-     * 12 面在投影上重叠）时，5× 补偿把幽灵态勾边/刻痕提亮成跨面"错位三角面"；
-     * 展开到位（碎片分开）后补偿再升起，幽灵态框架才恢复"亮结构线"。
-     * 与 _liftEnv 同源 smoothstep(_deploy,0,0.55)，保证抬升扫掠与补偿同步。
-     * ★ 门控只作用于"超出 1.0 的补偿部分"：基础 1.0 恒保留 —— 闭合态（_deploy=0）
-     *   时 boost 必须 =1（结构线正常亮度），绝不能乘成 0（否则基准面整面变黑消失）。 */
-    const _boostGate = THREE.MathUtils.smoothstep(this._deploy, 0.0, 0.55);
-    const _boostFull = Math.min(BASE_BOOST_MAX,
+    this.shellInnerUniforms.u_base_boost.value = Math.min(BASE_BOOST_MAX,
       1.0 + (_need - 1.0) * THREE.MathUtils.smoothstep(p, 0.76, 0.94) * BASE_BOOST_MIX);
-    /* v-穿帮二次修复（boost）：下降同步期间（_dropSync）结构线补偿压回基础亮度。
-     * 实测：等高能态**长时间展开到位**（_deploy=1 → boostGate=1）再拉 0，下降开头
-     * p 仍高（600ms 遥测过渡）→ _boostFull 满档（≈3×），而 innerFade 已被锁在 0.6
-     * 幽灵态 —— 勾边/刻痕净亮 ≈1.8×，在基准面半透明下读作"白色片"；且 boostFull
-     * 的 smoothstep(p,0.76,0.94) 只随 p 回落，跟不上 innerFade 的锁存，形成
-     * "水晶还在、白色结构线先亮"的窗口。下降时基准面本就该收回闭合，提亮不再需要，
-     * 强制 boost=1（基础亮度）随 innerFade 一起暗 → 白色片消除；上升/展开态不受影响。 */
-    const _boost = _dropSync ? 1.0 : (1.0 + (_boostFull - 1.0) * _boostGate);
-    this.shellInnerUniforms.u_base_boost.value = _boost;
-    /* v-穿帮四次修复（碎块侧）：下降同步信号广播给碎块 —— u_retract=1 时 FRAG 的
-     * reveal（闭合/展开实心度）提前随 deploy 淡出，收拢=淡出，冰白碎块重叠不再成片。
-     * 主 uniform 是 fork 源头（shellUniforms/shellInner/fragCore/每片 fUniforms 均共享
-     * 该引用），写一次全部生效。 */
-    this.uniforms.u_retract.value = _dropSync ? 1.0 : 0.0;
 
     /* v5.18：基准面沿法线抬升（用户："看不出来有一层面包着"）。
      * · 展开（_wantSeq）：随碎块外推一起抬起 —— 用 _deploy 的 0→0.55 段，
@@ -4805,326 +3575,8 @@ export class L5Core {
     const _liftEnv = this._wantSeq
       ? THREE.MathUtils.smoothstep(this._deploy, 0.0, 0.55)
       : 1.0 - THREE.MathUtils.clamp(this._baseProg ?? 1, 0, 1);
-    /* 基准面抬升（用户设计项，v5.26b 恢复 —— 上一版把它归零是在改需求，不是修 bug）。
-     * 与碎块外推走同一个包络 _liftEnv，保证"碎片面上升时基准面也抬升"。
-     * 抬升量 BASE_LIFT 由 FRAG_PUSH_MIN 反推（见常量处推导），
-     * 恒满足 BASE_LIFT·(1+BASE_FLOAT_AMP) < FRAG_PUSH_MIN → 最上位置永远低于碎块最下位置。 */
     this.shellInnerUniforms.u_lift.value = BASE_LIFT * _liftEnv;
-    this.shellInnerUniforms.u_sweep.value = _liftEnv;   // v-内容1：棱台与抬升同一包络扫掠
-    /* v-调试通道（仅无头复现用）：window.__DBG_BASE__ 存在时覆盖基准面 uniform，
-     * 用于精确复现"升起前一刻"等任意 sweep/lift/擦除组合状态。正常运行无此变量，零影响。 */
-    if (typeof window !== 'undefined' && window.__DBG_BASE__) {
-      const _dbg = window.__DBG_BASE__;
-      if (_dbg.sweep != null) this.shellInnerUniforms.u_sweep.value = _dbg.sweep;
-      if (_dbg.lift != null) this.shellInnerUniforms.u_lift.value = _dbg.lift;
-      if (_dbg.revB != null) this.shellInnerUniforms.u_revB.value.set(_dbg.revB, _dbg.dir ?? 1, _dbg.ring ?? 1, 0);
-      if (_dbg.boost != null) this.shellInnerUniforms.u_base_boost.value = _dbg.boost;
-    }
     this._baseLift = +this.shellInnerUniforms.u_lift.value.toFixed(5);  // 探针可观测
-
-    /* —— v-内容3：核心外壳透明度分档 + 细线环渐隐 ——
-     * 用户规格：0 能量 → 完全不透明；20 阈值无突变；0-35 → 1→0.75；
-     * 35-80 → 0.75→0.40；>80 → 与水晶碎块面显现一样的细线环脉冲，但**脉冲渐隐**
-     * （脉冲线扫过 → 完全透明、线内隐藏），露出其内的真正能量核心（下一内容）。
-     * 擦除前沿复用基准面 u_revB 的 _baseProg/_baseDir（同一 _animateBasePulse）：
-     * 跨 80 与基准面同时起脉冲、同波形、同面级错相；唯一差异是扫过的落点——
-     * 基准面半隐(0.50)、核心全隐(0.0)。 */
-    const coreU = this.coreMaterial.uniforms;
-    let cAlpha;
-    if (p <= 0.001) cAlpha = 1.0;
-    else if (p < 0.35) cAlpha = 1.0 - (1.0 - 0.75) * THREE.MathUtils.smoothstep(p, 0.0, 0.35);
-    else if (p < 0.80) cAlpha = 0.75 - (0.75 - 0.40) * THREE.MathUtils.smoothstep(p, 0.35, 0.80);
-    else cAlpha = 0.40;
-    coreU.u_core_alpha.value = cAlpha;
-    coreU.u_core_wipe.value.set(
-      this._baseProg ?? 1, this._baseDir ?? -1,
-      this._baseStats ? this._baseStats.ring : 0, 0);
-    this._coreAlpha = +cAlpha.toFixed(4);   // 探针可观测
-    this._coreWipeProbe = Array.from(coreU.u_core_wipe.value).map((v) => +v.toFixed(3));
-
-    /* —— v-内容4：黑洞体（核心内部） ——
-     * 相位：normal（0-20 紧闭 / 20-80 渐开）→ 跨 80 → collapse（**四段式**，
-     * BH_COLLAPSE_DUR = 2.65s）→ collapsed（面板已被吸入、大黑洞常驻）→ 降回 <80 →
-     * resurge（黑洞缩至最小 + 面板随基准面 _baseProg 细线环脉冲渐显，0.85s）→ normal。
-     *
-     * ★ v-内容4-塌（用户定标，见文件顶部常量区的四段式说明）：
-     *   ① 吸入 BH_SUCK_DUR(1.10s)：外壳板被超强引力**卷曲**吸进黑洞缩到 0；
-     *      **所有粒子**在这段内被全部吸入（不重生）；黑洞本身**不缩**，只略胀 ——
-     *      旧实现让黑洞与外壳一起缩，看起来就是"整体缩放"，没有区别。
-     *   ② 塌缩 BH_PINCH_DUR(0.55s)：**黑洞本身**缩到中心点 BH_R_PINCH，
-     *      全程带引力扭曲动效 u_bh_warp 0→1。
-     *   ③ 闪光 BH_FLASH_DUR(0.45s)：半径钉在中心点，爆白走 sin 半周，扭曲回落。
-     *   ④ 爆发 BH_BURST_DUR(0.55s)：半径 easeOutCubic 放大到 BH_R_MAX = 0.40u。 */
-    const bh = this._bh;
-    const p20 = THREE.MathUtils.smoothstep(p, 0.20, 0.80);
-    /* <80 挡位的黑洞半径（20-80 渐开）—— 与 >80 的 BH_R_MAX 分档，
-     * 用户："0.4u 属于大于80挡位" → 跨阈时刻的黑洞尺寸就是 BH_R_OPEN_MAX。 */
-    const bhROpen = BH_R_MIN + (BH_R_OPEN_MAX - BH_R_MIN) * p20;
-    let bhDist, bhGlow, bhReveal, bhBurn, bhSwallow, bhR, bhFlash = 0, bhWarp = 0, bhForm = 0;
-    /* v5.24-crush：「冻结星」变暗量 0..1（1 = 彻底变黑）。塌缩②前段迅速升到 1，
-     * ③④保持 1（中心点已无光可发），collapsed / 常态回到 0。 */
-    let bhDim = 0;
-    const bhOver80 = this._wantSeq;
-    if (bhOver80) {
-      if (bh.phase === 'normal' || bh.phase === 'resurge') {
-        bh.phase = 'collapse'; bh.colT = 0;
-        // v5.23：从**当前实际半径**出发（bh.lastR 每帧落盘）—— 中途跨阈也不跳变
-        bh.rFrom = bh.lastR ?? bhROpen;
-        bh.dFrom = bhPanelDist(bh.rFrom);      // ① 面板从这个距离被拉回中心
-      }
-      if (bh.phase === 'collapse') {
-        // v-内容4-塌：colT = 绝对秒数；四段各有时长
-        bh.colT = Math.min(BH_COLLAPSE_DUR, (bh.colT ?? 0) + dt);
-        const t = bh.colT;
-        const rFrom = bh.rFrom ?? bhROpen;
-        const dFrom = bh.dFrom ?? bhPanelDist(bhROpen);
-        if (t < BH_SUCK_DUR) {
-          /* ① 吸入（1.10s）：外壳板被超强引力**卷曲**、吸进黑洞、缩到 0；
-           *    **所有粒子**在这段内被全部吸入（不重生）；
-           *    ★ 黑洞本身**不缩**（旧实现让它跟外壳一起缩 → 看起来就是整体缩放），
-           *      只略微膨胀（正在吞东西）。 */
-          const k = t / BH_SUCK_DUR;
-          const eS = k * k * (3 - 2 * k);
-          bhDist = dFrom * (1 - eS);             // 面板被卷向中心
-          bhReveal = 1 - Math.min(1, eS * 1.15);
-          bhBurn = eS;                           // 撕裂白热（被吸进黑洞）
-          bhSwallow = eS;
-          bhR = rFrom * (1 + 0.12 * eS);         // 略胀，不缩
-        } else if (t < BH_SUCK_DUR + BH_PINCH_DUR) {
-          /* ② 压碎 / 冻结（0.55s）—— v5.24-crush（调研后重做）
-           * 调研结论：远处观察者**永远看不到物质穿过视界** —— 表观尺寸**冻结**在引力半径
-           * 附近，同时急剧变暗变红（"冻结星"，亮度每 20μs 减半），最后才彻底黑掉。
-           * 旧实现让"半径缩小"与"挤压"同时进行 → 球一变小，压痕就完全看不见 ——
-           * 这正是用户"反复截图都是完美的球形，看不出来"的根因。
-           * 现在：前 75% **表观尺寸几乎不变**（只缩 10%），挤压持续加深（球面被压凹、
-           * 环被压皱）、亮度迅速熄灭；后 25% 才"啪"地落进奇点。 */
-          const kp = (t - BH_SUCK_DUR) / BH_PINCH_DUR;
-          const eP = kp * kp * (3 - 2 * kp);
-          const freeze = Math.min(1, kp / 0.75);
-          const snapK = Math.max(0, (kp - 0.75) / 0.25);
-          const eSnap = snapK * snapK * (3 - 2 * snapK);
-          const rHold = rFrom * 1.12 * (1 - 0.10 * freeze);
-          bhR = rHold + (BH_R_PINCH - rHold) * eSnap;   // 冻结 → 末段才落进奇点
-          bhWarp = eP;                                  // 多向不等巨力挤压（压痕 + 环扭曲）
-          /* v5.25：变暗**推迟且不再到全黑**（0.85）。旧版 kp 一开始就 dim 到 1，
-           * 球一黑就完全没了形状信息 —— 那才是"塌缩看着一直是完美球形"的真凶。
-           * 现在前 45% 保持可见（看得见被压凹），最后 55% 才熄灭。 */
-          bhDim = 0.85 * THREE.MathUtils.smoothstep(kp, 0.45, 1.0);
-          bhDist = 0; bhReveal = 0; bhBurn = 1; bhSwallow = 1;
-        } else if (t < BH_SUCK_DUR + BH_PINCH_DUR + BH_FLASH_DUR) {
-          /* ③ 闪光（0.45s）：半径钉在中心点，爆白走 sin 半周 0→1→0；扭曲回落。 */
-          const u = (t - BH_SUCK_DUR - BH_PINCH_DUR) / BH_FLASH_DUR;
-          bhFlash = Math.sin(Math.PI * u);
-          bhWarp = 1 - u;                        // 扭曲在闪光时退去
-          bhDim = 1;                             // 已冻结变黑（闪光由 u_bh_flash 单独给）
-          bhDist = 0; bhReveal = 0; bhBurn = 1; bhSwallow = 1;
-          bhR = BH_R_PINCH;
-        } else {
-          /* ④ 爆发（0.55s）：从中心点 easeOutCubic 放大到 BH_R_MAX（0.40u）。 */
-          const kb = Math.min(1,
-            (t - BH_SUCK_DUR - BH_PINCH_DUR - BH_FLASH_DUR) / BH_BURST_DUR);
-          const eB = 1 - Math.pow(1 - kb, 3);
-          bhDim = 1 - eB;                        // 爆发：从"全黑"重新亮回来
-          bhDist = 0; bhReveal = 0; bhBurn = 1; bhSwallow = 1;
-          bhR = BH_R_PINCH + (BH_R_MAX - BH_R_PINCH) * eB;
-        }
-        bhGlow = 1;
-        if (bh.colT >= BH_COLLAPSE_DUR) bh.phase = 'collapsed';
-      } else {                                  // collapsed
-        bhDist = 0; bhReveal = 0; bhBurn = 1; bhSwallow = 1;
-        bhR = BH_R_MAX; bhGlow = 1;
-      }
-    } else {
-      if (bh.phase === 'collapse' || bh.phase === 'collapsed') {
-        bh.phase = 'resurge'; bh.resT = 0;
-        /* v5.23-form：三段回落（用户定标"先塌缩成点 → 再膨胀到对应大小 → 外壳再成形"）。
-         * ① 的起点是**当前实际半径**（从 collapsed 掉下来 = BH_R_MAX；若在塌缩途中
-         * 跨下来则是中途半径 → crush 自然很短，顺序不变、无跳变）。 */
-        bh.rsFrom = bh.lastR ?? BH_R_MAX;
-      }
-      if (bh.phase === 'resurge') {
-        bh.resT = Math.min(BH_RESURGE_DUR, (bh.resT ?? 0) + dt);
-        const t = bh.resT;
-        if (t < BH_RESURGE_CRUSH_DUR) {
-          /* ① 压入奇点（0.50s）：当前半径 → BH_R_PINCH，引力扭曲拉满。
-           * 非等比：写入段把球压成 oblate（扁椭球），透镜环被往里拽（shader 里
-           * u_bh_warp 驱动）→ "被自身超强引力压进中心奇点"，不是整体缩放。 */
-          const k = t / BH_RESURGE_CRUSH_DUR;
-          const e = k * k * (3 - 2 * k);
-          bhR = (bh.rsFrom ?? BH_R_MAX) + (BH_R_PINCH - (bh.rsFrom ?? BH_R_MAX)) * e;
-          bhWarp = e;
-          bhDist = 0; bhReveal = 0; bhBurn = 0; bhSwallow = 0;   // bhForm 保持 0
-        } else if (t < BH_RESURGE_CRUSH_DUR + BH_RESURGE_BLOOM_DUR) {
-          /* ② 从奇点膨胀（0.60s）到**当前能量对应的尺寸**（bhROpen 是实时目标，
-           * 期间能量再变也跟着，结束时正好落在 normal 的目标上 → 无缝交接）。 */
-          const kb = (t - BH_RESURGE_CRUSH_DUR) / BH_RESURGE_BLOOM_DUR;
-          const e = 1 - Math.pow(1 - kb, 3);
-          bhR = BH_R_PINCH + (bhROpen - BH_R_PINCH) * e;
-          bhWarp = 1 - e;                       // 膨胀时扭曲退去
-          bhDist = 0; bhReveal = 0; bhBurn = 0; bhSwallow = 0;
-        } else {
-          /* ③ 外壳数据化成形（0.95s）：黑洞已就位，面板**先虚影后实体**、
-           * 从内侧连续浮升到位（逐面错峰在面板循环里做）—— 没有"瞬移"。 */
-          const kf = Math.min(1,
-            (t - BH_RESURGE_CRUSH_DUR - BH_RESURGE_BLOOM_DUR) / BH_RESURGE_FORM_DUR);
-          bhR = bhROpen;
-          bhWarp = 0; bhReveal = 0; bhForm = kf; bhBurn = 0; bhSwallow = 0;
-          bhGlow = p20;
-          bhDist = bhPanelDist(bhROpen);        // 全局目标距（逐面入场另行计算）
-        }
-        bhGlow = bhGlow ?? p20;
-        if (t >= BH_RESURGE_DUR) { bh.phase = 'normal'; bh.rSmooth = bhR; }
-      } else {
-        /* normal：半径**平滑跟随**目标（指数趋近，绝不硬切）——
-         * resurge 结束时两者已相等，之后能量变化也只是连续漂移，杜绝一切瞬移。 */
-        bh.rSmooth = (bh.rSmooth ?? bhROpen) + (bhROpen - (bh.rSmooth ?? bhROpen)) * Math.min(1, dt * 6);
-        bhR = bh.rSmooth;
-        bhGlow = p20;
-        bhReveal = 1; bhForm = 0; bhBurn = 0; bhSwallow = 0;
-      }
-      // v-内容4-形：面板距 = 黑洞半径 + 0.1u（大小不变，只是往外推）
-      bhDist = bhDist ?? bhPanelDist(bhR);
-    }
-    bh.lastR = bhR;   // v5.23：每帧落盘，供下一次跨阈取"当前实际半径"
-    // 面板写入：抬升位移 / 塌缩向心+螺旋+缩小 / 渐显复位
-    /* ★★ v-内容4-形（最致命的一处，用户"三个五边形叠在一起"的主因）：
-     * 旧代码在正常分支里 `m.rotation.set(0, 0, 0)` —— 这会把构造函数里精心摆好的
-     * 面朝向**每帧抹成同一姿态**！12 块板于是全部朝向 +Z、互相平行，
-     * 位置又都挤在离体心 0.085 处 → 屏幕上就是"几个五边形叠在一起，不是立体"。
-     * 正确做法：每帧先 copy 本面的基准朝向 _bhFaceQuat[f]，需要自旋时再绕
-     * **局部 Z（= 面法线）** 叠加，绝不用 Euler 覆盖。 */
-    for (let f = 0; f < 12; f++) {
-      const m = this.bhPanels[f];
-      const n = this._bhFaceN[f];
-      const baseQ = this._bhFaceQuat[f];
-      if (bh.phase === 'collapse') {
-        const t = bh.colT;
-        const k = Math.min(1, t / BH_SUCK_DUR);
-        const eS = k * k * (3 - 2 * k);
-        const sc = Math.max(1e-3, 1 - eS);
-        m.scale.set(sc, sc, sc);
-        const pos = n.clone().multiplyScalar(bhDist);
-        // 螺旋向心：振幅随 (1-eS) 衰减到 0（被吸进去时不再横摆），起步 0.2s 内渐入
-        pos.addScaledVector(this._bhTang[f],
-          Math.sin(t * Math.PI * 2.2) * 0.09 * (1 - eS) * Math.min(1, t / 0.2));
-        m.position.copy(pos);
-        m.quaternion.copy(baseQ);
-        m.rotateZ(eS * 2.2 * (f % 2 === 0 ? 1 : -1));
-      } else if (bh.phase === 'collapsed') {
-        m.scale.set(1e-3, 1e-3, 1e-3);   // 已被吸入，不留残桩
-        m.position.set(0, 0, 0);
-        m.quaternion.copy(baseQ);
-      } else if (bh.phase === 'resurge') {
-        /* v5.23-form：回落三段的面板 ——
-         * ①②段（压入奇点 / 膨胀）：面板未成形，藏住；
-         * ③段：**逐面错峰**数据化成形，位置从目标距的 30% 处连续浮升到位
-         * （用户："外壳突兀出现，闭合后又瞬移到抬升位置"的根因就是旧版直接把
-         *   面板按瞬时 bhDist 摆好 —— 现在入场本身就是一段连续位移）。 */
-        const t3 = bh.resT - BH_RESURGE_CRUSH_DUR - BH_RESURGE_BLOOM_DUR;
-        if (t3 <= 0) {
-          m.scale.set(1e-3, 1e-3, 1e-3);
-          m.position.set(0, 0, 0);
-          m.quaternion.copy(baseQ);
-        } else {
-          // 错峰：0 ~ 0.51s 的逐面相位差（取模组合，12 面读作"依次装配"）
-          const stag = ((f * 7) % 12) / 12 * 0.45;
-          const sf = Math.max(0, Math.min(1,
-            (t3 / BH_RESURGE_FORM_DUR - stag) / 0.55));
-          const eF = sf * sf * (3 - 2 * sf);
-          const dT = bhPanelDist(bhROpen);
-          const sc = 0.72 + 0.28 * eF;
-          m.scale.set(sc, sc, sc);
-          m.position.copy(n).multiplyScalar(dT * (0.30 + 0.70 * eF));
-          m.quaternion.copy(baseQ);
-        }
-      } else {
-        // v-内容4-形：大小恒为 1（用户「大小不变」），只有位置沿法线外推
-        m.scale.set(1, 1, 1);
-        m.position.copy(n).multiplyScalar(bhDist);
-        m.quaternion.copy(baseQ);
-      }
-    }
-    // 黑洞写入
-    /* v-内容4-修：**物理半径 bhR 与绘制半径 bhRDraw 解耦**。
-     * ③闪光时物理半径只有 BH_R_PINCH(0.010u) —— 若直接按它缩放，闪光就是个看不见的点。
-     * 故闪光期间把绘制半径顶到 BH_FLASH_R，让爆白有可视面积；物理半径（粒子吸引/
-     * 吞噬判定用）仍然老老实实待在中心点。
-     *
-     * v-内容4-视：绘制拆成两个 mesh ——
-     *   · bhCore 事件视界：不透明黑球，半径 = bhRDraw / BH_LENS_K（**遮挡背后一切**）
-     *   · bhLens 引力透镜：加色壳，半径 = bhRDraw（只画光子环/光晕，不遮挡）
-     *
-     * ★ v5.22-尺（用户："黑洞大于0.8之后的大小是不是比之前大了好多，改回去"）：
-     *   BH_R_MAX = 0.40u 是**整个黑洞的外径**（用户第 2 轮定标"0.4u 属于大于80挡位"）。
-     *   上一版把透镜壳做成 bhRDraw × 1.5 → 外径变成 0.60u，整整大了 1.5 倍。
-     *   现在透镜壳就是外径本身（0.40u），视界缩到 0.267u —— 与着色器里
-     *   u_bh_vh = 1/1.5 ≈ 0.667 的"视界占投影半径比例"完全自洽。 */
-    const bhRDraw = Math.max(bhR, BH_FLASH_R * bhFlash);
-    const bhVisible = bhRDraw > 0.005;
-    /* v5.23-crush：不再整体压成椭圆（用户："变成椭圆塌缩并不是一个合适的引力塌缩方式"）。
-     * 改为 u_bh_crush 驱动**多向不等巨力**的定向压痕（顶点位移 + 环半径调制），
-     * 塌缩②与回落①共用 —— 读作"失控的自身引力把它挤碎、压进奇点"。 */
-    /* ★ v5.24b-bugfix：闪光期间**不画黑球**。
-     * bhRDraw 在闪光时被顶到 BH_FLASH_R(0.20u)，于是 bhCore 会以 0.133u 的黑球
-     * 杵在爆白的正中心 —— 用户："闪光那一下也是黑色的"。而且它还会在这一瞬
-     * 遮住身后的核心与碎块。物理上此刻黑洞已经塌进奇点、**不存在视界**，
-     * 爆出来的就应该是纯发光体 → 闪光段只留加色的 bhLens。 */
-    this.bhCore.visible = bhVisible && bhFlash <= 0.001;
-    this.bhCore.scale.setScalar(bhRDraw / BH_LENS_K);
-    this.bhLens.visible = bhVisible;
-    this.bhLens.scale.setScalar(bhRDraw);
-    const bhu = this.bhLensMaterial.uniforms;
-    bhu.u_bh_swallow.value = bhSwallow;
-    bhu.u_bh_flash.value = bhFlash;
-    bhu.u_bh_warp.value = bhWarp;
-    bhu.u_bh_crush.value = bhWarp;                   // 透镜：环按同一场扭曲
-    bhu.u_bh_dim.value = bhDim;                      // v5.24：冻结星变暗
-    bhu.u_bh_vh.value = 1 / BH_LENS_K;
-    this.bhCoreMaterial.uniforms.u_bh_crush.value = bhWarp;   // 视界：球面按同一场压凹
-    /* v5.28：测地线透镜**环**（几何自带内外缘，不再是一整个盘）。
-     *   · 缩放基准 = 阴影半径 ⇒ 几何内缘 u=1（临界曲线 = 视界球轮廓），外缘 u=1.25；
-     *   · 有效史瓦西半径 = 阴影半径 / b_c，把临界曲线钉在视界球轮廓上（视觉尺寸不变）；
-     *   · 覆盖度恒 1 ⇒ 环内**只输出偏折后的那一张像**。 */
-    /* v5.30：③闪光段黑洞已塌进奇点 → 不存在引力透镜 → 整条环不画。
-     * ★ 不能改回"用 alpha 淡出"：环现在**写深度**（这是它做真替换的手段），
-     *   alpha 归 0 却仍在写深度，会在爆白正中心挖出一个"后面什么都看不见"的圆。
-     *   要退就整体退 —— 与 bhCore 用同一条判据。 */
-    this.bhGrav.visible = bhVisible && bhFlash <= 0.001;
-    this.bhGrav.scale.setScalar(bhRDraw / BH_LENS_K);
-    const gvu = this.bhGravMaterial.uniforms;
-    gvu.u_gv_rs.value = bhRDraw / (BH_LENS_K * BH_B_CRIT_RS);
-    gvu.u_gv_uout.value = LENS_U_OUT;
-    /* v5.29：打开碎片的**隐形遮挡体**（renderOrder 35，只写深度不写颜色）。
-     * 洞前的碎片 ⇒ 深度比洞心近 ⇒ 透镜环(36)被深度测试挡掉 ⇒ 碎片正常遮住黑洞，
-     * 且它自己的绘制完全不受影响；洞后的碎片 ⇒ 深度更远 ⇒ 透镜环正常覆盖它。
-     * 这才是"一个像素一张像"+"洞前内容不被弯折"两条同时成立的唯一解。 */
-    this._setFragTwins(bhVisible);
-    bhu.u_bh_size.value = THREE.MathUtils.clamp(
-      (bhR - BH_R_MIN) / (BH_R_MAX - BH_R_MIN), 0, 1);
-    const bpu = this.bhPanelMaterial.uniforms;
-    bpu.u_bh_glow.value = bhGlow;
-    bpu.u_bh_reveal.value = bhReveal;
-    bpu.u_bh_burn.value = bhBurn;
-    bpu.u_bh_form.value = bhForm;   // v5.23-form：数据化成形（resurge ③ 段）
-    // 探针
-    this._bhDist = +bhDist.toFixed(4);   // v-内容4-形：面板中心到体心的距离
-    this._bhGlow = +bhGlow.toFixed(3);
-    this._bhR = +bhR.toFixed(4);
-    this._bhReveal = +bhReveal.toFixed(3);
-    this._bhPhase = bh.phase;
-    this._bhFlash = +bhFlash.toFixed(3);   // ③闪光段应 0→1→0
-    this._bhWarp = +bhWarp.toFixed(3);     // v-内容4-塌：②塌缩段应 0→1，③回落
-    this._bhForm = +bhForm.toFixed(3);     // v5.23-form：回落③段 0→1
-    this._bhDim = +bhDim.toFixed(3);       // v5.24-crush：冻结星变暗（屏幕空间透镜 pass 用）
-    this._bhRDraw = +bhRDraw.toFixed(4);   // 透镜壳外径（世界单位）
-    /* v5.24-lens：屏幕空间引力透镜 pass 的**捕获半径**必须是**视界半径**（外径/1.5）——
-     * 用外径会把加色光子环一起涂黑（pass 在 RenderPass 之后跑）。 */
-    this._bhRh = +(bhRDraw / BH_LENS_K).toFixed(4);
-
-    /* v-内容4-形：>80 黑洞把**所有粒子**一起塌缩吸入 —— 用户定标
-     * "大于80后，黑洞将外壳板和所有粒子塌缩吸入……（大于80的部分是全部被吸入，
-     *  就不存在环流了）" → 整个 >80 挡位 suckAll=true，不再有 flow 环流。 */
-    this._updateDataParticles(p, dt, simTime, bh.phase, bhR, bhOver80);
 
     // v-new：笼框/幽灵框是结构件 → 恒冷青（结构冷、能量暖）；亮度仍随 p/head 走
     const coldC = this._coldColor || (this._coldColor = new THREE.Color(0.15, 0.60, 1.0));
@@ -5134,191 +3586,6 @@ export class L5Core {
     this.cageGhostMaterial.opacity = (0.12 + 0.26 * p) * head * (this._cageMul ?? 1.0);
 
     // v5.21e：棱线光导管的逐帧颜色/透明度驱动（rodGain / rodHead / rodContain）已随之删除
-  }
-
-  /** v-内容5：高能数据立方体粒子 —— 与黑洞体相位联动的状态机。
-   * mode：wander（自由随机游走）/ attract（被黑洞吸引，螺旋吸入）/
-   * orbit（降回 <80 绕核心中心公转）。吞噬 → 回收：随机位置 + 随机初速度新粒子。
-   *
-   * ★ v-内容4-形：flow（双股环流）**已删除**。用户定标 ">80 是全部被吸入，不存在环流"
-   * —— 整个 >80 挡位所有粒子持续被选中 → 吸引 → 吞噬 → 回收 → 再被吸入，
-   * 读作"粒子源源不断被黑洞吃掉"，而不是"绕着转"。 */
-  _updateDataParticles(p, dt, simTime, bhPhase, bhR, suckAll = false) {
-    const st = this.dpState;
-    // 能量色渐变：冰蓝 → 橙黄 → 亮橙（两段插值）
-    const ice = [0.55, 0.85, 1.0], amber = [1.0, 0.72, 0.30], hot = [1.0, 0.45, 0.12];
-    let cc;
-    if (p < 0.5) {
-      const t = p * 2;
-      cc = [ice[0] + (amber[0] - ice[0]) * t, ice[1] + (amber[1] - ice[1]) * t, ice[2] + (amber[2] - ice[2]) * t];
-    } else {
-      const t = (p - 0.5) * 2;
-      cc = [amber[0] + (hot[0] - amber[0]) * t, amber[1] + (hot[1] - amber[1]) * t, amber[2] + (hot[2] - amber[2]) * t];
-    }
-    const over80 = bhPhase === 'collapse' || bhPhase === 'collapsed';
-    const resurging = bhPhase === 'resurge';
-    const opening = !over80 && p >= 0.20;
-    /* v-内容4-塌：**>80 所有粒子一次性全部转入 attract，被吞掉后进入 'gone'
-     * 不再重生**（用户："所有粒子在一定时间内被全部吸入，不需要重生"）。
-     * 每粒给一个随机 delay（0 ~ 55% 吸入段时长）→ 级联着被拽走，而不是齐刷刷瞬移。 */
-    /* ★ v5.22-bugfix：**本函数的全部局部助手必须在第一次使用之前声明完**。
-     * 旧代码把 `const _respawn = (s,s)=>{…}` 写在这段**下面**（"每粒子更新"处），
-     * 而这里的「跌回 <80 整体重生」分支会在它之前调用 → TDZ 抛
-     * `Cannot access 'w' before initialization`（压缩后 _respawn 被改名成 w），
-     * 于是能量降到 80 以下立刻整帧崩、画面卡死。
-     * 教训：函数体里凡是被"上方分支"用到的助手，一律提到函数顶部声明。 */
-    const dummy = this.dpDummy, col = new THREE.Color();
-    const up = new THREE.Vector3(0, 1, 0);
-    /** 回收重生：随机位置 + 随机初速度。mode='orbit' 时额外给出公转参数。 */
-    const _respawn = (s, mode) => {
-      const th = Math.random() * Math.PI * 2;
-      const ph = Math.acos(2 * Math.random() - 1);
-      /* v-内容4-形：重生半径必须**在黑洞外面**（黑洞最大 0.40u，而 DP_INNER 只有 0.34
-       * —— 否则粒子会直接生成在事件视界里，下一帧立刻被判吞噬，看不出吸入过程）。 */
-      const rIn = Math.max(DP_INNER, bhR + 0.06);
-      const r = rIn + Math.random() * Math.max(0.02, DP_OUTER - rIn);
-      s.pos.set(r * Math.sin(ph) * Math.cos(th), r * Math.cos(ph), r * Math.sin(ph) * Math.sin(th));
-      s.vel.set((Math.random() - 0.5) * 0.07, (Math.random() - 0.5) * 0.07, (Math.random() - 0.5) * 0.07);
-      s.mode = mode;
-      s.delay = 0;
-      if (mode === 'orbit') {
-        s.r = r;
-        s.tilt = (Math.random() - 0.5) * 1.3;
-        s.w = (Math.random() < 0.5 ? 1 : -1) * (0.28 + Math.random() * 0.35);
-        s.spin = Math.random() * Math.PI * 2;
-      }
-      this._dpInhaleTotal++;
-    };
-    const _ZERO = new THREE.Matrix4().makeScale(0, 0, 0);
-    if (suckAll && !this._dpSucked) {
-      this._dpSucked = true;
-      for (const s of st) {
-        if (s.mode === 'gone') continue;
-        s.mode = 'attract';
-        s.delay = Math.random() * BH_SUCK_DUR * 0.55;
-      }
-    } else if (!suckAll) {
-      this._dpSucked = false;
-      /* v5.23-part（用户定标"粒子突然出现 + 蠕动一阵后又变成另一排布 = 灾难"）：
-       * 旧实现一进 <80 就**同帧**把全部粒子 _respawn（resurge 的 orbit），随后
-       * resurge→normal 又切 wander 再 _respawn 一次 —— 两次全体瞬移重排。
-       * 现在：
-       *   · 目标常态由**能量**决定（p<0.20 wander / p≥0.20 orbit），resurge→normal
-       *     不再切模式（顺带修掉地图 §5 分歧 1 的"orbit 只活 0.85s"）；
-       *   · 换装/复活走**逐帧预算**（约 1.1s 摊完 400 颗），错峰出现，无同帧齐变。 */
-      const want = p < 0.20 ? 'wander' : 'orbit';
-      this._dpIdleMode = want;
-      /* ★ v5.23b-bugfix：游标**必须先取默认值再参与取模**。
-       * 旧写法在循环里直接用 `this._dpReviveCursor`（首帧是 undefined）
-       * → (i + undefined) % N = NaN → st[NaN] = undefined → `s.mode` 抛
-       * `Cannot read properties of undefined (reading 'mode')` → 跌破 80 整帧崩、画面卡死。
-       * 教训：取模索引的游标一律先 `?? 0` 落到一个**局部常量**，循环里只用这个常量。 */
-      const cur = this._dpReviveCursor ?? 0;
-      let budget = Math.max(1, Math.round(DP_COUNT * dt / 1.1));
-      for (let i = 0; i < DP_COUNT && budget > 0; i++) {
-        const s = st[(i + cur) % DP_COUNT];
-        if (s.mode === 'attract' || s.mode === want) continue;  // 在吸的让它走完
-        if (s.mode === 'gone') this._dpGone = Math.max(0, (this._dpGone ?? 0) - 1);
-        _respawn(s, want);
-        budget--;
-      }
-      this._dpReviveCursor = (cur + 7) % DP_COUNT;   // 每帧挪窗，避免总扫同一批
-    }
-    // 吸入名额（仅 20–80 段用：先选粒子 → 吸引 → 吞噬 → 回收重生）
-    this._dpInhaleAccum += opening
-      ? DP_INHALE_MAX * THREE.MathUtils.smoothstep(p, 0.2, 0.8) * dt : 0;
-    let slots = Math.floor(this._dpInhaleAccum);
-    this._dpInhaleAccum -= slots;
-    while (slots-- > 0) {
-      const cands = [];
-      for (const s of st) if (s.mode === 'wander' || s.mode === 'orbit') cands.push(s);
-      if (!cands.length) break;
-      const s = cands[(Math.random() * cands.length) | 0];
-      s.mode = 'attract';
-      s.delay = 0;
-    }
-    // 每粒子更新（_respawn / _ZERO / dummy / up 已在函数顶部声明）
-    for (let i = 0; i < DP_COUNT; i++) {
-      const s = st[i];
-      if (s.mode === 'gone') {   // v-内容4-塌：已被吞噬，不再重生、不再渲染
-        this.dataParticles.setMatrixAt(i, _ZERO);
-        this.particleTrails.setMatrixAt(i, _ZERO);
-        continue;
-      }
-      if (s.mode === 'wander') {
-        s.vel.x += (Math.random() - 0.5) * 0.16 * dt;
-        s.vel.y += (Math.random() - 0.5) * 0.16 * dt;
-        s.vel.z += (Math.random() - 0.5) * 0.16 * dt;
-        s.vel.multiplyScalar(1 - 0.4 * dt);
-        const spd = s.vel.length();
-        if (spd > DP_WANDER_SPD * 2.2) s.vel.multiplyScalar(DP_WANDER_SPD * 2.2 / spd);
-        s.pos.addScaledVector(s.vel, dt);
-        // v-内容4-形：内边界随黑洞长大外推（黑洞最大 0.40u > DP_INNER 0.34）
-        const rr = s.pos.length();
-        const rMin = Math.max(DP_INNER, bhR + 0.06);
-        if (rr > DP_OUTER) s.pos.multiplyScalar(DP_OUTER / rr);
-        else if (rr < rMin) s.pos.multiplyScalar(rMin / Math.max(rr, 1e-6));
-      } else if (s.mode === 'attract') {
-        if ((s.delay ?? 0) > 0) {
-          // v-内容4-塌：错峰 —— 还没轮到自己，先原地漂移
-          s.delay -= dt;
-          s.pos.addScaledVector(s.vel, dt);
-          s.vel.multiplyScalar(1 - 0.4 * dt);
-        } else {
-          const dir = s.pos.clone().negate().normalize();
-          const acc = 1.6 + 2.4 * bhR;   // 黑洞越大吸引越强
-          s.vel.addScaledVector(dir, acc * dt);
-          s.vel.multiplyScalar(1 - 0.4 * dt);
-          s.pos.addScaledVector(s.vel, dt);
-          const tang = new THREE.Vector3().crossVectors(dir, up);
-          if (tang.lengthSq() < 1e-6) tang.set(1, 0, 0);
-          s.pos.addScaledVector(tang.normalize(), Math.sin(simTime * 9 + s.seed * 10) * 0.014 * dt);
-          /* v5.22-尺：bhR 现在是**外径**（含透镜光晕），视界半径 = bhR / BH_LENS_K。
-           * 吞噬判定必须落在**视界面上**（旧写法 bhR*0.60 会让粒子在黑球外面
-           * 凭空消失）—— 粒子一路被吸到黑球表面才被吃掉。 */
-          if (s.pos.length() <= bhR / BH_LENS_K) {
-            // v-内容4-塌：>80 吞掉即消失（不重生）；20–80 段照旧回收重生
-            if (suckAll) { s.mode = 'gone'; this._dpGone = (this._dpGone ?? 0) + 1; }
-            else _respawn(s, resurging ? 'orbit' : 'wander');
-          }
-        }
-      } else {  // orbit：绕核心中心公转
-        s.spin += s.w * dt;
-        const a = s.spin, ca = Math.cos(a), sa = Math.sin(a), ct = Math.cos(s.tilt), stt = Math.sin(s.tilt);
-        s.pos.set(s.r * ca, s.r * sa * stt, s.r * sa * ct);
-        s.vel.set(-s.r * sa * s.w, s.r * ca * stt * s.w, s.r * ca * ct * s.w);
-      }
-      // 本体（立方体自旋）
-      dummy.position.copy(s.pos);
-      dummy.quaternion.setFromAxisAngle(up, s.spin * 0.6);
-      dummy.scale.set(1, 1, 1);
-      dummy.updateMatrix();
-      this.dataParticles.setMatrixAt(i, dummy.matrix);
-      // 拖尾：沿速度方向向后延伸，长度 ∝ 速度
-      const vlen = s.vel.length();
-      const trailLen = Math.min(0.10, 0.012 + vlen * 1.5);
-      dummy.position.copy(s.pos).addScaledVector(s.vel, -trailLen * 0.5);
-      dummy.lookAt(s.pos.x, s.pos.y, s.pos.z);
-      dummy.scale.set(trailLen, DP_TRAIL_W, DP_TRAIL_W);
-      dummy.updateMatrix();
-      this.particleTrails.setMatrixAt(i, dummy.matrix);
-      // 颜色（本体亮、拖尾随速度衰减）
-      const b = 0.80 + 0.20 * Math.sin(simTime * 6 + s.seed * 9);
-      col.setRGB(cc[0] * b, cc[1] * b, cc[2] * b);
-      this.dataParticles.setColorAt(i, col);
-      const tc = 0.30 + 0.30 * Math.min(1, vlen * 22);
-      col.setRGB(cc[0] * tc, cc[1] * tc, cc[2] * tc);
-      this.particleTrails.setColorAt(i, col);
-    }
-    this.dataParticles.instanceMatrix.needsUpdate = true;
-    this.particleTrails.instanceMatrix.needsUpdate = true;
-    if (this.dataParticles.instanceColor) this.dataParticles.instanceColor.needsUpdate = true;
-    if (this.particleTrails.instanceColor) this.particleTrails.instanceColor.needsUpdate = true;
-    // 探针：各 mode 计数 + 累计吞噬
-    const cnt = { wander: 0, attract: 0, flow: 0, orbit: 0 };
-    for (const s of st) cnt[s.mode]++;
-    this._dpMode = cnt;
-    this._dpInhale = this._dpInhaleTotal;
   }
 
   dispose() {
@@ -5334,22 +3601,6 @@ export class L5Core {
       });
     });
     this.coreMaterial.dispose();
-    if (this.bhPanelMaterial) this.bhPanelMaterial.dispose();
-    if (this.bhCoreMaterial) this.bhCoreMaterial.dispose();
-    if (this.bhLensMaterial) this.bhLensMaterial.dispose();
-    if (this.bhGravMaterial) {
-      this.bhGravMaterial.uniforms.t_lut.value?.dispose?.();
-      this.bhGravMaterial.dispose();
-    }
-    // v5.29：碎片的隐形遮挡体与其宿主共用同一份几何（上面已释放），这里只释放材质
-    if (this.fragTwins) this.fragTwins.forEach((m) => m.material?.dispose?.());
-    if (this.bhGrav) this.bhGrav.geometry.dispose();
-    if (this.bhProbeRT) this.bhProbeRT.dispose();
-    if (this.bhPanels) this.bhPanels.forEach((m) => m.geometry.dispose());
-    if (this.bhCore) this.bhCore.geometry.dispose();
-    if (this.bhLens) this.bhLens.geometry.dispose();
-    if (this.dataParticles) { this.dataParticles.geometry.dispose(); this.dpMaterial.dispose(); }
-    if (this.particleTrails) { this.particleTrails.geometry.dispose(); this.dpTrailMaterial.dispose(); }
     this.shellMaterial.dispose();
     this.shellInnerMaterial.dispose();
     this.fragCoreMaterial.dispose();

@@ -1,0 +1,66 @@
+[
+ {
+  "name": "baseline",
+  "shellAlpha": 0.21200000000000002,
+  "storedAvg": 0.9157894736842105,
+  "shellVis": true,
+  "coreVis": true,
+  "facetJit": 1
+ },
+ {
+  "name": "fac_off",
+  "shellAlpha": 0.21200000000000002,
+  "storedAvg": 0.9754385964912281,
+  "shellVis": true,
+  "coreVis": true,
+  "facetJit": 0
+ },
+ {
+  "name": "shell_off",
+  "shellAlpha": 0.21200000000000002,
+  "storedAvg": 1.0526315789473684,
+  "shellVis": false,
+  "coreVis": true,
+  "facetJit": 1
+ },
+ {
+  "name": "core_off",
+  "shellAlpha": 0.21200000000000002,
+  "storedAvg": 1.1614035087719299,
+  "shellVis": true,
+  "coreVis": false,
+  "facetJit": 1
+ },
+ {
+  "name": "pulse_off",
+  "shellAlpha": 0.21200000000000002,
+  "storedAvg": 1.2842105263157895,
+  "shellVis": true,
+  "coreVis": true,
+  "facetJit": 1
+ },
+ {
+  "name": "dataflow_off",
+  "shellAlpha": 0.21200000000000002,
+  "storedAvg": 1.343859649122807,
+  "shellVis": true,
+  "coreVis": true,
+  "facetJit": 1
+ },
+ {
+  "name": "cool0",
+  "shellAlpha": 0.21200000000000002,
+  "storedAvg": 0.042105263157894736,
+  "shellVis": true,
+  "coreVis": true,
+  "facetJit": 1
+ },
+ {
+  "name": "cool05",
+  "shellAlpha": 0.21200000000000002,
+  "storedAvg": 6.101754385964912,
+  "shellVis": true,
+  "coreVis": true,
+  "facetJit": 1
+ }
+]
