@@ -26,6 +26,7 @@
  *  本文件所有增强项的亮度均由 u_emissive_intensity(E(t)) 与 u_emissive_color 直接驱动。
  */
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { buildFaceFragments } from './dodecaKit.js';
 import { BH_B_CRIT_RS, buildDeflectionLUT } from './geodesic.js';
 
@@ -124,8 +125,9 @@ const LENS_RING_FRAC = 0.25;                         // 本项目厚度 / 阴影
 const LENS_U_OUT = 1.0 + LENS_RING_FRAC;             // = 1.25 环外缘（u = b/b_c）
 const LUT_UMAX = 6.0;                                // 偏折角查找表的 u 上限（超出用弱场公式）
 
-/* ★ 绘制顺序总表（v5.29）—— 改任何一处 renderOrder 都必须回来对着这张表看：
+/* ★ 绘制顺序总表（v5.30）—— 改任何一处 renderOrder 都必须回来对着这张表看：
  *   18 bhCore          不透明视界球（唯一写深度的遮挡者）
+ *   20 bhGrav          测地线透镜环（★ v5.30：写洞心深度，靠"深度"做真替换，不靠排序）
  *   24 bhPanels        黑洞自身机械面板
  *   29/30/31           基准面 / 体积核心 / 内壳
  *   32                 水晶碎片本体 / 前沿柱面 / 碎片内芯（★ v5.32：三者同层，见下）
@@ -136,10 +138,13 @@ const LUT_UMAX = 6.0;                                // 偏折角查找表的 u 
  *   深度** ⇒ 背面那个面的柱面(33)、内芯(34) 永远画在正面那个面的晶体(32) 之后，
  *   跨面的前后关系被分层压掉。现三者同归 32 ⇒ 12 个面之间恢复按 z 的由远及近排序；
  *   同面内 z 相同 ⇒ 按 id（创建序 本体→内芯→柱面）稳定排序。
- *   36 bhGrav          测地线透镜环（覆盖度 1，纯替换）
- *   38 bhLens          加色光子环 / 挤压亮弧 / 闪光（必须排在透镜之后）
- * 隐形遮挡体之所以是 35：排在它之前的层一个都不会被影响；排在它之后的只有 36 和 38，
- * 而这两层正是"应该被洞前碎片遮住"的部分。 */
+ *   38 bhLens          加色光子环 / 挤压亮弧 / 闪光
+ * 隐形遮挡体之所以是 35：排在它之前的层一个都不会被影响；排在它之后的只有 38，
+ * 而这层正是"应该被洞前碎片遮住"的部分。
+ * ★ bhGrav 为什么是 20（v5.30，别再往回挪）：它**写深度**（洞心深度），
+ *   排在它之后的层按自身深度自动分流 —— 洞后的被剔除、洞前的照常叠加。
+ *   v5.27 排在 20 出现"两张像"，根因是当时 depthWrite:false（洞后内容没被剔除），
+ *   不是 20 这个顺序有问题。 */
 const FRAG_DEPTH_ORDER = 35;
 
 /* ── v5.27：尺度映射（唯一锚点：临界曲线 = 视界球轮廓 ⇒ 视觉尺寸不变）─────────────
@@ -225,8 +230,13 @@ export const FRAG_ROT_RAMP = 0.30;                // 基准时长（秒）；实
  *     回位前一直存在）拽回终点，到位瞬间**速度直接归零**（硬卡停，不震荡）。
  * 过冲幅度按 radialN 分档：面心片大、外缘片小（0=面心 1=外缘）→ 形成
  * "基准台→中心碎片→外围碎片"的内带动外层次。 */
-export const FRAG_ROT_OVER_MAX = 0.13;            // 面心片过冲幅度（rad ≈ 7.4°，最大档）
-export const FRAG_ROT_OVER_MIN = 0.05;            // 外缘片过冲幅度（rad ≈ 2.9°，最小档）
+/* v5.35（用户定标）："齿轮卡位现在实现了，但是因为过冲角度较小所以不是很明显……
+ *   差不多是现在角度的两倍"。原 0.13 / 0.05 rad（7.4° / 2.9°）→ **0.26 / 0.10 rad
+ *   （14.9° / 5.7°）**，正好 2×。
+ * 参照系：一次卡位步进 FRAG_ROT_STEP = 72°，过冲/步进 = 20.7%（原 10.4%）；
+ *   回位段时长不变（FRAG_RET_FRAC 0.38）⇒ 回位角速度也翻倍，"咔"得更明显。 */
+export const FRAG_ROT_OVER_MAX = 0.26;            // 面心片过冲幅度（rad ≈ 14.9°，最大档）
+export const FRAG_ROT_OVER_MIN = 0.10;            // 外缘片过冲幅度（rad ≈ 5.7°，最小档）
 /** v-内容2：回位段时长 = 驱动段时长 × 该系数（短促有力，"咔"地卡住） */
 export const FRAG_ROT_RET_FRAC = 0.38;
 /* v5.13c/d：**缓动速率**（不是时长倍率）—— 走**面内归一化距离** radialN（0=面心 1=外缘）。
@@ -234,8 +244,30 @@ export const FRAG_ROT_RET_FRAC = 0.38;
  * 用户反馈"每个面的所有碎片缓动系数看起来也是一样的"。
  * v5.13d 起改为速率语义：面心片 1.45、外缘片 0.62（近 2.3× 档差），
  * 旋转读起来是一道从面心扫向边缘的波。 */
-export const FRAG_ROT_RATE_MIN = 0.62;            // 外缘片速率（慢）
-export const FRAG_ROT_RATE_MAX = 1.45;            // 面心片速率（快）
+/* v5.35（用户定标）："缓动系数太大了，调小一点，现在看着和瞬移一样"。
+ * 过冲翻倍后**角速度也跟着翻倍**（同样的时长要走更长的角度）⇒ 72° 的面心片在
+ *   0.30 / (1.45 × 1.90) = **0.109s ≈ 6.5 帧**内走完（≈11°/帧）—— 这就是"瞬移"。
+ * 调到 0.80 / 0.34（≈0.55×）后：
+ *   · p=1.00（能量加成 ×1.90）：面心片 0.197s ≈ 12 帧（≈6°/帧）、外缘片 0.464s；
+ *   · p=0.80（无加成）：面心片 0.375s、外缘片 0.882s —— 仍**快于** v5.13c 那版
+ *     （RAMP 0.55s / 速率 ≈1.0 ≈ 0.55s），不会退回用户当年抱怨的"旋转时间太长"。
+ * ★ 两个数的**比值**（2.35×）保持不变 ⇒ "波从面心扫向边缘"的层次感不受影响。
+ * ★ 还有第二个旋钮：若单独觉得**回位那一下**太急，调 FRAG_RET_FRAC（回位时长 /
+ *   驱动时长，现 0.38）；若觉得整体节奏（含基准台跟随）都慢/快，调 FRAG_ROT_RAMP。 */
+export const FRAG_ROT_RATE_MIN = 0.34;            // 外缘片速率（慢）
+export const FRAG_ROT_RATE_MAX = 0.80;            // 面心片速率（快）
+/* v5.35：**驱动段（当前角 → 过冲顶点）缓动曲线的指数** = easeOutPow(EXP)。
+ * "瞬移感"其实是两个来源，上面只解决了第一个：
+ *   ① **时长太短**（角速度）—— 由 FRAG_ROT_RATE_* / FRAG_ROT_RAMP 决定，已放慢 1.8×；
+ *   ② **曲线太前重** —— easeOutCubic(3.0) 在**前 20% 的时间里就走掉 49% 的角度**，
+ *      起步那两帧几乎是从 0 跳到一多半 ⇒ 眼睛读到的就是一个"跳变"，而不是转动。
+ *      降到 2.2 ⇒ 前 20% 只走 37%，起步明显放缓，末端仍平滑收敛（EXP>1 ⇒ 顶点速度=0，
+ *      "冲到过冲顶点时速度恰好为 0"这条设计约束不受影响）。
+ * 想更线性就继续往 1 调（1 = 匀速），想更"啪"就往 3 调。 */
+export const FRAG_ROT_DRIVE_EXP = 2.2;
+/* v5.35：回位段（过冲顶点 → 终点）**没有动** —— 用户只点了"旋转到过冲角度"这一段。
+ * FRAG_RET_FRAC 仍是 0.38（回位时长 = 驱动时长 × 0.38，现 ≈0.075s），保持"咔"的短促。
+ * 若单独觉得回位那一下太急/太拖，只调这一个数。 */
 /** v5.13d：能量超出 0.80 的部分带来的**速率加成**（p=1.0 时 ×(1+0.90)=1.90） */
 export const FRAG_ROT_ENERGY = 0.90;
 /** v5.13c：回归演出的兜底超时（秒）—— 正常靠"全部碎片停稳"结束 */
@@ -409,9 +441,19 @@ export const HIT_QUEUE_EXTRA_MAX = 2;
 export const BASE_FACE_STAGGER = 0.35;
 /* v5.18：基准面擦除环（= 用户说的"渐隐渐显脉冲线"）同步收细 ——
  * 半宽 0.038 → 0.018（显著区从 ≈0.09 半径收到 ≈0.043），增益 0.30 → 0.52 补回峰值。
- * 依据：用户"撞击和渐隐渐显的脉冲线宽度都过于大了，完全不符合精细、科技感的要求"。 */
+ * 依据：用户"撞击和渐隐渐显的脉冲线宽度都过于大了，完全不符合精细、科技感的要求"。
+ *
+ * ★ v5.37：增益 0.52 → **1.20**（半宽不动，仍是"极薄"）。
+ * 用户本轮："基准面渐显渐隐的效果还是一个圆形扩散出来，**根本没有高亮边缘**"。
+ * 拆成两个独立成因分别处理（两支都要，缺一条都还是"看不见的圆"）：
+ *   ① **形状/方向写反了**（真 bug，见 FRAG 里 bSwept 那段）—— 前沿之内变全亮、
+ *      之外变半隐 ⇒ 读成"一个亮盘从面心往外扩"。这一条是主因，已修；
+ *   ② 亮折线**峰值太低**：0.52 × bArc(0.46~1.0) × u_revB.z × (0.40+0.60·lambert)
+ *      ⇒ 正面 lambert≈0.6 时只剩 ~0.20，叠在半透板材上基本读不出"线"。
+ *      对照碎块侧：同一条线用 SHELL_FORM_EDGE = **1.45**（σ 只有 0.005）。
+ *      故把基准面这条线的峰值提到与碎块侧同一量级（1.20，σ 略宽 → 总能量相当）。 */
 export const BASE_RING_SIGMA = 0.011;
-export const BASE_RING_GAIN = 0.52;
+export const BASE_RING_GAIN = 1.20;
 /** 擦除前沿的软边（半径占比）与推进缓动指数 */
 export const BASE_WIPE_SOFT = 0.16;
 export const BASE_WIPE_POW = 1.35;
@@ -479,6 +521,94 @@ export const FRAG_PUSH_MIN = 0.16;
  * 以后要调抬升高度：**改下面的余量系数（0.80，最大 0.99）**，或者先加大碎块外推量下
  * 限 FRAG_PUSH_MIN；不要直接写死一个数，也不要把 u_lift 归零（归零 = 删掉用户的设计）。 */
 export const BASE_LIFT = FRAG_PUSH_MIN / (1.0 + BASE_FLOAT_AMP) * 0.80;  // ≈ 0.097
+
+/* —— v5.35：80 阈值抬升时，碎块除抬升外还要**以面心为原点四散**（用户定标）——
+ * 用户原话："在水晶碎块面抬升（仅指到达80阈值的那一次抬升）的时候，除了抬升之外，
+ *   每个碎片应该以每个面的中心为原点进行扩张（只是碎片远离中心，不是等比放大），
+ *   扩张后再继续之前的上下浮动，这样才能留出缝隙看到缝隙内的基准面和黑洞，
+ *   不过这个碎片四散扩张不能过于大，不然也会影响观感"
+ *
+ * ★ 为什么是"**平移** ∝ 到面心的距离"，而不是"全体平移同一个常数"：
+ *   常数位移只能让**角向**相邻的片分开 —— 径向相邻的两片沿几乎同一个方向移动
+ *   同样的量，它们之间**一条缝都不会开**。位移 ∝ 本片到面心的面内距离 r 时，
+ *   任意两片的间距都由 Δ 变成 (1+k)·Δ ⇒ 缝 = k·Δ，径向/角向一视同仁。
+ * ★ "不是等比放大"说的是**碎片自身尺寸不变**：只动 mesh.position，不动 scale、
+ *   不动几何 ⇒ 片还是那片，是"排布被撑开"，不是"片被撑大"。
+ *   （若改成对**顶点**按同样规则位移，就退化成纯粹的等比放大 —— 片一起变大，
+ *   缝反而开不出来，这正是用户特意排除的那种做法。）
+ *
+ * 取值推导（1u ≈ 112px，面内切半径 apo ≈ 0.491u，典型片径 ≈ 0.19u）：
+ *   · 缝宽 ≈ FRAG_SPREAD × 相邻片质心间距 ≈ 0.18 × 0.19 ≈ **0.034u ≈ 3.8px**
+ *     —— 足以看见缝里的基准面与黑洞，又远小于片自身尺寸（≈18%，不会"散架"）；
+ *   · 最外缘片（面内 r ≈ 0.65u）外移 0.18×0.65 ≈ **0.117u ≈ 13px**，
+ *     相对已外推的壳半径 1.16~1.34u 只加 ~9%，轮廓不会明显变大。
+ *   要调只动 FRAG_SPREAD 一个数（缝宽与外扩量同比例变化）。
+ * ⚠ FRAG_SPREAD_MIN 是给 r→0 的面心片兜底的：纯比例会让最内圈几乎不动、挤在一起。 */
+export const FRAG_SPREAD = 0.18;        // 面内四散系数（× 本片到面心的面内距离 r）
+export const FRAG_SPREAD_MIN = 0.010;   // 面心片的最小四散量（u ≈ 1.1px）
+/* —— v5.36：跌破 80 后碎块**先合拢、再降下**（用户定标）——
+ * 用户原话："碎块应该是在旋转回位后，等待降下的一段时间内合拢，然后再降下去，
+ *   这样才有秩序感"
+ * ★ 为什么需要单独一个量：四散量原本直接挂在 eP（= 抬升进度）上 ⇒ 降下时"边散边降"，
+ *   缝一边收、片一边落，读不出"先收好、再整体落下"的次序。
+ * 现在拆成两段：合拢（_closeT 1→0，本常量控制时长）走完之后 _deployT 才开始降。
+ * ★ 时长为什么取 0.45s：跌破 80 后 _deployT **本来就被冻住**（基准面渐显
+ *   BASE_PULSE_DUR = 0.85s，见 holdDeploy）⇒ 合拢全程塞在这段既有的等待窗口里，
+ *   **总时长一分不增**（这正是用户要的"在等待降下的一段时间内合拢"）。 */
+export const FRAG_SPREAD_CLOSE_DUR = 0.45;
+
+/* ★ v5.33：视差修正 cubemap 的**球面代理半径**（世界单位）—— 缺陷 B 的唯一修复旋钮。
+ * ⚠ 位置说明（TDZ）：本常量依赖上面的 `FRAG_PUSH_MIN`，**必须**声明在它之后 ——
+ *   const 有暂时性死区，写在使用点之后会在模块求值阶段就抛
+ *   "Cannot access 'FRAG_PUSH_MIN' before initialization"（本项目 #5 已踩过同类坑）。
+ * 问题：透镜环采样的是洞心那张 cube probe，探针**只有一个原点（洞心）**；
+ *   而主相机是正交相机，环外缘那条射线的原点在 0.333u 横向偏移处。
+ *   正交投影下两条射线方向相同、原点不同 ⇒ 洞心往前看是"黑洞正后方"，
+ *   相机往前看是"近侧壳面" —— 直接采样 rd2 会让环外缘与环外画面硬拼。
+ * 解法（业界标准 = parallax-corrected cubemap）：以洞心为心、半径 LENS_PROXY_R 作
+ *   球面代理，让偏折后的射线从最近接近点出发与代理球求交得 Q，
+ *   再采样 probe(normalize(Q − 洞心))。α→0 时 Q 正好落回相机射线与代理球的交点
+ *   ⇒ 环外缘输出与环外画面逐点相同，真正无缝。
+ * 取值依据：代理半径 = "最靠近相机的那一层背景"的半径 —— 闭合态主壳在
+ *   R_SHELL_OUT(1.0u)；展开态碎块被推到 [1.16, 1.34]u（FRAG_PUSH_MIN=0.16 起）。
+ *   取**下界** 1.16u（偏大→交点外移→环里更偏外层；偏小→更偏内层，偏差方向可审计）。 */
+export const LENS_PROXY_R = R_SHELL_OUT + FRAG_PUSH_MIN;   // = 1.16u
+
+/** v5.33：探针专用 layer —— 只有挂在这一层的对象会被洞心立方探针看见。
+ *
+ * ★★ 编号不能乱取 —— 已占用的层（改之前必须查 radiance.js / scene.js）：
+ *   layer 0 = 主相机默认层
+ *   layer 1 = `GLOW_LAYER`（辐射/辉光掩膜链）   ← radiance.js:20
+ *   layer 2 = `PARTICLE_LAYER`（粒子/环流）     ← radiance.js:21，且 **主相机也 enable(2)**
+ *   ⇒ 取 **3**。
+ *   （v5.33 首版取了 2 —— 于是代理被主相机当成粒子一起画出来，等于外壳在画面里出现两遍；
+ *     这是"环变黑"之外第二个隐藏事故，靠 scene.js:179 `camera.layers.enable(PARTICLE_LAYER)`
+ *     这行反查出来的。）
+ * 用途：把探针要渲染的对象从 570+ 个（285 碎块 + 285 内芯）压到二十几个
+ *  （12 个面代理 + 12 个内芯代理 + coreMesh + shellInner + 粒子），见下方 LOD 代理的注释。
+ *  资料依据：three.js 官方层机制 + Codrops《Creating Mirrors in React-Three-Fiber and
+ *  Three.js》用 layer 11 让 CubeCamera 只看见指定对象。 */
+export const L5_PROBE_LAYER = 3;
+
+/* ★ v5.33：洞心立方探针的**刷新间隔**（诊断旋钮，默认 = v5.27 原始行为，**不做退化**）。
+ *
+ * 用户实测：`__AETHER_L5__.l5.bhProbe = null` 关掉探针后立刻不卡 ⇒ **瓶颈已确认是探针**。
+ * 单帧成本 = 6 个立方体面 × 每个面一次完整场景遍历 ⇒ 隔帧刷新 = 平均每帧 **3 次全场景渲染**
+ * （叠加主渲染 = 4 倍）。场景里光水晶碎块就是 285 片本体 + 285 片内芯 = **570 draw call**，
+ * 粒子/环流反而只有 1 个 draw call（`InstancedMesh` / `Points`），不是瓶颈。
+ *
+ * ⚠ 用户明确否决"靠降频换性能"：降频 = 环里的画面滞后 = 退化。
+ *   所以默认值保持 2（不变），真正的优化必须落在**减少每次探针渲染的 draw call** 上 ——
+ *   调研到的标准做法有三条（来源见 HANDOFF §5.16）：
+ *     ① three.js `layers` 剔除（CubeCamera 只看见指定 layer）—— Codrops 官方教程做法；
+ *     ② 只对重要物体做反射 / 用 LOD 简化反射体（多篇 three.js 反射优化共识）；
+ *     ③ 降分辨率 —— **不减 draw call**，只省带宽，治不了本症。
+ *   结论：本项目该走 ①+② —— 给探针一份"12 面壳"低模代理（570 → 26 draw call，见 proxyFaces）。
+ *
+ * 本常量当前只作 URL 诊断旋钮：`?lens=0` 彻底关（同时不画透镜环，避免"凭空黑环"）、
+ * `?lens=N` 指定间隔，方便 A/B 量瓶颈。
+ * ⚠ 不能叫 `?probe=` —— 那个已被无头 `FrameProbe` 占用（见 main.js）。 */
+export const LENS_PROBE_EVERY = 2;
 
 /* —— v-内容1：基准面棱台化（位似厚度）——
  * 用户规格："基准面抬升的同时为它带上厚度；不是沿法线推出全等面做柱体，而是以
@@ -1029,10 +1159,48 @@ uniform float u_sweep;               // v-内容1：棱台扫掠包络（0=零�
  * （v5.31：顶点着色器算柱面位置也要用同一组端点，不能各写一份） */
 /* v5.18：0.038 → 0.018（与 JS export BASE_RING_SIGMA 镜像，改一边必须改另一边） */
 #define BASE_RING_SIGMA  0.011  // 基准面细线环的高斯半宽（"极薄"）
-#define BASE_WIPE_SOFT   0.16   // 基准面擦除前沿软边
-#define BASE_WIPE_JIT    0.10   // 擦除前沿的方位不规则扰动
+/* —— v5.36：基准面擦除前沿改走**水晶破碎折线**（与碎块 shellVis 同一套规则）——
+ * 原来只有单频 crystalSegJitter(az,8)×0.10，再叠一条 **0.16 宽的软过渡**
+ * （BASE_WIPE_SOFT）—— 软过渡比抖动幅度还大 ⇒ 不规则被糊平，读出来就是
+ * "一个圆形、没有高亮边缘的扩散渐变"。现在：
+ *   · 两层折线（大尺度断裂 + 小尺度碎屑），振幅**与碎块侧完全相同**（0.055 / 0.020）
+ *     ⇒ 与水晶碎块面出现时是同一条破碎折线语言；
+ *   · 前沿改成**硬边**（±BASE_WIPE_AA 抗锯齿），与碎块 shellVis 同款 ⇒ 破折线的
+ *     尖角与台阶真正看得见，不再是渐变；
+ *   · 亮折线用 crystalBand（极窄高斯）+ 周长补偿，两个方向（擦除/渐显）都画。 */
+/* ⚠ v5.37：核心外壳（u_core_wipe）**也已**改走 crystalLineSDF（见 FRAG 里 cSwept 那段）
+ *   —— 它是全项目最后一条"圆形软边脉冲"，用户规格本来就写着它与基准面同款
+ *      （"与水晶碎块面显现一样的细线环脉冲"），这次一并统一。
+ *   于是 BASE_WIPE_SOFT / BASE_WIPE_JIT **已无使用者**（保留定义只为对照旧参数与
+ *   防历史调试脚本引用；删掉也不会有人报错，但没必要动）。 */
+#define BASE_WIPE_SOFT   0.16   // （v5.37 起无使用者）旧：擦除前沿软边
+#define BASE_WIPE_JIT    0.10   // （v5.37 起无使用者）旧：擦除前沿的方位不规则扰动
+#define BASE_WIPE_JIT1   0.055  // 大尺度断裂振幅（= 碎块侧 SHELL_J_AMP1）
+#define BASE_WIPE_JIT2   0.020  // 小尺度碎屑振幅（= 碎块侧 SHELL_J_AMP2）
+#define BASE_WIPE_AA     0.012  // 前沿抗锯齿半宽（硬边；= 碎块侧 shellVis 的 0.012）
+#define BASE_ARC_COMP    1.15   // 亮折线的周长补偿（= 碎块侧 SHELL_ARC_COMP，防边缘闪一下）
+#define CORE_WIPE_EDGE   0.55   // 核心外壳细线环的峰值增益（旧实现是字面量 0.30）
 #define BASE_WIPE_END    1.35
 #define BASE_WIPE_POW    1.35   // 擦除前沿推进缓动指数
+/* —— v5.36：水晶碎块**不再随能量改变亮度**（用户定标）——
+ * 用户原话："水晶碎块在能量80以下的时候是不是能量越高越透明，我考虑了一下，
+ *   如果变亮/变透明的话，脉冲线就会不明显，实际效果也确实是这样，在接近80的时候，
+ *   脉冲线和背景看起来就是一个发光的蜘蛛网，所以我想在水晶碎块就不要随着能量
+ *   改变透明度.亮度了"
+ * ★ 查证：碎块的 **alpha 本来就不随能量变化**（alpha = 0.42 + 0.30·fres + 0.18·u_deploy，
+ *   只跟视角与展开度有关）。真正随能量走的是**亮度**项：本文件里 pC / eN 两个系数。
+ *   "越透明"是"本体越亮 ⇒ 脉冲线的对比被吃掉"的观感，所以这次冻的就是这两个系数。
+ * ★ 取 p=0.45 的档（偏下）—— 冻在高位等于把"发光蜘蛛网"固化下来，冻在低位才能让
+ *   脉冲线始终有对比。两个数是**算出来的**，不是拍的：
+ *     pC = 0.55 + 0.45·p^0.70          → p=0.45 ⇒ 0.807 ≈ 0.81
+ *     eN = clamp(iCore(p)·1.12 / 3.5)  → iCore(0.45)=1.2+2.8·0.45^1.5=2.045 ⇒ 0.654 ≈ 0.65
+ *   （1.12 = 呼吸叠加 BREATH_GAIN 的上限；3.5 = eN 的归一化分母，见 eN 的定义处）
+ * ★ 只作用于**水晶碎块**（u_core_layer 内芯层 + u_petal>0.5 本体层两个子分支），
+ *   基准面 / 核心外壳 / 装甲一律不动。
+ * ★ ≥80 的演出不受影响：它们由 u_deploy / u_shell_form / u_burst 等**时间量**驱动，
+ *   与 p 无关 —— 冻掉 pC/eN 不会让展开变暗。 */
+#define CRYST_P_FIX      0.81   // 冻结后的 pC（原随 p 在 0.55~1.00 之间）
+#define CRYST_E_FIX      0.65   // 冻结后的 eN（原随发光功率在 ~0.34~1.00 之间）
 #define BASE_HIDE_LEVEL  0.50   // 擦除扫过后基准面保留的比例（"半隐"）
 #define BASE_FACE_STAGGER 0.35  // 12 面起跑错相占用的行程比例
 /* v5.17：核心透屏 —— 闭合态把热封在壳内（防"面心白团"），展开态核心暴露 → 炽亮。
@@ -1344,6 +1512,11 @@ void main() {
      * fbm 云团 + 面内径向衰减 + 慢呼吸；能量越高越亮。加色层不吃凹凸/裂缝细节，
      * 那些是本体层的职责 —— 两层叠加才有"晶体里透出光"的纵深。 */
     if (u_core_layer > 0.5) {
+      /* v5.36：把外层那两个**随能量走**的系数在本分支内**遮蔽成常量**（GLSL 允许内层
+       *   作用域同名遮蔽）⇒ 本层（碎块内芯）的亮度不再随能量变化。取值推导见
+       *   CRYST_P_FIX / CRYST_E_FIX 的定义处。只影响水晶碎块，基准面/核心不受影响。 */
+      const float pC = CRYST_P_FIX;
+      const float eN = CRYST_E_FIX;
       /* ★★ v5.19：整个水晶壳体的白雾**已删除** ★★
        * 用户原话："白雾和整个系统都很割裂，这个构造体是由精密粒子和水晶面组成的，
        *   白雾会带来混乱、雾蒙蒙的感觉，请删掉整个水晶壳体的白雾，换一种水晶发光效果。"
@@ -1423,6 +1596,11 @@ void main() {
      *     厚处更深更饱和，这是"有体积的晶体"和"贴图薄片"的分水岭。
      */
     if (u_petal > 0.5) {
+      /* v5.36：与内芯层同理 —— 把随能量走的 pC / eN 在本分支内遮蔽成常量，
+       * 水晶碎块本体的亮度从此不随能量变化（推导见 CRYST_P_FIX / CRYST_E_FIX）。
+       * 只遮蔽这一个 if 块：下面的基准面分支（u_petal=0.35）不受影响。 */
+      const float pC = CRYST_P_FIX;
+      const float eN = CRYST_E_FIX;
       vec3 N = normalize(vNormalWorld);
       if (!gl_FrontFacing) N = -N;
       vec3 Vd = normalize(vViewDir);
@@ -2017,26 +2195,48 @@ void main() {
      * 用户最新反馈的时序错误："碎片面都要升起来了，基准面才脉冲渐隐"。
      * 恢复原始时序：演出起跑即擦除（u_revB 0→1），0.42s 擦除完毕 → 全亮 →
      * 0.72s 后基准面抬升/展开 —— 擦除先于升起完成。 */
-    float bJit = BASE_WIPE_JIT * crystalSegJitter(azb, 8.0, faceSeed * 3.0 + 1.9);
     float bUraw = clamp((u_revB.x - faceSeed * BASE_FACE_STAGGER)
                      / (1.0 - BASE_FACE_STAGGER), 0.0, 1.0);
     float bU = bUraw;
     float bFront = (1.0 - pow(1.0 - bU, BASE_WIPE_POW)) * BASE_WIPE_END;
-    // bBehind：0 = 已被前沿扫过；1 = 前沿尚未扫到
-    float bBehind = smoothstep(bFront - 0.05, bFront + BASE_WIPE_SOFT + bJit, rb);
-    // dir=+1 擦除（扫过→半隐，上升 80）；dir=−1 渐显（扫过→恢复，跌破 80）
-    float bTarget = (u_revB.y > 0.0) ? bBehind : (1.0 - bBehind);
+    /* v5.36：前沿改走**水晶破碎折线**（crystalLineSDF，与碎块 shellVis 完全同一套规则）。
+     * 旧实现只有单频 crystalSegJitter(az,8)×0.10，再叠一条 **0.16 宽的软过渡**
+     * —— 软过渡比抖动幅度还大，不规则被糊平 ⇒ 读出来就是"一个圆形、没有高亮边缘的
+     * 扩散渐变"，正是用户本轮的反馈。现在三层都对齐碎块侧：
+     *   ① 两层折线（大尺度断裂 + 小尺度碎屑），振幅与碎块侧**完全相同**；
+     *   ② 前沿判定改成**硬边**（±BASE_WIPE_AA），与碎块 shellVis 同款 ⇒ 尖角看得见；
+     *   ③ 亮折线用 crystalBand（极窄高斯），不再以 bFront 为心、不再被软边糊掉。 */
+    float bSd = crystalLineSDF(rb, azb, bFront, faceSeed * 7.31 + 2.7,
+                               BASE_WIPE_JIT1, BASE_WIPE_JIT2);
+    /* ★★ v5.37 真 bug 修复（本轮"还是一个圆形扩散出来"的**根因**）★★
+     *   bSwept = 1 ⇔ bSd < 0 ⇔ rb < bFront + j ⇔ **已被前沿扫过**。
+     *   v5.36 把软边换硬边时，smoothstep 的两个 edge 写成了**降序**（AA → −AA），
+     *   返回值语义随之从"未扫过"翻成"已扫过"，但下面那行方向判据**没跟着改**
+     *   ⇒ 擦除方向整个判反：**前沿之内 = 全亮，前沿之外 = 半隐**。
+     *   视觉上就是"一个通亮的大圆盘从面心往外扩"—— 正是用户连着两轮说的
+     *   "一个圆形、没有高亮边缘的扩散渐变 / 还是一个圆形扩散出来"。
+     *   修法：按语义命名（bSwept），并把 bTarget 写成"**未扫过 = 照旧**"（擦除）
+     *   / "**已扫过 = 恢复**"（渐显）—— 与 v5.35 及更早的旧实现语义完全一致。 */
+    float bSwept = smoothstep(BASE_WIPE_AA, -BASE_WIPE_AA, bSd);
+    // dir=+1 擦除（上升跨 80）：未扫过 → 1（照旧）；已扫过 → 0（半隐）
+    // dir=−1 渐显（跌破 80）：已扫过 → 1（恢复）；未扫过 → 0（维持半隐）
+    float bTarget = (u_revB.y > 0.0) ? (1.0 - bSwept) : bSwept;
     float bVis = mix(BASE_HIDE_LEVEL, 1.0, bTarget);
     // 预乘混合：c 与 alpha 同乘，才能真正"半隐"（只降 alpha → 背后亮层透出来反而更亮）
     c *= bVis;
     alpha *= bVis;
-    /* 极薄细线环：冷青白（从暖色主视觉里跳出来，又不跟核心的橙抢戏）、σ=0.038、
-     * 低增益（BASE_RING_GAIN=0.30，远低于碎块侧曾用过的 0.42/0.62/0.85）。
-     * 每面自己的前沿快出界时环自行熄灭 → 不会在外缘留一圈常亮头。 */
-    float bBand = exp(-pow((rb - bFront) / BASE_RING_SIGMA, 2.0))
+    /* 极薄细线环：冷青白（从暖色主视觉里跳出来，又不跟核心的橙抢戏）。
+     * v5.36：与碎块顶面亮折线同构造 —— crystalBand（极窄高斯，σ=BASE_RING_SIGMA）+ 峰值封顶，
+     * 并加**周长补偿**（BASE_ARC_COMP，与碎块侧 SHELL_ARC_COMP 同源）：折线的屏幕弧长
+     * ∝ 前沿半径，不补偿的话"前沿抵达外缘"那一刻总光通量冲到峰值 → 闪一下。
+     * 每面自己的前沿快出界时环自行熄灭 → 不会在外缘留一圈常亮头。
+     * v5.37：峰值由 u_revBGain 提到 1.20（见 BASE_RING_GAIN 注释②）；lambert 下限从
+     * 0.40 提到 0.70 —— 基准面在棱角处 lambert 很低，旧下限会把线直接吞掉。 */
+    float bArc = 1.0 / (1.0 + BASE_ARC_COMP * clamp(bFront, 0.0, 1.0));
+    float bBand = min(crystalBand(bSd, BASE_RING_SIGMA), 1.0) * bArc
        * u_revB.z * (1.0 - smoothstep(0.80, 1.0, bU));
     c += mix(vec3(0.62, 0.86, 1.0), u_emissive_color, 0.25) * bBand * u_revBGain
-       * (0.40 + 0.60 * lambert);
+       * (0.70 + 0.30 * lambert);
 
     // v-new：内壳展开淡出 —— premultiplied(OneFactor) 混合下，alpha 缩小不会门控颜色，
     // 必须显式用 u_shell_fade 乘掉 c 与 alpha，基准面才会在 _deploy>0.55 后真正不可见。
@@ -2176,21 +2376,29 @@ void main() {
     float plateVar = 0.88 + 0.24 * hash11(_pidC * 1.37 + 3.1);
     float lambertC = max(dot(_nC, normalize(KEY_LIGHT_DIR)), 0.0);
     float rimC = pow(1.0 - facing, 2.0);
-    // 细线环擦除前沿（复制 u_revB 机制）：面级错相 → 12 面不同时起跑
+    // 细线环擦除前沿（与基准面 u_revB 完全同构）：面级错相 → 12 面不同时起跑
     float csSeed = hash13(floor(normalize(vObjNrm) * 16.0 + 0.5));
     float crb = clamp(length(fuv) / max(u_face_apothem, 1e-6), 0.0, 1.4);
     float cazb = atan(fuv.y, fuv.x);
-    float cJit = BASE_WIPE_JIT * crystalSegJitter(cazb, 8.0, csSeed * 3.0 + 1.9);
     float cU = clamp((u_core_wipe.x - csSeed * BASE_FACE_STAGGER)
                      / (1.0 - BASE_FACE_STAGGER), 0.0, 1.0);
     float cFront = (1.0 - pow(1.0 - cU, BASE_WIPE_POW)) * BASE_WIPE_END;
-    // cBehind：0 = 已被前沿扫过；1 = 前沿尚未扫到
-    float cBehind = smoothstep(cFront - 0.05, cFront + BASE_WIPE_SOFT + cJit, crb);
+    /* ★ v5.37：改走与基准面**完全同一套**水晶破碎折线规则。
+     *   旧实现是单频 jitter(az,8)×0.10 + ±0.05/0.16 的**软过渡**，而且那条亮线是
+     *   以 cFront 为心的**正圆**（exp(−((crb−cFront)/σ)²)）—— 所以无论怎么调参数，
+     *   都只能是"一个圆形扩散、没有高亮边缘"。用户规格本来就写着核心外壳与
+     *   基准面同款（"与水晶碎块面显现一样的细线环脉冲"），这次一并统一，
+     *   于是全项目不再存在任何"正圆软边"脉冲。 */
+    float cSd = crystalLineSDF(crb, cazb, cFront, csSeed * 7.31 + 2.7,
+                               BASE_WIPE_JIT1, BASE_WIPE_JIT2);
+    // cSwept = 1 = 已被前沿扫过（硬边 ±BASE_WIPE_AA，与碎块 shellVis 同款）
+    float cSwept = smoothstep(BASE_WIPE_AA, -BASE_WIPE_AA, cSd);
     // 方向>0 = 渐隐（扫过 → 全透明，脉冲线内隐藏）；方向<0 = 渐显（扫过 → 恢复 cA）
-    float cTarget = (u_core_wipe.y > 0.0) ? cBehind : (1.0 - cBehind);
+    float cTarget = (u_core_wipe.y > 0.0) ? (1.0 - cSwept) : cSwept;
     cA *= mix(0.0, 1.0, cTarget);
-    // 极薄细线环（渐隐脉冲线本身）：冷青白，σ 同基准面
-    float cBand = exp(-pow((crb - cFront) / BASE_RING_SIGMA, 2.0))
+    // 极薄细线环（渐隐脉冲线本身）：冷青白，σ 同基准面；同样带周长补偿
+    float cArc = 1.0 / (1.0 + BASE_ARC_COMP * clamp(cFront, 0.0, 1.0));
+    float cBand = min(crystalBand(cSd, BASE_RING_SIGMA), 1.0) * cArc
        * u_core_wipe.z * (1.0 - smoothstep(0.80, 1.0, cU));
     // 外观 = 缩小版基准面板材：冷钢蓝板体 + 能量色渗光 + 五边形勾边 + fresnel rim + 细线环
     vec3 cBody = mix(vec3(0.012, 0.028, 0.048), vec3(0.085, 0.135, 0.205), lambertC) * plateVar;
@@ -2199,7 +2407,8 @@ void main() {
     cCore += u_emissive_color * pxLine(sdPentagon(fuv, u_face_apothem * 0.985), 2.3)
           * (0.45 + 0.55 * pC) * (0.55 + 0.45 * lambertC) * 0.9;
     cCore += u_emissive_color * rimC * 0.28 * (0.20 + 0.50 * pC);
-    cCore += mix(vec3(0.62, 0.86, 1.0), u_emissive_color, 0.25) * cBand * 0.30 * (0.40 + 0.60 * lambertC);
+    cCore += mix(vec3(0.62, 0.86, 1.0), u_emissive_color, 0.25) * cBand * CORE_WIPE_EDGE
+          * (0.60 + 0.40 * lambertC);
     // 亮度预算：同板材分支防炸白
     float _cMax = max(max(cCore.r, cCore.g), cCore.b);
     if (_cMax > 1.25) cCore *= 1.25 / _cMax;
@@ -2758,6 +2967,7 @@ const BH_GRAV_FRAG = /* glsl */ `
   uniform vec3  u_gv_fwd;        // 视线方向（世界；正交相机 ⇒ 全场同一条）
   uniform float u_gv_rs;         // 有效史瓦西半径（世界单位）
   uniform float u_gv_uout;       // 环外缘（窗函数在此归零）
+  uniform float u_gv_proxy;      // v5.33：视差修正的球面代理半径（世界单位）
   varying vec3 vW;
 
   const float B_CRIT  = 2.5980762;   // 3√3/2
@@ -2786,7 +2996,21 @@ const BH_GRAV_FRAG = /* glsl */ `
     vec3 bhDir = -off / max(b, 1e-6);
     vec3 rd = normalize(u_gv_fwd);
     vec3 rd2 = rd * cos(a) + bhDir * sin(a);
-    vec3 col = textureCube(t_probe, rd2).rgb * dim;
+    /* ⑤ 视差修正（v5.33）：探针只有一个原点（洞心），而相机射线的原点在 0.333u
+     *    横向偏移处 —— 正交投影下两条射线方向相同、原点不同，看到的根本不是
+     *    同一块壳面（洞心往前看 = 黑洞正后方；相机往前看 = 近侧壳面）。
+     *    直接采样 rd2 就是缺陷 B：环外缘和环外画面硬拼。
+     *    业界标准解法 = 视差修正 cubemap：以洞心为心、半径 u_gv_proxy 作球面代理，
+     *    让偏折后的射线从**最近接近点**出发（薄透镜近似：偏折发生在环平面上，
+     *    而本环过洞心且垂直视线 ⇒ 最近接近点就是本片元）与代理球求交得 Q，
+     *    再采样 probe(normalize(Q − 洞心))。
+     *    |off| < u_gv_proxy 恒成立 ⇒ 判别式恒正、交点必落在射线正方向上。
+     *    α→0 时 rd2 = rd ⇒ Q 正好等于相机射线与代理球的交点 ⇒ 环外缘的输出
+     *    与环外画面逐点相同，真正无缝。 */
+    float projB = dot(off, rd2);
+    float projC = dot(off, off) - u_gv_proxy * u_gv_proxy;
+    float tHit = -projB + sqrt(max(projB * projB - projC, 0.0));
+    vec3 col = textureCube(t_probe, normalize(off + rd2 * tHit)).rgb * dim;
     /* ⑤ **覆盖度恒为 1** —— 一个像素只能有一张像。
      *    若用 alpha<1 把"弯曲像"和"直影像"叠在一起，等于让同一个光子既走直线又被弯折：
      *    cout = mix(原像, 弯折像, α混) 在物理上不成立（用户原话："能同时看到弯折后的
@@ -3136,7 +3360,8 @@ export class L5Core {
         u_gv_center: { value: new THREE.Vector3() },
         u_gv_fwd: { value: new THREE.Vector3(0, 0, -1) },
         u_gv_rs: { value: 0.10 },
-        u_gv_uout: { value: LENS_U_OUT }
+        u_gv_uout: { value: LENS_U_OUT },
+        u_gv_proxy: { value: LENS_PROXY_R }
       },
       transparent: true,
       /* v5.30：★ 环必须**写深度**（写的是洞心深度）。
@@ -3190,8 +3415,14 @@ export class L5Core {
      * 分辨率 256 / 隔帧更新 = 可调性能旋钮；只在透镜盘可见时才跑。 */
     this.bhProbeRT = new THREE.WebGLCubeRenderTarget(256, { type: THREE.HalfFloatType });
     this.bhProbe = new THREE.CubeCamera(0.02, 200, this.bhProbeRT);
+    /* v5.33：默认仍是 enableAll()（= v5.32 之前的行为）。**只有在 LOD 代理确实建成之后**
+     * 才切到 `layers.set(L5_PROBE_LAYER)` —— 顺序反过来（先锁层、后建代理）时，只要代理
+     * 构建抛异常/返回 null，探针就会看到一个空层 ⇒ 透镜环一片死黑（v5.33 首版就是这么黑的）。
+     * 切层后它只渲染被显式挂到这一层的对象（12 个面代理 / 内芯代理 / coreMesh / shellInner / 粒子），
+     * 285 片碎块本体、285 个内芯、285 根柱面、285 个隐形遮挡体一概不进探针。
+     * ★ 六面子相机的 layers 与 CubeCamera 本身是**同一份对象引用**
+     *   （r0.186 源码 `cameraPX.layers = this.layers`）⇒ 设一次即可。 */
     this.bhProbe.layers.enableAll();
-    this.bhProbe.children.forEach((c) => c.layers.enableAll());   // 六面子相机各自有 layers
     this.bhGravMaterial.uniforms.t_probe.value = this.bhProbeRT.texture;
 
     /* ---------- v-内容5：高能数据立方体粒子 ---------- */
@@ -3328,6 +3559,12 @@ export class L5Core {
       blending: THREE.AdditiveBlending
     });
     this.fragTwins = [];     // v5.29：隐形遮挡体（见下）
+    /* v5.33 性能旋钮（默认值 = 实测定位卡顿后调优过的值，见 updateProbe 注释）：
+     *   probe  整数：0 = 彻底不更新探针（同时不画透镜环）；N≥1 = 每 N 帧刷一次
+     *   twins  bool：隐形遮挡体（洞前碎片挡住光子环）
+     *   bands  bool：前沿柱面
+     * 只用于定位/兜底，由 main.js 的 ?lens= 下发（⚠ 不能叫 ?probe=，已被无头 FrameProbe 占用）。 */
+    this.perf = { probe: LENS_PROBE_EVERY, twins: true, bands: true };
     this.fragments = buildFaceFragments(R_SHELL_OUT).map((f) => {
       // Phase1c：每片克隆材质，持有独立的 u_impact / u_cool（共享 uniform 经 fork 引用同步）。
       // v-fix（关键回归修复）：克隆基准必须是**裂片预设 shellUniforms**（u_petal=1 → 晶体分支），
@@ -3427,11 +3664,170 @@ export class L5Core {
       band.visible = false;
       mesh.add(band);
       this.group.add(mesh);
+      /* v5.38：**本片在面局部坐标里的包围盒** —— 只服务一件事：按屏幕重叠剔除
+       * 隐形遮挡体（见 `_updateFragTwins`）。
+       * 为什么不能直接用 `geo.boundingSphere`：那个球的球心是几何自身的包围盒中心，
+       * 而几何原点在**面心** —— 球心到原点的距离（最多 ≈0.79u）会被算成半径的一部分，
+       * 于是"本片在哪"完全丢失（285 片的球几乎一样大）⇒ 剔除判据失效。
+       * 这里烘的是 8 个角点（面局部坐标，原点=面心），逐帧用 mesh 的世界矩阵变换后
+       * 取屏幕平面的 min/max，才是真正"本片投影到哪"的紧包围盒。一次性开销
+       * （285 × ~1727 顶点 ≈ 49 万次比较），只在构造时跑一次。 */
+      const _bb = (() => {
+        const pa = f.geo.getAttribute('position');
+        let x0 = Infinity, y0 = Infinity, z0 = Infinity;
+        let x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+        /* 直接读底层 Float32Array（285 × 1727 ≈ 49 万点；用 getX/getY/getZ 访问器会多 150 万次
+         * 函数调用，构造期肉眼可见地变慢）。若不是普通 BufferAttribute 则退回访问器。 */
+        const raw = !pa.isInterleavedBufferAttribute && pa.array ? pa.array : null;
+        const n = pa.count;
+        for (let i = 0; i < n; i++) {
+          const x = raw ? raw[i * 3] : pa.getX(i);
+          const y = raw ? raw[i * 3 + 1] : pa.getY(i);
+          const z = raw ? raw[i * 3 + 2] : pa.getZ(i);
+          if (x < x0) x0 = x; if (x > x1) x1 = x;
+          if (y < y0) y0 = y; if (y > y1) y1 = y;
+          if (z < z0) z0 = z; if (z > z1) z1 = z;
+        }
+        const c = [];
+        for (let k = 0; k < 8; k++) {
+          c.push(new THREE.Vector3(
+            (k & 1) ? x1 : x0, (k & 2) ? y1 : y0, (k & 4) ? z1 : z0));
+        }
+        return c;
+      })();
       /* ★ 字段名必须是 bandMesh：**f.band 已经是"环带序号 0..3"**（v5.23 起
        * `f.band === 3` 用来挑"每个面最外一圈碎片"给粒子吸附）。若这里也叫 band，
        * 展开对象会把它覆盖成 mesh → f.band === 3 永远为假 → 吸附环整条失效。 */
-      return { ...f, mesh, core, bandMesh: band, mat: fMat, stored: 0, impactW: 0 };
+      return {
+        ...f, mesh, core, bandMesh: band, mat: fMat, stored: 0, impactW: 0,
+        bbCorners: _bb
+      };
     });
+
+    /* ---------- v5.33：探针 LOD 代理（每面 1 个合并网格：570 draw call → 26） ----------
+     * 用户实测"关掉探针立刻不卡" ⇒ 瓶颈确认是探针；用户明确否决降频/降分辨率（退化），
+     * 所以只能减**每次探针渲染的 draw call**。调研到的标准做法（见 HANDOFF §5.16）：
+     *   ① three.js `layers` 剔除 —— Codrops 官方教程用 layer 11 让 CubeCamera 只看见指定对象；
+     *   ② 对反射体用 LOD / "只对重要物体做反射"（多篇 three.js 反射优化共识）。
+     *
+     * ★ 为什么是**按面合并 12 份**而不是全部合并成 1 份：
+     *   ① 片几何原点在**面心**、片世界位置 = 面心 + 面法线×外推量 ⇒ 同一个面的 24 片可以
+     *      用**一次刚体平移**（mesh.position = 面心 + 法线×本面平均外推）精确复现，
+     *      而全部合并成一份就只能整体缩放，会把切向尺寸也放大 —— 那是错的形变；
+     *   ② VERT/FRAG 里有 **面级 uniform**（u_front_seed / u_band_phi0 / u_band_e1,e2,n /
+     *      u_band_face …），一份网格只能带一组值 ⇒ 另外 11 个面的水晶折线/柱面参数全错。
+     *      按面合并后每组代理直接用本面代表片的那份 uniform **对象引用**，逐帧自动同步。
+     *   视觉代价可论证：环最宽 7.5px、总面积约 1583 px²，探针却给了 6×256² = 393216 texel
+     *   （248 倍冗余）⇒ 环对空间细节的需求极低，逐片独立外推（pushAmt 0.16~0.35）与
+     *   上下浮动（±0.034u）的差别不可辨；保留的是"整片壳在哪、什么颜色、什么亮度"。
+     *
+     * ⚠ `mergeGeometries` 在 attribute 不兼容时是 **return null**（不是 throw），
+     *   try/catch 抓不到 —— 若不检查返回值就 `new Mesh(null, mat)`，物体会静默不渲染，
+     *   探针六面全空 ⇒ 透镜环一片死黑（v5.33 首版就是这么黑的）。必须显式判空。
+     *   任何一步失败都必须退回 enableAll()：卡，但画面正确。 */
+    this.proxyFaces = [];          // [{ faceIdx, mesh, core, center, normal }]
+    /* 每帧统计用（避免每帧分配）：本面外推量之和 / 片数 / u_cool 之和 */
+    this._proxyPush = new Float32Array(12);
+    this._proxyCnt = new Int32Array(this._proxyPush.length);
+    this._proxyCool = new Float32Array(this._proxyPush.length);
+    {
+      const byFace = new Map();
+      for (const f of this.fragments) {
+        let arr = byFace.get(f.faceIdx);
+        if (!arr) byFace.set(f.faceIdx, (arr = []));
+        arr.push(f);
+      }
+      let built = 0;
+      for (const [faceIdx, arr] of byFace) {
+        /* 不克隆、不 translate：f.geo 的顶点本来就是**面局部坐标**，
+         * 合并后整块仍是"以面心为原点" ⇒ 只需每帧写 mesh.position。 */
+        const merged = mergeGeometries(arr.map((f) => f.geo), false);
+        if (!merged) { console.error('[L5] 面 ' + faceIdx + ' 的探针代理合并失败'); break; }
+        const rep = arr[0];
+        /* 材质：以本面代表片的 uniforms 为基底 —— 面级 uniform（u_rev / u_front_seed /
+         * u_band_* / u_shell_form / u_lift …）都是**同一份对象引用** ⇒ 逐帧自动同步，
+         * 代理与真实碎片永远同色同亮。只有三样是"逐片随机事件"，必须换成中性值：
+         *   u_impact（受击柔光）/ u_cool（储能冷色，改由每帧写本面均值）/ u_hitT（撞击行程，
+         *   -1 = 空闲 —— 若留默认 0 会在整面上画出代表片的撞击脉冲环）。 */
+        const pMat = this._shellMaterial(Object.assign({}, rep.mat.uniforms, {
+          u_impact: { value: new THREE.Vector4(0, 0, 0, 0) },
+          u_cool: { value: 0.0 },
+          u_hitT: { value: -1.0 }
+        }));
+        const pMesh = new THREE.Mesh(merged, pMat);
+        pMesh.name = 'L5_ProbeProxy_Face' + faceIdx;
+        pMesh.renderOrder = 32;                 // 与真实碎片同层（深度排序规则见 v5.32）
+        /* ★ v5.37：打开视锥剔除（v5.33 起曾写死 frustumCulled = false）。
+         * ★★ v5.38 更正认知（别再把时间花在这里）：**这条剔除在本项目基本不起作用**，
+         *   留着它只是为了在极端位移下兜住正确性（宁可不算、不可错剔）。推导：
+         *     · 合并几何仍是"以面心为原点"的面局部坐标 ⇒ computeBoundingSphere() 给出
+         *       的球（球心≈面心、半径≈五边形外接半径 ≈0.85u）× 1.45 ≈ 1.23u；
+         *     · 面心到壳心（探针相机所在处）只有 R_SHELL_OUT×0.7947 ≈ 0.82u
+         *       ⇒ **包围球把探针相机自己包在里面**（|中心到相机| ≈ 0.82 < 1.23）；
+         *     · 90° 的立方体面视锥 + near 0.1 ⇒ 法线背向的那几个面，其球心到近平面的
+         *       距离 ≈ 0.98u，仍 < 1.23 ⇒ 判为"与视锥相交"，不剔。
+         *   要真剔除得把膨胀压到 ≤1.0（即几乎不膨胀）——风险方向反了（可能剔掉本该出现的
+         *   面 ⇒ 透镜里少一块），收益也只有每次刷新 ~17% 的顶点 ⇒ 不值得，刻意保持保守。
+         *   ⚠ 结论：探针的顶点量**在数学上剔不动**，它那 2/3 的顶点预算只能靠"代理减面"
+         *     解决（那是设计取舍，不是 bug）。 */
+        merged.computeBoundingSphere();
+        if (merged.boundingSphere && merged.boundingSphere.radius > 1e-4) {
+          merged.boundingSphere.radius *= 1.45;
+          pMesh.frustumCulled = true;
+        } else {
+          merged.boundingSphere = null;          // 兜底：算不出来就别剔，保持旧行为（多画不错画）
+          pMesh.frustumCulled = false;
+        }
+        /* 内芯：与真实 core 同款（同一份几何、scale 0.86、共用 fragCoreMaterial）。
+         * 真实 core 是碎片 mesh 的子对象 ⇒ 它跟着碎片走；代理里做成独立对象，
+         * 每帧把位置抄成同一个值即可。 */
+        const pCore = new THREE.Mesh(merged, this.fragCoreMaterial);
+        pCore.name = 'L5_ProbeProxy_FaceCore' + faceIdx;
+        pCore.scale.setScalar(0.86);
+        pCore.renderOrder = 32;
+        pCore.frustumCulled = pMesh.frustumCulled;   // 与本体同一判据（几何同一个）
+        for (const m of [pMesh, pCore]) {
+          m.layers.set(L5_PROBE_LAYER);    // 只在探针 layer ⇒ 主相机（layer 0）永远看不见
+          /* ★★ 必须打 noGlowMask：scene.js 建 L5Stage 时会 `l5Group.traverse(o =>
+           * { if (!o.userData.noGlowMask) o.layers.enable(GLOW_LAYER) })`，而**主相机也开着
+           * GLOW_LAYER** ⇒ 不打这个标记，代理就会被登记进辉光层、被主相机画出来 ——
+           * 画面上等于"外壳出现两遍"（一层真的、一层代理）。 */
+          m.userData.noGlowMask = true;
+          this.group.add(m);
+        }
+        this.proxyFaces.push({
+          faceIdx, mesh: pMesh, core: pCore,
+          center: rep.faceCenter.clone(), normal: rep.normal.clone()
+        });
+        built++;
+      }
+      if (built !== byFace.size) {
+        /* 有面没建成 ⇒ 不能把探针锁死在残缺的 layer。整段回退：
+         * 代理全部撤掉，探针恢复"渲染全场景"（v5.32 之前的行为：卡，但画面正确）。 */
+        console.error('[L5] 探针 LOD 代理构建不全（' + built + '/' + byFace.size
+          + '），探针退回全场景渲染（会卡但不会黑）');
+        for (const p of this.proxyFaces) {
+          this.group.remove(p.mesh); this.group.remove(p.core);
+          p.mesh.material.dispose(); p.mesh.geometry.dispose(); p.core.geometry.dispose();
+        }
+        this.proxyFaces = [];
+        this.bhProbe.layers.enableAll();
+      } else {
+        /* 走到这里代理才是完整的 ⇒ 此刻才把探针切成"只看代理层"。
+         * 除代理外还要让探针看见：核心本体、内壳（基准面）—— 它们是从洞心往外看
+         * 最先碰到的东西，是"黑洞身后的景象"的组成部分；能量环粒子流（InstancedMesh，
+         * 各 1 个 draw call）也一起带上，让环里有光点。 */
+        this.coreMesh.layers.enable(L5_PROBE_LAYER);
+        this.shellInner.layers.enable(L5_PROBE_LAYER);
+        /* ⚠ `layers` 不会被子对象继承：three.js 的 projectObject 是**无条件递归** children，
+         * 逐个子对象自己做 layers.test ⇒ 给 Group 开层毫无作用，必须逐个 Mesh 开。 */
+        if (this.particleGroup) {
+          this.particleGroup.traverse((o) => o.layers.enable(L5_PROBE_LAYER));
+        }
+        /* ringGroups / ambientPoints / cage 建在这段**之后** ⇒ 留到构造函数末尾再补。 */
+        this.bhProbe.layers.set(L5_PROBE_LAYER);
+      }
+    }
 
     /* Phase1e：外缘环吸附目标 —— 粒子只撞"每个面边缘的那一环碎片"（轮廓线把面分成的环）。
      * ① 预计算每片在面局部坐标里的质心：几何原点在面心，mesh.position 只是面心位置，
@@ -3465,6 +3861,14 @@ export class L5Core {
        *   顶点平均 = 片质心（碎片是薄凸板，顶点平均足够），原点与几何一致 = 面心。 */
       for (let k = 0; k < pa.count; k++) { c.x += pa.getX(k); c.y += pa.getY(k); c.z += pa.getZ(k); }
       f.centroid = c.multiplyScalar(1 / Math.max(1, pa.count));   // 片局部坐标（原点 = 面心）
+      /* v5.35：面内四散的**方向 + 比例基准** —— 把质心投影到面内（去掉法线分量），
+       * 得到"本片到面心的面内距离" spreadR 与单位方向 spreadDir。
+       * ⚠ 必须投影：质心带厚度方向分量（CRYST_Z0..Z1），不投影的话外散方向会偏出面外。 */
+      {
+        const ip = f.centroid.clone().addScaledVector(f.normal, -f.centroid.dot(f.normal));
+        f.spreadR = ip.length();
+        f.spreadDir = f.spreadR > 1e-6 ? ip.divideScalar(f.spreadR) : new THREE.Vector3();
+      }
       f.faceSeed = (fi * 0.6180339887) % 1.0;                     // 每片确定性相位种子（半隐扩散用）
       /* v5.17（撞击脉冲重构）：预计算**片包围半径** = 质心到最远顶点的距离。
        * 用途：粒子命中时以"命中点到最远顶点"为脉冲行程 → 走到 1 时恰好覆盖满整片
@@ -3735,6 +4139,20 @@ export class L5Core {
     this._basePulseBusy = false;
     this._revImpGap = 0;       // 撞击可见环的全局限流计时
     this._revStats = { cycling: 0, impacting: 0, frontAvg: 0, hiddenFrac: 0 };
+
+    /* v5.33：构造函数**末尾**再补一次探针层登记 —— ringGroups / ambientPoints / cage /
+     * ambientTrails 都是在 LOD 代理那段之后才建的，当时还不存在。只有代理真的建成
+     * （proxyFaces 非空、探针已切层）才把它们加进来，否则探针仍在 enableAll，加不加一样。
+     * ★ 原则：**尽量还原探针原本（enableAll）看得到的内容**，这次改动只减 draw call、
+     * 不改画面构成 —— 凡是当时能进探针的、又不是"285 份逐片网格"的东西都补回来。 */
+    if (this.proxyFaces && this.proxyFaces.length && this.bhProbe) {
+      for (const rg of this.ringGroups) if (rg.flow) rg.flow.layers.enable(L5_PROBE_LAYER);
+      for (const o of [this.ambientPoints, this.ambientTrails, this.cage, this.cageGhost]) {
+        if (o) o.layers.enable(L5_PROBE_LAYER);
+      }
+      /* 辉光板（fieldGlow）**故意不补**：它是面向主相机的 billboard，进立方探针后会朝
+       * 六个面各自转一次，在环里拼成一块没有意义的亮斑。它本来就不该进探针。 */
+    }
   }
 
   /* ==================== Phase1b：环境能量粒子系统 ==================== */
@@ -4161,18 +4579,37 @@ export class L5Core {
     this._shellT = THREE.MathUtils.clamp(
       this._shellT + (wantShell ? dt : -dt) / SHELL_FORM_DUR, 0, 1);
     this.uniforms.u_shell_form.value = this._shellT;
+    /* v5.38：**壳还没成形就根本不发这 570 个 draw call**。
+     * 为什么这是逐像素等价的（不是"关掉效果"）：
+     *   · 晶体本体走 `u_petal > 0.5` 分支，出口前有 `c *= shellVis; alpha *= shellVis;`
+     *     （shellVis = smoothstep(0.012, −0.012, sdShell)，sdShell 以
+     *      shellFront = mix(−0.20, 1.35, u_shell_form) 为前沿）；
+     *     u_shell_form = 0 ⇒ shellFront = −0.20 ⇒ 面内归一化半径 rt ∈ [0,1] 全部落在
+     *     前沿之后（sdShell ≥ 0.125）⇒ shellVis ≡ 0 ⇒ 颜色与 alpha 双零。
+     *     本体之后叠加的"顶面亮折线 / 数据细流"都以同一条 sdShell 的窄带为权重 ⇒ 也 ≡ 0。
+     *   · 内芯层（fragCoreMaterial）的总闸是 `smoothstep(0, u_seam_glow_fade, u_seam_form)`；
+     *     u_seam_form 只在 35 阈值以上才起（而 35 > SHELL_SHOW_P = 0.20 ⇒ 那时 _shellT 已 = 1）。
+     *     ⚠ 但两个计时器时长不同（SHELL_FORM_DUR 0.75s / SEAM_FADE_DUR 0.9s），
+     *       收尾会差 ~0.15s ⇒ 门控必须**同时**看两者，否则那 0.15s 会把内芯冷光提前掐掉。
+     *   · 粒子撞击脉冲（u_hitT）在低能态不会触发（环境粒子层要求 p ≥ DEPLOY_START = 0.80）。
+     * ⇒ `_shellT = 0 且 u_seam_form = 0` 时这 285×2(+遮挡体) 个对象**一个像素都不贡献**，
+     *   却每帧要走 570 次 draw call + 98 万次顶点着色 ⇒ 白烧 CPU/GPU。 */
+    this._applyShellDrawGate();
     /* v5.31：**前沿柱面的开/关** —— 只有前沿正跨过本片的那几片才画柱面。
      * 判据与顶点着色器里的 clamp(front + 抖动, lo, hi) 同源：
      *   front + 抖动 < lo → 本片还没开始长；> hi → 本片已长满（前沿进到外圈）。
      * 抖动幅度最大 0.055+0.020 = 0.075 → 窗口两端各放宽 0.08，避免"柱面被 clamp 在
      * 内/外边界上又还没关掉"的那一两帧露馅。
      * 只在 _shellT 变化（正在渐显/渐隐）时才动；静止态（0 或 1）零开销。 */
-    if (this._bandT !== this._shellT) {
+    if (this._bandT !== this._shellT || this._forceBandRefresh) {
       const frontB = SHELL_FORM_START + (SHELL_FORM_END - SHELL_FORM_START) * this._shellT;
+      const bandsOn = this.perf ? this.perf.bands !== false : true;   // v5.33 诊断旋钮
       for (const f of this.fragments) {
-        f.bandMesh.visible = frontB > f.bandLo - 0.08 && frontB < f.bandHi + 0.08;
+        f.bandMesh.visible = bandsOn
+          && frontB > f.bandLo - 0.08 && frontB < f.bandHi + 0.08;
       }
       this._bandT = this._shellT;
+      this._forceBandRefresh = false;
     }
 
     /* —— v5.16：基准面「细线环脉冲 + 擦除式半隐」状态机 ——
@@ -4204,9 +4641,21 @@ export class L5Core {
      *   · 新值：BASE_PULSE_DUR = **0.42s** —— 与旋转冻结 FRAG_RET_HOLD(0.45s) 重叠，
      *     实际总冻结 = max(0.45, 0.42) = **0.45s**，回到 v5.13d 的基线（−0.85s）。 */
     const revealBusy = !wantSeq && this._basePulseBusy === true;
-    const holdDeploy = holdRot || revealBusy;
+    /* —— v5.36：碎块的**合拢**进度（1 = 四散，0 = 已合拢）——
+     * 用户定标："碎块应该是在旋转回位后，等待降下的一段时间内合拢，然后再降下去，
+     *   这样才有秩序感"。
+     * 四散量 = eP × _closeT：跌破 80 时 eP 仍≈1（_deployT 被冻住），只有 _closeT 往 0 走
+     *   ⇒ 碎片**先原地收拢、缝先闭**，收完才轮到 _deployT 下降 —— 次序读得出来。
+     * 合拢期间必须把 _deployT 一起冻住（下面 closing 并入 holdDeploy），
+     *   否则"边散边降"又会回来。0.45s < 基准面渐显的 0.85s ⇒ 总时长不增。 */
+    if (this._closeT == null) this._closeT = 0;
+    if (wantSeq) this._closeT = 1;
+    else this._closeT = Math.max(0, this._closeT - dt / FRAG_SPREAD_CLOSE_DUR);
+    const closing = !wantSeq && this._closeT > 0;
+    const holdDeploy = holdRot || revealBusy || closing;
     this._holdDeploy = holdDeploy;        // 探针可观测
     this._revealBusy = revealBusy;
+    this._closeProbe = +this._closeT.toFixed(3);   // 探针可观测
     this._deployT = THREE.MathUtils.clamp(
       this._deployT + ((wantSeq && this._burstT >= 0.999) ? dt : (holdDeploy ? 0 : -dt)) / DEPLOY_DUR, 0, 1);
 
@@ -4263,6 +4712,14 @@ export class L5Core {
      * 正确的几何关系是：水晶面**底面本来就贴在基准面上**，顶面距基准面 = 线框划定的壁厚
      * （R_SHELL_IN → R_SHELL_OUT 那一层）。柱面就是这层壁的侧壁 —— 不需要任何额外位移。
      * （v5.21f：脉冲柱面整体删除，此段连同 offSum/offN 平均抬升累积一并移除。） */
+    /* v5.33：按面统计外推量与储能冷色 —— 供探针 LOD 代理做"整面刚体平移 + 平均冷色"跟随。
+     * 不用平均值再去缩放整块几何：片几何原点在面心、真实位置 = 面心 + 法线×外推 ⇒
+     * 平移是精确复现，缩放会连带放大切向尺寸（那是错的形变）。 */
+    if (this.proxyFaces && this.proxyFaces.length) {
+      this._proxyPush.fill(0);
+      this._proxyCnt.fill(0);
+      this._proxyCool.fill(0);
+    }
     for (const f of this.fragments) {
       // 每片自己的缓动进度（同一条曲线，不同终点）
       const u = THREE.MathUtils.clamp(d / (f.arrive ?? 1.0), 0, 1);
@@ -4275,6 +4732,10 @@ export class L5Core {
       const bob = Math.sin(waveT * f.floatFreq + f.floatPhase + 1.1) * floatAmp * 0.45;
       f.mesh.position.copy(f.faceCenter).addScaledVector(f.normal, off);
       f.mesh.position.y += bob;
+      if (this.proxyFaces && this.proxyFaces.length) {
+        this._proxyPush[f.faceIdx] += off;
+        this._proxyCnt[f.faceIdx] += 1;
+      }
 
       // —— Phase1c/d：冷色调随储存量升高；受击柔光强度衰减；累计每面吸收量 ——
       const fmat = f.mesh.material;
@@ -4291,6 +4752,9 @@ export class L5Core {
         f.stored = Math.max(0, f.stored - dt * drainRate);
       }
       fmat.uniforms.u_cool.value = Math.min((f.stored || 0) * this._COOL_PER, this._COOL_MAX);
+      if (this.proxyFaces && this.proxyFaces.length) {
+        this._proxyCool[f.faceIdx] += fmat.uniforms.u_cool.value;
+      }
       if (f.impactW > 0) f.impactW = Math.max(0, f.impactW - dt / this._IMPACT_FADE);
       fmat.uniforms.u_impact.value.w = f.impactW;
       /* Round G：删掉了 Round F 的"每片各算一遍半隐"逻辑 ——
@@ -4373,7 +4837,8 @@ export class L5Core {
          * 驱动→过冲→回位→硬卡停，只是终点是**原位** —— */
         if (rt.phase === 'drive') {
           rt.driveT = Math.min(1, rt.driveT + dt / rotDur(rt));
-          const e = 1.0 - Math.pow(1.0 - rt.driveT, 3.0);
+          /* v5.35：指数由常量 FRAG_ROT_DRIVE_EXP 控制（原写死 3.0 = easeOutCubic，太前重） */
+          const e = 1.0 - Math.pow(1.0 - rt.driveT, FRAG_ROT_DRIVE_EXP);
           rt.angle = rt.from + (rt.driveEnd - rt.from) * e;
           if (rt.driveT >= 1) { rt.angle = rt.driveEnd; rt.phase = 'ret'; rt.retT = 0; }
         } else if (rt.phase === 'ret') {
@@ -4394,7 +4859,8 @@ export class L5Core {
         // 每片自己的速率 → 各片在同一面内先后到位（波从面心扫向边缘）
         if (rt.phase === 'drive') {
           rt.driveT = Math.min(1, rt.driveT + dt / rotDur(rt));
-          const e = 1.0 - Math.pow(1.0 - rt.driveT, 3.0);
+          /* v5.35：指数由常量 FRAG_ROT_DRIVE_EXP 控制（原写死 3.0 = easeOutCubic，太前重） */
+          const e = 1.0 - Math.pow(1.0 - rt.driveT, FRAG_ROT_DRIVE_EXP);
           rt.angle = rt.from + (rt.driveEnd - rt.from) * e;
           if (rt.driveT >= 1) { rt.angle = rt.driveEnd; rt.phase = 'ret'; rt.retT = 0; }
         } else if (rt.phase === 'ret') {
@@ -4417,8 +4883,25 @@ export class L5Core {
         rt.angle += (grp.accum - rt.angle) * Math.min(1, dt * 8.0);   // 未激活片缓慢对齐面目标
       }
       f.mesh.quaternion.setFromAxisAngle(f.normal, rt.angle * rotGate);
+      /* —— v5.35：面内四散（随同一次抬升进行，之后照常上下浮动）——
+       * ★ 放在**旋转写入之后**：three.js 的矩阵是 T·R·S，即 world = position + R·p。
+       *   若把四散量加进 position（不随 R 转），旋转轴就会被横向平移 s 而不再过面心，
+       *   齿轮卡位会绕着一条偏出去的轴转 —— 那是错的。把四散量乘上本片的 R，
+       *   等价于"先在面局部把排布撑开、再整体绕面心转"，旋转轴仍在面心。
+       * ★ 幅度走**本片自己的 eP**（= 抬升进度）⇒ 与抬升同步、与各片到达时刻错开一致，
+       *   且跌破 80 时随 _deployT 回落自动收回（不需要额外的收/放状态机）。 */
+      if (f.spreadDir) {
+        /* v5.36：× _closeT ⇒ 跌破 80 后"先合拢、再降下"（见 FRAG_SPREAD_CLOSE_DUR 注释） */
+        const amt = eP * (this._closeT ?? 1)
+                  * Math.max(FRAG_SPREAD_MIN, FRAG_SPREAD * f.spreadR);
+        if (amt > 1e-6) {
+          const sv = this._spreadV || (this._spreadV = new THREE.Vector3());
+          sv.copy(f.spreadDir).multiplyScalar(amt).applyQuaternion(f.mesh.quaternion);
+          f.mesh.position.add(sv);
+        }
+      }
     }
-    /* —— 面级排程（每帧一次，不能放在碎片循环里 —— 那会被同面的 20+ 片各推一次）—— */
+    /* —— 面级排程（每帧一次，不能放在碎片循环里 —— 那会被同面的 20+ 片各把一次）—— */
     let anyBusy = false;
     for (const key in this._faceRot) {
       const grp = this._faceRot[key];
@@ -4492,6 +4975,19 @@ export class L5Core {
         if (this._rotEvents.length > 12) this._rotEvents.shift();
       }
       this._faceBaseRot[fidx] += (grp.accum * rotGate - this._faceBaseRot[fidx]) * Math.min(1, dt / rotDurMax());
+    }
+
+    /* —— v5.33：把统计结果写回探针 LOD 代理 ——
+     * 每个面的代理 = 一整块合并网格，用**刚体平移**精确复现"面心 + 法线×本面平均外推"；
+     * 内芯同理（同一位置、scale 0.86）。u_cool 写本面均值 ⇒ 代理与真实碎片同冷暖。 */
+    if (this.proxyFaces && this.proxyFaces.length) {
+      for (const p of this.proxyFaces) {
+        const n = this._proxyCnt[p.faceIdx] || 1;
+        const avg = this._proxyPush[p.faceIdx] / n;
+        p.mesh.position.copy(p.center).addScaledVector(p.normal, avg);
+        p.core.position.copy(p.mesh.position);
+        p.mesh.material.uniforms.u_cool.value = this._proxyCool[p.faceIdx] / n;
+      }
     }
     /* —— v-内容2：基准台面自旋 uniform 写入（shellInnerUniforms 独立副本；
      * 裂片/核心共享 this.uniforms 默认 0 → 不转）。
@@ -4623,7 +5119,45 @@ export class L5Core {
       frontAvg: +(frontSum / Math.max(1, n)).toFixed(3),
       hiddenFrac: +(amtSum / Math.max(1, n)).toFixed(3),
       /* v5.16 基准面脉冲的观测口（碎块侧已无周期/显现，clock 字段改挂基准面行程） */
-      base: this._baseStats ?? null
+      base: this._baseStats ?? null,
+      /* v5.33：探针 / LOD 代理的可观测状态 —— "环是黑的"第一手判据，不用翻代码 */
+      probe: this._probeStats(),
+      /* v5.38：**整帧** draw call / 三角形（由 main.js 每帧回填）。
+       * ⚠ 不要直接读 `renderer.info` —— three.js 的 `renderer.info.autoReset` 默认为 true，
+       *   每次 `renderer.render()` 开头都会 `info.reset()` ⇒ 帧末读到的只是**最后一个
+       *   全屏 pass**（恒为 calls:1 / triangles:1），主相机那 800+ 次绘制、探针那 6 次
+       *   场景渲染全都看不到。要总量必须 `autoReset = false` + 自己每帧 reset（main.js 已做）。 */
+      frame: this._frameStats ?? null,
+      /* v5.38：门控效果 —— shellDraw=false 表示这 570 个 draw call 本轮根本没发；
+       * twins.on 是屏幕剔除后真正开启的隐形遮挡体数量。 */
+      shellDraw: this._shellDraw !== false,
+      twins: { on: this._twinOn ?? -1, total: this.fragTwins ? this.fragTwins.length : 0 }
+    };
+  }
+
+  /**
+   * v5.33：黑洞中心探针 + LOD 代理的可观测状态。
+   * 透镜环一片死黑时按这个顺序排查：
+   *   mode === 'fallback' → 代理没建成（控制台会有 [L5] 报错），探针退回全场景渲染（卡但正确）；
+   *   onProbeLayer false → 代理没挂到探针层，探针看不见它们 ⇒ 必黑；
+   *   every === 0        → 探针根本不刷新（?lens=0 或 perf 被改过）；
+   *   radii 全 0         → _animateDeploy 没把位置写回代理（代理缩在原点）；
+   *   gravVis false      → 透镜环本身不可见，与探针无关。
+   */
+  _probeStats() {
+    const pf = this.proxyFaces || [];
+    return {
+      every: this.perf ? this.perf.probe : LENS_PROBE_EVERY,   // 0 = 不刷新
+      /* Layers.mask：0x7fffffff = enableAll（回退模式）；8 = 只看 layer3（代理模式） */
+      layerMask: this.bhProbe ? this.bhProbe.layers.mask : -1,
+      mode: pf.length ? 'proxy' : 'fallback',
+      proxies: pf.length,
+      onProbeLayer: pf.length
+        ? pf.every((p) => p.mesh.layers.isEnabled(L5_PROBE_LAYER)) : false,
+      visible: pf.length ? pf.filter((p) => p.mesh.visible).length : 0,
+      radii: pf.map((p) => +p.mesh.position.length().toFixed(3)),
+      hasProbe: !!this.bhProbe,
+      gravVis: !!this.bhGrav && this.bhGrav.visible
     };
   }
 
@@ -4904,8 +5438,28 @@ export class L5Core {
    *    value 深拷贝成冻结快照，逐帧更新再也传不进来，顶点位移就会和可见碎片对不上）。 */
   _makeDepthTwin(srcMat) {
     return new THREE.ShaderMaterial({
-      vertexShader: srcMat.vertexShader,
-      fragmentShader: srcMat.fragmentShader,
+      /* ★★ v5.37 性能修复（本轮"整个程序变卡"的**实际大头**）★★
+       * 旧实现把 fragmentShader 也照抄了本体 —— 于是 285 个可见碎片各自带一个
+       * **把项目里最重的片元着色器整段跑一遍、再把结果整段丢掉**的孪生体：
+       *   · colorWrite = false ⇒ 颜色输出被硬件丢弃，一个像素都没用上；
+       *   · 覆盖面积 = 整片水晶的投影面积 ⇒ 每帧约 50 万~100 万次纯浪费的重着色器调用；
+       *   · 而它**唯一**的职责是写深度（让洞前碎片挡住透镜环，renderOrder 35）。
+       * 深度只由**顶点位置**决定 ⇒ 只保留 vertexShader（顶点位移逐位不变 ⇒ 深度轮廓
+       * 逐位不变），片元换成一行空实现。
+       * ★ 为什么这不改变遮挡轮廓：本体 FRAG（晶体 / 基准面 / 核心外壳三分支）全程
+       *   **没有任何 discard**（本文件的 discard 只在场辉光与透镜两个着色器里）——
+       *   即"几何覆盖到的像素全部写深度"。换成空片元后覆盖关系完全相同。
+       * ★ 为什么不能干脆删掉孪生体：sync() 里 `_updateFragTwins(bhVisible, bhRDraw)` —— 黑洞可见
+       *   期间它必须在，否则透镜环(36)与光子环(38)会画到洞前碎片上面（像被弯折）。 */
+      vertexShader: srcMat.vertexShader,   // ★ 必须同源：顶点位移决定深度轮廓
+      fragmentShader: [
+        'precision highp float;',
+        'void main() {',
+        '  /* 颜色已被 colorWrite=false 丢弃 —— 这里只需产生片元去写深度。',
+        '     光照 / 折射 / 脉冲线全部与深度无关，整段省掉。 */',
+        '  gl_FragColor = vec4(0.0);',
+        '}'
+      ].join('\n'),
       uniforms: srcMat.uniforms,          // 共享 ⇒ 自动跟随逐帧更新
       transparent: true,                  // 必须在 transparent 队列，否则被提前渲染
       depthWrite: true,
@@ -4917,10 +5471,135 @@ export class L5Core {
     });
   }
 
-  /** v5.29：统一开关所有隐形遮挡体。 */
-  _setFragTwins(v) {
+  /**
+   * v5.39：**只关不记** —— 探针渲染期间把隐形遮挡体整体藏起来（不碰可见性掩码）。
+   *
+   * ★★ 这里绝不能再走 `_updateFragTwins(false, …)`（v5.38 就是这么写的，是个真 bug）★★
+   * 那条路会顺手把 `_twinVisMask` **逐位清零**，而紧接着的 `_restoreFragTwins()`
+   * 干的正是"回放这张掩码" ⇒ 探针帧结束时遮挡体全灭，非探针帧又被 sync 点亮
+   * ⇒ **遮挡体以探针周期 ON/OFF 交替**（LENS_PROBE_EVERY = 2 ⇒ 60fps 下正好 30Hz）。
+   * 后果有多大：唯一受遮挡体影响的层就是加色光子环 `bhLens`(38)（见 renderOrder 总表，
+   * 排在 35 之后的只有 38）。于是亮的一帧光子环被洞前碎片挡掉、下一帧又叠在碎片上面
+   * ⇒ **整个黑洞 30Hz 明暗频闪**。用户原话："黑洞会一直高频率闪烁，给我眼睛都晃瞎了"。
+   *
+   * 为什么 v5.37 的时候看不到：那时探针后的回放走 `_setFragTwins(true)` —— 把 285 个
+   * 遮挡体**全部打开**（没有剔除，但"该挡的地方"覆盖一致）⇒ 两种状态在关键区域里
+   * 逐像素等价，闪不起来。v5.38 把回放改成"回放掩码"（本来是对的优化）却忘了一件事：
+   * 被回放的那张表已经被上一次"临时隐藏"清零了。
+   *
+   * ★ 规则（本次教训）：`_twinVisMask` 是**权威可见性表**，只允许 `sync()` 那一处
+   *   `_updateFragTwins(bhVisible, bhRDraw)` 写。任何"临时隐藏 / 临时显示"只准改
+   *   `visible`，**绝不许碰掩码** —— 否则同一个状态就有了两个互相打架的写入者，
+   *   而症状只会表现为"闪"。
+   *
+   * ★ v5.39 追加：正常（代理）路径下**根本不会调用本函数** —— 见 `updateProbe` 的
+   *   layer 判据（探针只看 layer3，而遮挡体是 layer0，压根进不了探针那次渲染）。
+   *   它只服务"代理构建回退 ⇒ 探针 `enableAll()`"那一条路。 */
+  _hideFragTwins() {
     const a = this.fragTwins;
-    for (let i = 0; i < a.length; i++) a[i].visible = v;
+    if (!a || !a.length) return;
+    for (let i = 0; i < a.length; i++) a[i].visible = false;
+  }
+
+  /**
+   * v5.38：隐形遮挡体（renderOrder 35，只写深度不写颜色）的**按需开启**。
+   *
+   * 为什么要剔：这 285 个遮挡体唯一的职责是"让洞前的碎片挡住透镜环(36)与光子环(38)"
+   * —— 而 36/38 全部落在**黑洞圆盘之内**（bhGrav 外径 = bhRDraw×LENS_U_OUT/BH_LENS_K
+   * ≈ 0.83·bhRDraw；bhLens 外径 = bhRDraw）。一个投影完全落在圆盘之外的碎片，
+   * 无论它写不写深度都**不可能影响 36/38 的任何一个像素** ⇒ 把它关掉是**逐像素等价**的，
+   * 不是近似。黑洞可见时 285 个遮挡体里通常只有几十个的包围盒能碰到圆盘。
+   *
+   * 判据（全部用世界坐标，零投影矩阵）：
+   *   · 相机是**固定正交相机**（scene.js: `position(0,0,50)` + `lookAt(0,0,0)` + up=+Y，
+   *     逐帧只改 left/right/top/bottom 做缩放；视线方向喂给 `u_cam_forward`）⇒
+   *     相机基向量恒为 (1,0,0)/(0,1,0) ⇒ **屏幕平面坐标就是世界 X/Y**。
+   *     若将来相机真的会绕轨道转，这里必须换成真正的投影（见 __revStats.frame 的注释）。
+   *   · 每个碎片预烘了 8 个面局部包围盒角点（`bbCorners`）⇒ 逐帧乘 mesh 世界矩阵后取
+   *     X/Y 的 min/max = 该片在世界 X/Y 平面上的紧包围盒；再与黑洞圆盘做"矩形×圆"相交。
+   *
+   * 为什么不能像探针那样交给 three.js 的 `frustumCulled`：视锥剔除只认**包围球**，
+   * 而这里是"包围盒 vs 一个小圆"——包围球会把 0.4u 的圆盘放大成整个壳。
+   *
+   * 失败方向永远是"多画"：没数据 / 算不出来 / `perf.twins === false` 时按旧行为全开。
+   *
+   * ★ v5.39：本函数是 `_twinVisMask` 的**唯一写入者**，调用点只有 sync() 一处。
+   *   需要"临时隐藏"（探针渲染期间）一律用 `_hideFragTwins()`；用 `_updateFragTwins(false, …)`
+   *   去临时隐藏会把掩码清零，回放者拿到的就是一张废表 ⇒ 隔帧闪烁（v5.38 的真 bug）。
+   */
+  _updateFragTwins(on, bhRDraw) {
+    const twins = this.fragTwins;
+    if (!twins || !twins.length) return;
+    const mask = this._twinVisMask || (this._twinVisMask = new Uint8Array(twins.length));
+    if (!on || (this.perf && this.perf.twins === false)) {
+      for (let i = 0; i < twins.length; i++) { twins[i].visible = false; mask[i] = 0; }
+      this._twinOn = 0;
+      return;
+    }
+    /* 世界半径未知 ⇒ 退回全开（多画不错画） */
+    if (!(bhRDraw > 0)) {
+      for (let i = 0; i < twins.length; i++) { twins[i].visible = true; mask[i] = 1; }
+      this._twinOn = twins.length;
+      return;
+    }
+    const M = this._twinM || (this._twinM = new THREE.Matrix4());
+    const W = this._twinW || (this._twinW = new THREE.Matrix4());
+    const P = this._twinP || (this._twinP = new THREE.Vector3());
+    const C = this._twinC || (this._twinC = new THREE.Vector3());
+    this.group.updateWorldMatrix(true, false);      // 只升 3 级（scene→assembly→group）
+    M.copy(this.group.matrixWorld);
+    /* group 的世界缩放（用于把 bhRDraw 从组内单位换成世界单位） */
+    const sx = Math.hypot(M.elements[0], M.elements[1], M.elements[2]) || 1;
+    /* 圆盘半径 = bhRDraw×1.30（覆盖 36/38 的**物理**足迹：bhGrav 外径 = 1.25×bhRDraw/BH_LENS_K
+     * ≈ 0.833·bhRDraw，bhLens 外径 = bhRDraw）+ 0.12u 绝对余量。
+     * ★ 为什么 0.12 就够（已用纯 node 断言核过，`tmp_twin_cull_check.mjs`）：
+     *   片元用的 VERT 在 `aBand/aKind/aFaceIdx` 三个分支全不命中时，唯一的位移项是
+     *   `_liftN * u_lift`；而 **u_lift 只被 shellInnerUniforms 写**（`this.uniforms.u_lift`
+     *   恒为 0，碎片材质是从它 fork 的）⇒ 碎片的渲染范围 **恰好等于** 几何静态 AABB
+     *   乘 mesh 自身矩阵（面内四散也只写 `mesh.position`，已在矩阵里）。
+     *   实测保留数（黑洞可见时）：闭合态 94/285、满展开态 58/285；
+     *   而"真正压在实环半径 0.833·bhRDraw 上"的只有 20 片 —— 余量把这些全兜住了。 */
+    const R = bhRDraw * sx * 1.30 + 0.12 * sx;
+    const R2 = R * R;
+    this.bhGrav.getWorldPosition(C);
+    const bx = C.x, by = C.y;
+    const frags = this.fragments;
+    let live = 0;
+    for (let i = 0; i < frags.length; i++) {
+      const f = frags[i];
+      f.mesh.updateMatrix();                        // position/quaternion/scale → matrix
+      W.multiplyMatrices(M, f.mesh.matrix);
+      const c = f.bbCorners;
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (let k = 0; k < 8; k++) {
+        P.copy(c[k]).applyMatrix4(W);
+        if (P.x < x0) x0 = P.x;
+        if (P.x > x1) x1 = P.x;
+        if (P.y < y0) y0 = P.y;
+        if (P.y > y1) y1 = P.y;
+      }
+      const dx = Math.min(Math.max(bx, x0), x1) - bx;
+      const dy = Math.min(Math.max(by, y0), y1) - by;
+      const vis = dx * dx + dy * dy <= R2;
+      twins[i].visible = vis;
+      mask[i] = vis ? 1 : 0;
+      if (vis) live++;
+    }
+    this._twinOn = live;
+  }
+
+  /** v5.38：把遮挡体恢复成"上一次 sync 算出的那份可见性"。
+   *  探针渲染前后要整体关/开它们（探针里不能写深度），但**不必重算** ——
+   *  每帧只在 sync 里算一次，这里直接回放掩码（探针隔帧跑，重算等于白跑一遍）。
+   *  v5.39：**只读掩码、不写掩码**（掩码的唯一写入者是 sync，见 `_hideFragTwins`）。
+   *  掩码还不存在（sync 尚未跑过，只有启动首帧可能）⇒ 退回"全开"——
+   *  与 `_updateFragTwins` 的失败方向一致：宁可多画，不可漏画。 */
+  _restoreFragTwins() {
+    const a = this.fragTwins;
+    const m = this._twinVisMask;
+    if (!a || !a.length) return;
+    if (!m) { for (let i = 0; i < a.length; i++) a[i].visible = true; return; }
+    for (let i = 0; i < a.length; i++) a[i].visible = m[i] === 1;
   }
 
   /** v5.27：更新黑洞中心的立方探针 —— 渲染"不含黑洞自身"的场景六面，供透镜采样。
@@ -4929,18 +5608,52 @@ export class L5Core {
    *  每帧都跑代价太高，而透镜里是剧烈压缩的远景，隔一帧看不出来。 */
   updateProbe(renderer, scene) {
     if (!this.bhProbe || !this.bhGrav || !this.bhGrav.visible) return;
+    /* v5.33：刷新间隔由 perf.probe 控制（0 = 不刷新，同时 sync 会把 bhGrav 整个隐藏） */
+    const every = this.perf ? this.perf.probe : LENS_PROBE_EVERY;
+    if (every <= 0) return;
     this._probeTick = (this._probeTick || 0) + 1;
-    if (this._probeTick % 2) return;
+    if (this._probeTick % every) return;
     const bhVis = this.bhGroup.visible;
     this.bhGroup.visible = false;      // 黑洞自身不能进探针（否则自己透镜自己）
     /* v5.29：探针里**不能**开隐形遮挡体 —— 探针要的是"抵达洞心的辐射"，而水晶碎片是
      * 加色半透明（它们在探针里应该是"加一层光"而不是"挡住后面"）。一旦让它们写深度，
-     * 探针六面会被近侧的碎片糊住，透镜环里就什么都看不见了。 */
-    this._setFragTwins(false);
+     * 探针六面会被近侧的碎片糊住，透镜环里就什么都看不见了。
+     * ★ v5.39：必须用 `_hideFragTwins()`（只改 visible、**不碰掩码**）。
+     *   v5.38 这里写的是 `_setFragTwins(false)` —— 它会把 `_twinVisMask` 清零，
+     *   于是下面 `_restoreFragTwins()` 回放的是一张全 0 的表 ⇒ 遮挡体隔帧全灭
+     *   ⇒ 光子环(38)隔帧盖住洞前碎片 ⇒ **黑洞 30Hz 频闪**。详见 `_hideFragTwins`。
+     *
+     * ★★ v5.39 追加（这一条让上面那类 bug **从正常路径上彻底消失**）：★★
+     *   **到底要不要"临时隐藏"，取决于探针看不看得见这些遮挡体。**
+     *   代理模式下探针是 `layers.set(L5_PROBE_LAYER)`（= 3）⇒ `mask` 只有 bit3，
+     *   **不含 layer 0**；而遮挡体是 layer 0 的对象（碎片 mesh 的子对象，只带
+     *   noGlowMask，从没被 enable 过探针层）⇒ 它们**根本进不了探针那次渲染**
+     *   （three.js `projectObject` 逐对象 `layers.test`）。于是这一步在代理模式下
+     *   是**空操作**。既然如此就不该做：跳过后，正常路径上**没有任何人会在探针前后
+     *   碰遮挡体的 `visible`** ⇒ "两个写入者"的隐患被从结构上摘掉，而不只是被修好。
+     *   只有构建回退（代理没建全 ⇒ `bhProbe.layers.enableAll()`，mask 含 bit0）
+     *   那条路才真的需要关。判据**从 mask 现算**（不写死）⇒ 将来谁改了探针 layers，
+     *   这里自动跟着对。 */
+    const probeSeesTwins = (this.bhProbe.layers.mask & 1) !== 0;
+    if (probeSeesTwins) this._hideFragTwins();
     this.bhProbe.position.copy(this.bhGravMaterial.uniforms.u_gv_center.value);
     this.bhProbe.update(renderer, scene);
     this.bhGroup.visible = bhVis;
-    this._setFragTwins(this.bhGrav.visible);
+    /* v5.38：回放 sync 算好的掩码，不重算（**只读**那张表，见 `_hideFragTwins`） */
+    if (probeSeesTwins) this._restoreFragTwins();
+  }
+
+  /**
+   * v5.33：运行时改探针刷新间隔 —— 定位/A-B 用（URL `?lens=N` 下发）。
+   *   0  = 彻底不刷新（sync 会连带把 bhGrav 整个隐藏 ⇒ 透镜环不画，探针开销归零）
+   *   N≥1 = 每 N 帧刷一次（默认 LENS_PROBE_EVERY = 2，即隔帧）
+   * ⚠ 这是**定位旋钮**，不是优化手段：降 N 会让洞后景象滞后，用户明确否决过拿它当优化。
+   */
+  setProbeEvery(n) {
+    if (!this.perf) this.perf = { probe: LENS_PROBE_EVERY, twins: true, bands: true };
+    const v = parseInt(n, 10);
+    this.perf.probe = Number.isFinite(v) ? Math.max(0, v) : LENS_PROBE_EVERY;
+    return this.perf.probe;
   }
 
   /** 视觉增强总开关：false → 回退到规格字面渲染 */
@@ -4966,6 +5679,37 @@ export class L5Core {
   }
 
   /**
+   * v5.38：水晶碎块层的**发射门控** —— 壳还没成形时干脆不发 draw call。
+   *
+   * `f.mesh.visible = false` 在 three.js 里是"连顶点着色器都不跑"（`projectObject`
+   * 里 `visible === false` 直接跳过整个子树，不产生 render item）⇒ 285 个本体 +
+   * 285 个内芯（+ 黑洞可见时的遮挡体，它们是本体的子对象）**一次性全部省掉**，
+   * 而画面**逐像素不变**（推导见 `_animateDeploy` 里调用点上方那段注释）。
+   *
+   * 两个门必须**同时**为 0 才收：
+   *   · `_shellT`（u_shell_form）= 晶体本体与前沿柱面的门；
+   *   · `u_seam_form` = 内芯层（fragCoreMaterial）的总闸。
+   * 两者时长不同（0.75s / 0.9s），收尾会差 ~0.15s。
+   *
+   * `layerOn` 来自 setLayer('fragments')：用户手动关层时永远不画（那一路是**强制**隐藏，
+   * 与本门控无关）；打开层时再按壳的成形状态决定。
+   */
+  _applyShellDrawGate(force) {
+    const frags = this.fragments;
+    if (!frags || !frags.length) return;
+    const layerOn = !(this._layerFlags && this._layerFlags.fragments === false);
+    const formGate = (this._shellT ?? 0) > 1e-4;
+    const seamGate = (this.uniforms.u_seam_form.value ?? 0) > 1e-4;
+    const draw = !!layerOn && (formGate || seamGate);
+    if (!force && this._shellDraw === draw) return;
+    this._shellDraw = draw;
+    for (let i = 0; i < frags.length; i++) frags[i].mesh.visible = draw;
+    /* 探针 LOD 代理**不**吃本门控 —— 它是"外壳在透镜里的替身"，由 setLayer('fragments')
+     * 单独管（**必须**如此：代理的顶点位置被顶点着色器按前沿复算，外壳展开/收拢时它要
+     * 跟着变形，用 CPU 的 visible 去掐会在透镜环里留下一个突然消失的面）。 */
+  }
+
+  /**
    * 层级显示开关。关闭即彻底隐藏：obj.visible=false 在 three.js 中既不被渲染、
    * 也不写深度缓冲、不参与拾取/后处理掩膜 —— 不会"隐藏了但干涉还在"。
    * v5.22：基准面（shellInner）改为**可关闭** —— 用户需要关掉它来观察核心与粒子，
@@ -4982,7 +5726,12 @@ export class L5Core {
     this._layerFlags[name] = v;
     switch (name) {
       case 'fragments':        // 水晶碎块 / 外壳（285 片外甲，含其内芯发光子层）
-        for (const f of this.fragments) f.mesh.visible = v;
+        /* v5.38：不再直接写 visible —— 交给门控（壳未成形时本来就没有像素输出）。
+         * `_layerFlags.fragments` 已在上面写入，门控会读它。 */
+        this._applyShellDrawGate(true);
+        /* v5.33：探针 LOD 代理是"外壳在透镜里的唯一替身" —— 外壳关掉时它也必须关，
+         * 否则透镜环里仍然看得到壳。（代理不吃上面的发射门控，理由见 `_applyShellDrawGate`。） */
+        if (this.proxyFaces) for (const p of this.proxyFaces) { p.mesh.visible = v; p.core.visible = v; }
         break;
       /* v5.21e：'core' 现在只对应核心本体（棱线光导管已整体删除，
        * 不再需要 v5.21d 那套父子层同步）。v-内容4：黑洞体（机械壳+黑洞）
@@ -5421,6 +6170,9 @@ export class L5Core {
      *   u_bh_vh = 1/1.5 ≈ 0.667 的"视界占投影半径比例"完全自洽。 */
     const bhRDraw = Math.max(bhR, BH_FLASH_R * bhFlash);
     const bhVisible = bhRDraw > 0.005;
+    /* v5.38：缓存**原始**绘制半径 —— 隐形遮挡体的屏幕剔除要按它算圆盘大小
+     * （`_bhRDraw` 那一位是 +toFixed(4) 的观测值，不要拿它做判据）。 */
+    this._bhRDrawRaw = bhRDraw;
     /* v5.23-crush：不再整体压成椭圆（用户："变成椭圆塌缩并不是一个合适的引力塌缩方式"）。
      * 改为 u_bh_crush 驱动**多向不等巨力**的定向压痕（顶点位移 + 环半径调制），
      * 塌缩②与回落①共用 —— 读作"失控的自身引力把它挤碎、压进奇点"。 */
@@ -5449,7 +6201,10 @@ export class L5Core {
      * ★ 不能改回"用 alpha 淡出"：环现在**写深度**（这是它做真替换的手段），
      *   alpha 归 0 却仍在写深度，会在爆白正中心挖出一个"后面什么都看不见"的圆。
      *   要退就整体退 —— 与 bhCore 用同一条判据。 */
-    this.bhGrav.visible = bhVisible && bhFlash <= 0.001;
+    /* v5.34：`?lens=0` / `perf.probe = 0` ⇒ 探针永不刷新 ⇒ 采样到的仍是空贴图，
+     * 此时必须**整条环不画**（否则就是一圈死黑）。同样不能靠 alpha 淡出（理由同上）。 */
+    const probeOn = (this.perf ? this.perf.probe : LENS_PROBE_EVERY) > 0;
+    this.bhGrav.visible = bhVisible && bhFlash <= 0.001 && probeOn;
     this.bhGrav.scale.setScalar(bhRDraw / BH_LENS_K);
     const gvu = this.bhGravMaterial.uniforms;
     gvu.u_gv_rs.value = bhRDraw / (BH_LENS_K * BH_B_CRIT_RS);
@@ -5457,8 +6212,10 @@ export class L5Core {
     /* v5.29：打开碎片的**隐形遮挡体**（renderOrder 35，只写深度不写颜色）。
      * 洞前的碎片 ⇒ 深度比洞心近 ⇒ 透镜环(36)被深度测试挡掉 ⇒ 碎片正常遮住黑洞，
      * 且它自己的绘制完全不受影响；洞后的碎片 ⇒ 深度更远 ⇒ 透镜环正常覆盖它。
-     * 这才是"一个像素一张像"+"洞前内容不被弯折"两条同时成立的唯一解。 */
-    this._setFragTwins(bhVisible);
+     * 这才是"一个像素一张像"+"洞前内容不被弯折"两条同时成立的唯一解。
+     * ★ v5.38：只开"投影能碰到黑洞圆盘"的那些（逐像素等价，见 `_updateFragTwins`）——
+     *   黑洞可见时 285 个里通常只剩几十个，省掉的都是**不可能影响 36/38 任何像素**的。 */
+    this._updateFragTwins(bhVisible, bhRDraw);
     bhu.u_bh_size.value = THREE.MathUtils.clamp(
       (bhR - BH_R_MIN) / (BH_R_MAX - BH_R_MIN), 0, 1);
     const bpu = this.bhPanelMaterial.uniforms;
@@ -5706,6 +6463,14 @@ export class L5Core {
     }
     // v5.29：碎片的隐形遮挡体与其宿主共用同一份几何（上面已释放），这里只释放材质
     if (this.fragTwins) this.fragTwins.forEach((m) => m.material?.dispose?.());
+    // v5.33：探针 LOD 代理 —— 几何是合并出来的独立一份，材质也是新建的，都要释放
+    // （同一面的本体与内芯共用一份合并几何 ⇒ 只能 dispose 一次）
+    if (this.proxyFaces) {
+      this.proxyFaces.forEach((p) => {
+        p.mesh.material.dispose();
+        p.mesh.geometry.dispose();
+      });
+    }
     if (this.bhGrav) this.bhGrav.geometry.dispose();
     if (this.bhProbeRT) this.bhProbeRT.dispose();
     if (this.bhPanels) this.bhPanels.forEach((m) => m.geometry.dispose());

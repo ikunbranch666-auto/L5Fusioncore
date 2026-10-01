@@ -251,10 +251,43 @@ function tick(tsMs) {
     color: tmpColor,
   });
 
+  /* v5.38：**整帧**性能记账（背景见 l5Core.js `_revStats.frame` 的注释）。
+   * 为什么必须这么绕：three.js 的 `renderer.info.autoReset` 默认 true，**每次**
+   * `renderer.render()` 开头都 `info.reset()` ⇒ 帧末读 `renderer.info.render` 只会拿到
+   * 最后一个全屏 pass（恒为 calls:1 / triangles:1），主相机那 800+ 次绘制与探针那 6 次
+   * 场景渲染全都看不见 —— 拿它判断性能会得出完全错误的结论。
+   * 这里关掉自动 reset、每帧手动 reset 一次，于是帧末的读数就是**整帧总量**；
+   * 再在探针渲染前后各取一次快照，就能把"探针 6 面"与"主相机 + 后处理"分开。
+   * ⚠ 只在正常播放时接管；无头探针（FrameProbe）要的是默认语义，不动它。 */
+  const _info = stage.renderer.info;
+  if (probe) {
+    if (!_info.autoReset) _info.autoReset = true;
+  } else {
+    if (_info.autoReset) _info.autoReset = false;
+    _info.reset();
+  }
+
   // v5.27：黑洞中心的立方探针必须在 sync 之后、composer.render 之前更新
   l5.updateProbe(stage.renderer, stage.scene);
+  const _probeCalls = _info.render.calls;
+  const _probeTris = _info.render.triangles;
 
   stage.render();
+  if (!probe) {
+    l5._frameStats = {
+      calls: _info.render.calls,
+      triangles: _info.render.triangles,
+      points: _info.render.points,
+      lines: _info.render.lines,
+      probeCalls: _probeCalls,
+      probeTris: _probeTris,
+      mainCalls: _info.render.calls - _probeCalls,
+      mainTris: _info.render.triangles - _probeTris,
+      programs: _info.programs ? _info.programs.length : -1,
+      textures: _info.memory.textures,
+      geometries: _info.memory.geometries
+    };
+  }
   frameIndex++;
 
   if (frameTimes.length > 60) frameTimes.shift();
@@ -657,6 +690,14 @@ function boot() {
       fxEnabled = false;
       stage.setFx(false, l5);
       document.querySelectorAll('#seg-fx button').forEach((b) => b.classList.toggle('is-active', b.dataset.fx === 'off'));
+    }
+    /* ?lens=N：黑洞中心探针的刷新间隔（v5.33 性能/定位旋钮）。
+     *   0 = 彻底不刷新（透镜环一起隐藏 ⇒ 探针开销归零，用来 A/B "卡是不是探针造成的"）；
+     *   N≥1 = 每 N 帧刷一次（默认 2 = 隔帧）。
+     * ⚠ 不能叫 ?probe= —— 那个已被无头 FrameProbe 占用（上面的 probeFrameN）。 */
+    const lensN = urlQ.get('lens');
+    if (lensN != null && l5 && typeof l5.setProbeEvery === 'function') {
+      l5.setProbeEvery(parseInt(lensN, 10));
     }
     const p0 = parseFloat(urlQ.get('p'));
     if (Number.isFinite(p0)) {
