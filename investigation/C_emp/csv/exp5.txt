@@ -1,3 +1,0 @@
-﻿baseline       WHITE= 523 ( 1.688%)
-fac2           WHITE= 528 ( 1.705%)
-fac05          WHITE= 547 ( 1.766%)

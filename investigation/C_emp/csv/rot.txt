@@ -1,4 +1,0 @@
-﻿baseline_front WHITE= 330 ( 1.065%)
-baseline_rot45 WHITE= 348 ( 1.123%)
-baseline_front WHITE= 515 ( 1.663%)
-baseline_rot45 WHITE=1647 ( 5.317%)

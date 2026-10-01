@@ -50,3 +50,5 @@ tmp_*
 .puppeteer*
 playwright-report/
 test-results/
+
+investigation/
