@@ -276,6 +276,37 @@ export const det = (x) => {
   const s = Math.sin(x * 127.1 + 13.7) * 43758.5453;
   return s - Math.floor(s);
 };
+
+/* v5.32：**GPU 可精确镜像**的伪随机 [0,1) —— 供 jag 专用。
+ *
+ * 为什么 jag 不能用 det()/hash11：柱面要在**顶点着色器**里按当前前沿复算位置，
+ * 而它必须落在"本体晶体"的同一套参数化上 —— 本体顶点是 CPU 烘的（含 jag），
+ * 柱面是 GPU 算的 ⇒ 两边必须得到**逐位相同**的 jag 值。
+ * det() 的做法 fract(sin(x*127.1+13.7)*43758.5453) 做不到：sin 的自变量可达 8e4，
+ * float32 做参数约简的误差（~1e-2）被 ×43758 放大成完全不同的输出 —— 这正是本项目
+ * 「hash 型伪随机不能跨 CPU/GPU 镜像」那条规则的实际成因。
+ *
+ * 换成**只用乘加**的 hash（Dave Hoskins 无 sin 版）：float32 的乘法/加法是 IEEE 严格
+ * 舍入，CPU 用 Math.fround 逐步模拟即可逐位一致。GLSL 侧镜像见 l5Core 的
+ * CRYST_LINE_GLSL（jhash），两侧必须**同步修改**。
+ * ★ 改动任一侧都要同时改另一侧，否则柱面会整体错位（且不会报任何错）。 */
+const f32 = Math.fround;
+export const jhash = (p) => {
+  let x = f32(p);
+  x = f32(x * f32(0.1031)); x = f32(x - Math.floor(x));   // fract(p * 0.1031)
+  x = f32(x * f32(x + f32(33.33)));                       // p *= p + 33.33
+  x = f32(x * f32(x + x));                                // p *= p + p
+  return f32(x - Math.floor(x));                          // fract(p)
+};
+/** GLSL 里的 `a*c0 + b*c1 + …` 是**逐步 float32** 运算，JS 的 float64 一次算完
+ *  会在高位（~650 量级）积累 ~3e-4 的差，经 jhash 内部 ~2300× 的放大后变成
+ *  约 7% 的噪声差（≈0.3px）。故这里也严格逐步模拟。
+ *  用法：jhash(fmad([[ia, 7.13], [it, 3.71], [k, 11.9], [1, 1.7], [faceIdx, 0.37]])) */
+export const fmad = (pairs) => {
+  let acc = 0;
+  for (const [v, c] of pairs) acc = f32(acc + f32(f32(v) * f32(c)));
+  return acc;
+};
 export const norm = (a) => ((a % TAU) + TAU) % TAU;
 /** 有序去重 */
 export const uniqSort = (arr) => {
@@ -357,15 +388,20 @@ export function buildFaceFracturePlan(R, faceIdx) {
   };
   const JAG_A = 0.016, JAG_T = 0.016, JAG_Z = 0.003;
   const NQA = 72, NQT = 26, NQZ = 3;
+  /* ★ v5.32：噪声源 det() → **jhash()**（GPU 可镜像，见该文件头注释）。
+   * 只有 jag 换：jag 是唯一"CPU 烘进几何、GPU 又要复算同一个值"的量。
+   * 其余（bands / breaks / ph / SIG_* / facetH 相位）全程只在 CPU 侧用，保持 det() 不变
+   * ⇒ 裂法、环带、断裂相位等既有观感一点不动；变的只是断口锯齿的**具体随机值**
+   *   （振幅/块化粒度/统计特性完全相同，肉眼不可分辨）。 */
   const jag = (a, t, z) => {
     const k = Math.min(NQZ - 1, Math.max(0,
       Math.floor(((z - CRYST_Z0) / CRYST_H) * NQZ + 1e-9)));
     const ia = Math.floor((norm(a) / TAU) * NQA + 1e-9);
     const it = Math.floor(t * NQT + 1e-9);
     return [
-      JAG_A * (det(ia * 7.13 + it * 3.71 + k * 11.9 + 1.7 + faceIdx * 0.37) - 0.5) * 2,
-      JAG_T * (det(ia * 3.29 + it * 9.17 + k * 5.31 + 4.2 + faceIdx * 0.71) - 0.5) * 2,
-      JAG_Z * (det(ia * 5.71 + it * 2.13 + k * 7.77 + 8.1 + faceIdx * 1.13) - 0.5) * 2
+      JAG_A * (jhash(fmad([[ia, 7.13], [it, 3.71], [k, 11.9], [1, 1.7], [faceIdx, 0.37]])) - 0.5) * 2,
+      JAG_T * (jhash(fmad([[ia, 3.29], [it, 9.17], [k, 5.31], [1, 4.2], [faceIdx, 0.71]])) - 0.5) * 2,
+      JAG_Z * (jhash(fmad([[ia, 5.71], [it, 2.13], [k, 7.77], [1, 8.1], [faceIdx, 1.13]])) - 0.5) * 2
     ];
   };
   /** (a,t,z) → 3D（相对面心）。z=Z1 时额外叠加顶面刻面高度 */
@@ -413,8 +449,79 @@ export function buildFaceFracturePlan(R, faceIdx) {
     n, verts, center, e1, e2, v2, apo, phi0, SEG, rB, vertAz,
     warp, bands, breaks, ph, SIG_A, SIG_T,
     // v5.4 晶体体场
-    CRYST_H, CRYST_Z0, CRYST_Z1, FACET_A, NQZ, facetH, jag, V
+    CRYST_H, CRYST_Z0, CRYST_Z1, FACET_A, NQZ, facetH, jag, V,
+    /* v5.31：前沿柱面需要 warp / facetH 的**面级常量**原值（顶点着色器里复算位置），
+     * 只有这里能拿到（facetH 是个闭包，靠 phF1/phF2 定相位）。 */
+    phF1, phF2,
+    /* v5.31b：**前沿折线的 seed 改成"按面统一"**（原来是按片 vShard*3.1）。
+     * 用户实测："这个面的侧面柱看着不连续……像是笔刷的痕迹"。
+     * 根因：相邻碎块在同一方位角上抖动值完全不同 ⇒ 柱面在碎块边界出现
+     *   ±(0.055+0.020) 半径的径向台阶；且每片的出场/退场时刻也各自错开
+     *   ⇒ 同一圈上有的片有墙有的片没有 ⇒ 读成断续的笔触。
+     * 按面统一后：同一面所有碎块共用同一条 j(az) 折线 ⇒ 半径连续 + 时刻同步
+     *   ⇒ 柱面拼成一整圈连续锯齿墙。"不规则"不丢：折线仍是 7+19 段的尖角折线，
+     *   只是同一面共用一条（面与面之间 seed 仍然不同）。 */
+    frontSeed: det(faceIdx * 5.71 + 2.3) * 9.0
   };
+}
+
+/* ==================== v5.31：前沿柱面（frontier band）几何 ====================
+ * 用户定标（2026-10-01）："水晶碎块面现在的渐显渐隐只是上下两个脉冲面在向外扩张，
+ *   两个面之间并没有侧柱面相连……我要的是一整个水晶碎块在向外扩张的效果，
+ *   而不是上下两个面。"（选定方案 B：保留连续细线前沿 + 补一层**真的**前沿柱面。）
+ *
+ * 为什么必须是独立几何而不是"在顶/底面上画一条色带"：
+ *   v5.20 试过面内色带（coplanar）→ 用户实测："我怀疑你把柱面加到了那个贴片上面的
+ *   那个面上，而不是上下两个五边形脉冲面之间的那个柱面上"。共面的色带永远不可能
+ *   产生"上下关系"。柱面必须是 z ∈ [Z0,Z1] 上一段**有厚度的竖直曲面**。
+ *
+ * 为什么位置在**顶点着色器**里算而不是 CPU 每帧回写：
+ *   柱面必须落在"碎块可见边缘"上，而这个边缘由片元 shellVis 用 crystalSegJitter(az)
+ *   逐像素判定。要让两边严格同位置，只能让两边跑**同一段 GLSL**；CPU 侧镜像
+ *   hash11（fract(sin(p*127.1)*43758.5)）会因 GPU sin 的舍入差而给出完全不同的
+ *   伪随机值 → 柱面与边缘错开 ~4px。故：几何只烘**参数**（方位 / 厚度），
+ *   真实 3D 位置由 VERT 用与 FRAG 同源的函数复算。
+ *
+ * 顶点 = 方位 NA 档 × 厚度 NZ 档；索引固定，position/normal 只是占位（每帧 VERT 重写）。
+ * NA=14 的依据：前沿折线的细层是 19 段/2π（周期 0.33 rad），本片方位跨度典型
+ *   0.5~1.5 rad → 14 档给出 0.04~0.11 rad 间距，远细于 0.33 → 折线尖角不丢。 */
+const BAND_NA = 14;
+const BAND_NZ = 4;      // 厚度分档（首/尾正好落在 Z0 / Z1）
+/** @param a0,a1 本片的方位区间（与本体碎块同一段，两端与断裂侧壁对齐） */
+export function buildBandGeometry(a0, a1, shardSeed) {
+  const NV = BAND_NA * BAND_NZ;
+  const bandV = new Float32Array(NV);
+  const az = new Float32Array(NV);
+  for (let i = 0; i < BAND_NA; i++) {
+    const a = norm(a0 + (a1 - a0) * (i / (BAND_NA - 1)));
+    for (let k = 0; k < BAND_NZ; k++) {
+      const v = i * BAND_NZ + k;
+      bandV[v] = k / (BAND_NZ - 1);          // 0 = 底 Z0，1 = 顶 Z1
+      az[v] = a / TAU;                        // = aCrackAz（与本体同一口径）
+    }
+  }
+  const idx = [];
+  const at = (ii, kk) => ii * BAND_NZ + kk;
+  for (let i = 0; i < BAND_NA - 1; i++) {
+    for (let k = 0; k < BAND_NZ - 1; k++) {
+      idx.push(at(i, k), at(i, k + 1), at(i + 1, k + 1));
+      idx.push(at(i, k), at(i + 1, k + 1), at(i + 1, k));
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(NV * 3), 3));
+  /* normal 只作占位：真实法线由顶点着色器算（柱面朝向随前沿变）。
+   * ★ 不能留成全 0 —— VERT 里 normalize(normal) 会得到 NaN，再乘进 u_lift 项
+   *   （0 × NaN = NaN）会把整个柱面的 gl_Position 打成 NaN → 柱面彻底不显示。 */
+  const nrm0 = new Float32Array(NV * 3);
+  for (let v = 0; v < NV; v++) nrm0[v * 3 + 2] = 1.0;
+  g.setAttribute('normal', new THREE.BufferAttribute(nrm0, 3));
+  g.setAttribute('aBand', new THREE.BufferAttribute(new Float32Array(NV).fill(1), 1));
+  g.setAttribute('aBandV', new THREE.BufferAttribute(bandV, 1));
+  g.setAttribute('aCrackAz', new THREE.BufferAttribute(az, 1));
+  g.setAttribute('aShard', new THREE.BufferAttribute(new Float32Array(NV).fill(shardSeed), 1));
+  g.setIndex(idx);
+  return g;
 }
 
 export function buildFaceFragments(R) {
@@ -425,8 +532,8 @@ export function buildFaceFragments(R) {
     const P = buildFaceFracturePlan(R, faceIdx);
     if (P.verts.length !== 5) return;
     const {
-      verts, center, e1, e2, rB, warp, bands, breaks, vertAz, apo,
-      CRYST_H, CRYST_Z0, CRYST_Z1, NQZ, facetH, V
+      verts, center, e1, e2, rB, warp, bands, breaks, vertAz, apo, phi0,
+      ph, SIG_A, SIG_T, CRYST_H, CRYST_Z0, CRYST_Z1, NQZ, facetH, V, phF1, phF2, frontSeed
     } = P;
 
     /* ---------- 全局采样栅格（相邻片共享边界必须逐点一致） ----------
@@ -545,7 +652,7 @@ export function buildFaceFragments(R) {
       }
       const NZ = ZG.length;
 
-      const pos = [], sm = [], rm = [], th = [], wl = [], cu = [], ca = [];
+      const pos = [], sm = [], rm = [], th = [], wl = [], cu = [], ca = [], tp = [];
       let area2 = 0;
       /**
        * 按参考方向定绕向并写入顶点（保证法线朝外，否则整片背向相机、光照全反）。
@@ -560,6 +667,7 @@ export function buildFaceFragments(R) {
           pos.push(p[0], p[1], p[2]);
           sm.push(a.s); rm.push(a.r); th.push(a.t);
           wl.push(a.w); cu.push(a.u); ca.push(a.az);
+          tp.push(a.top || 0);      // v5.31b：1 = 顶面（前沿亮折线只画在顶面）
         }
       };
       const NREF = [n.x, n.y, n.z];
@@ -570,7 +678,7 @@ export function buildFaceFragments(R) {
           const q = (ii, jj) => ({
             p: V(A[ii], T[jj], CRYST_Z1),
             a: { s: seam[ii][jj], r: rimA[ii][jj], t: thickAt(A[ii], T[jj]),
-                 w: 0, u: T[jj], az: norm(A[ii]) / TAU }
+                 w: 0, u: T[jj], az: norm(A[ii]) / TAU, top: 1 }
           });
           const c00 = q(i, j), c01 = q(i, j + 1), c11 = q(i + 1, j + 1), c10 = q(i + 1, j);
           // 平面投影面积（运动分级用）：按两个三角的真实叉积累加
@@ -637,6 +745,10 @@ export function buildFaceFragments(R) {
       g.setAttribute('aWall', new THREE.Float32BufferAttribute(wl, 1));
       g.setAttribute('aCrackU', new THREE.Float32BufferAttribute(cu, 1));
       g.setAttribute('aCrackAz', new THREE.Float32BufferAttribute(ca, 1));
+      /* v5.31b：aTop = 1 只给顶面。用途：20 阈值的前沿亮折线**只画在顶面** ——
+       * 原来它同时画在顶面 + 底面 + 环向侧壁（那些侧壁 aCrackU 是常数，整面墙会
+       * 一次性点亮）⇒ 一条细线变成 2~3 px 宽的三层亮带 = 用户说的"笔刷痕迹"。 */
+      g.setAttribute('aTop', new THREE.Float32BufferAttribute(tp, 1));
       return { geo: g, area: area2, radial: rTyp };
     };
 
@@ -649,7 +761,9 @@ export function buildFaceFragments(R) {
         const a0 = B[i];
         const a1 = i === B.length - 1 ? B[0] + TAU : B[i + 1];
         const made0 = mkSolid(bi, a0, a1);
-        made.push({ ...made0, band: bi, azimuth: norm((a0 + a1) * 0.5), idx: i, seq: shardSeq++ });
+        made.push({ ...made0, band: bi, azimuth: norm((a0 + a1) * 0.5), idx: i, seq: shardSeq++,
+          /* v5.31：前沿柱面要用到本片的方位/半径区间（柱面只在这段区间内存在） */
+          a0, a1, lo: bands[bi], hi: bands[bi + 1] });
       }
     }
     const maxArea = Math.max(...made.map((m) => m.area));
@@ -680,11 +794,22 @@ export function buildFaceFragments(R) {
       const shardSeed = det(m.seq * 12.9898 + 3.17);
       m.geo.setAttribute('aShard',
         new THREE.Float32BufferAttribute(new Float32Array(nVert).fill(shardSeed), 1));
+      /* v5.31：前沿柱面几何（参数化，真实位置由顶点着色器按当前前沿复算）。
+       * 与本体碎块共用同一材质 ⇒ 共享 uniforms（u_shell_form 自动同步）、
+       * 共用同一个 shardSeed ⇒ 前沿折线的 seed 与片元 shellVis 完全一致。 */
+      const bandGeo = buildBandGeometry(m.a0, m.a1, shardSeed);
 
       frags.push({
         geo: m.geo,
         faceCenter: center.clone(),
         normal: n.clone(),
+        /* v5.31 前沿柱面：几何 + 本片半径区间（柱面只在这段区间内存在） */
+        bandGeo,
+        bandLo: m.lo,
+        bandHi: m.hi,
+        /* v5.31：warp / facetH 的面级常量 —— 顶点着色器要用它们复算柱面位置 */
+        phi0, apo, sigA: SIG_A, sigT: SIG_T, ph, f1: phF1, f2: phF2, e1, e2,
+        frontSeed,          // v5.31b：前沿折线 seed（**按面统一** —— 柱面才连续）
         band: m.band,
         idx: m.idx,
         faceIdx,

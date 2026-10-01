@@ -52,3 +52,5 @@ playwright-report/
 test-results/
 
 investigation/
+.workbuddy/
+*.bak

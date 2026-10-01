@@ -127,9 +127,15 @@ const LUT_UMAX = 6.0;                                // 偏折角查找表的 u 
 /* ★ 绘制顺序总表（v5.29）—— 改任何一处 renderOrder 都必须回来对着这张表看：
  *   18 bhCore          不透明视界球（唯一写深度的遮挡者）
  *   24 bhPanels        黑洞自身机械面板
- *   29/30/31/32/34     基准面 / 体积核心 / 内壳 / 水晶碎片本体 / 碎片内芯
+ *   29/30/31           基准面 / 体积核心 / 内壳
+ *   32                 水晶碎片本体 / 前沿柱面 / 碎片内芯（★ v5.32：三者同层，见下）
  *   33                 笼框 / 环境粒子
  *   35 FRAG_DEPTH_ORDER 隐形遮挡体（碎片的"只写深度"孪生体）← 夹在这里才有意义
+ * ★ v5.32（用户实测："前后同时有水晶面出来的时候都没有前后遮挡关系"）：
+ *   本体/柱面/内芯原来占 32/33/34 三层，而 three.js 的排序键里 **renderOrder 优先于
+ *   深度** ⇒ 背面那个面的柱面(33)、内芯(34) 永远画在正面那个面的晶体(32) 之后，
+ *   跨面的前后关系被分层压掉。现三者同归 32 ⇒ 12 个面之间恢复按 z 的由远及近排序；
+ *   同面内 z 相同 ⇒ 按 id（创建序 本体→内芯→柱面）稳定排序。
  *   36 bhGrav          测地线透镜环（覆盖度 1，纯替换）
  *   38 bhLens          加色光子环 / 挤压亮弧 / 闪光（必须排在透镜之后）
  * 隐形遮挡体之所以是 35：排在它之前的层一个都不会被影响；排在它之后的只有 36 和 38，
@@ -266,10 +272,17 @@ export const SEAM_FADE_DUR = 0.9;
  * 反向（能量跌回 20 以下）同速收回。 */
 export const SHELL_SHOW_P = 0.20;
 export const SHELL_FORM_DUR = 0.75;
+/* v5.31：前沿行程的**端点**（GLSL 镜像在公共块 SHELL_FRONT_GLSL）。
+ * CPU 侧需要它来判断"前沿正跨过哪几片"→ 只给那几片打开柱面（其余柱面 visible=false）。 */
+export const SHELL_FORM_START = -0.20;
+export const SHELL_FORM_END = 1.35;
 /** 水晶壳前沿的软边宽度（半径占比）与推进缓动指数：1.35 次幂 → 面内可见时长占 63% */
 export const SHELL_FORM_SOFT = 0.14;
 /** 水晶壳前沿自带的一道"脉冲亮边"增益（渐显是"脉冲"，不是单纯淡入） */
-export const SHELL_FORM_EDGE = 2.00;
+/* v5.31b：2.00 → **1.45**（用户："顶面的脉冲线也很粗，都要改细"）。
+ * 与宽度一起降 = 直接降喂给 bloom 的**总能量**（≈峰值 × 宽度）：0.018 → 0.007（约 39%）。
+ * 峰值仍 >1.0 ⇒ 线还是亮、还是锐，只是不再糊成一圈笔触。GLSL 镜像见 FRAG 同名 #define。 */
+export const SHELL_FORM_EDGE = 1.45;
 /* v5.21：**前沿脉冲线的周长补偿** —— 修"脉冲线都到达边缘的时候亮度叠加会闪一下"。
  * crystalBand 是逐像素固定峰值 1.0，而折线的**屏幕弧长 ∝ 前沿半径**（面心处几乎是一个点，
  * 五边形边界处是整圈周长）。于是总光通量随前沿线性增长 → 到边缘时最亮 → 一次过冲闪光，
@@ -561,11 +574,73 @@ float fbm3(vec3 p) {
 }
 `;
 
+/* —— 共享 GLSL：水晶破碎折线（v5.17 全局规则；**v5.31 抽出供 VERT 复用**）——
+ * 为什么必须抽出：v5.31 的前沿柱面（frontier band）要在**顶点着色器**里算出真实
+ * 3D 位置，而它必须落在"碎块可见边缘"上 —— 那条边缘是片元 shellVis 用
+ * crystalSegJitter(az) 逐像素判定的。两边必须跑**同一段 GLSL**（同一个 seed、
+ * 同一条折线）才不会错开；若在 CPU 侧镜像 hash11（fract(sin(p*127.1)*43758.5)），
+ * GPU/CPU 的 sin 舍入差会让伪随机值完全不同 → 柱面与边缘差出好几个像素，
+ * 正是用户反复指出的"两个面之间没有柱面"。故抽成公共块，VERT / FRAG 各注入一份。 */
+/* —— 共享 GLSL：水晶壳渐显前沿的行程端点与折线振幅 ——
+ * v5.31：柱面（VERT）与可见边缘门控（FRAG）必须用**同一组**端点/振幅，
+ * 否则柱面会与边缘错开。JS 侧同名导出见下方 SHELL_FORM_START / SHELL_FORM_END。 */
+const SHELL_FRONT_GLSL = /* glsl */ `
+#define SHELL_FORM_START -0.20   // 前沿起点（<0 → u_shell_form=0 时整壳完全不显示）
+#define SHELL_FORM_END    1.35   // 前沿终点（>1 = 越过五边形边界）
+#define SHELL_J_AMP1      0.055  // 前沿折线：大尺度断裂振幅（半径占比）
+#define SHELL_J_AMP2      0.020  // 前沿折线：小尺度碎屑振幅
+
+/** 前沿抖动：柱面（VERT）与可见边缘（FRAG）**必须跑同一个函数**，否则柱面与顶面亮折线
+ *  会在半径上错开。放在公共块里两边各注入一份。
+ *  ★ 依赖 crystalSegJitter（CRYST_LINE_GLSL）⇒ 注入顺序必须是 CRYST_LINE 在前、
+ *    SHELL_FRONT 在后（VERT 与 FRAG 两边都已按此顺序，见各自注入处）。 */
+float bandFrontJ(float az, float seed) {
+  return crystalSegJitter(az, 7.0, seed) * SHELL_J_AMP1
+       + crystalSegJitter(az, 19.0, seed + 3.7) * SHELL_J_AMP2;
+}
+`;
+
+const CRYST_LINE_GLSL = /* glsl */ `
+float hash11(float p) { return fract(sin(p * 127.1) * 43758.5453); }
+
+/** v5.32：jag 的噪声源 —— **无 sin、只用乘加**（Dave Hoskins 式）。
+ *  为什么必须换掉 hash11：hash11 的 sin 自变量可达 8e4，float32 做参数约简的误差被
+ *  ×43758 放大成完全不同的值 ⇒ GPU 与 CPU 永远不可能一致。而乘加在两边都是 IEEE
+ *  严格舍入 ⇒ CPU 用 Math.fround 逐步模拟即逐位一致（见 dodecaKit.jhash）。
+ *  ★ 只有"必须在 CPU（烘几何）与 GPU（顶点着色器复算）两侧得到同一个值"的量才用它；
+ *  只在 GPU 内部用的（如 crystalSegJitter）继续用 hash11 即可。 */
+float jhash(float p) {
+  p = fract(p * 0.1031);
+  p *= p + 33.33;
+  p *= p + p;
+  return fract(p);
+}
+
+/** 分段随机偏移：把方位切成 segs 段，每段一个随机值，段内线性 → 折线（有尖角）
+ *  ★ v5.32：段号 **按 segs 取模** —— 原来不取模时 az=0（=2π）处 i0 从 segs−1 跳回 0，
+ *    取到两个完全不同的随机数 ⇒ 折线在 az=0 那条经线上出现一次**径向台阶**。
+ *    这正是"柱面看着不连续"的另一半来源（另一半是环带 clamp，见 VERT 柱面段）。 */
+float crystalSegJitter(float az, float segs, float seed) {
+  float a = az * 0.15915494 * segs;            // az/2π × segs
+  float i0 = floor(a);
+  float f0 = fract(a);
+  float s0 = mod(i0, segs);                    // 环绕：2π 处与 0 处取到同一段
+  float s1 = mod(i0 + 1.0, segs);
+  float j0 = hash11(s0 * 1.317 + seed * 11.3);
+  float j1 = hash11(s1 * 1.317 + seed * 11.3);
+  return (mix(j0, j1, f0) * 2.0 - 1.0);        // −1..1，段内线性 = 折线
+}
+`;
+
 /* ------------------------------------------------------------------ *
  *  顶点着色器
  * ------------------------------------------------------------------ */
 const VERT = /* glsl */ `
 precision highp float;
+/* ★ 顺序不能反：SHELL_FRONT_GLSL 里的 bandFrontJ 依赖 CRYST_LINE_GLSL 的
+ * crystalSegJitter（GLSL 要求先声明后使用）。FRAG 侧同样是 CRYST_LINE 在前。 */
+${CRYST_LINE_GLSL}
+${SHELL_FRONT_GLSL}
 uniform vec3 u_cam_forward;      // 世界空间相机朝向（由 CPU 每帧写入）
 /* v5.18：基准面（shellInner）沿面法线抬升 —— 高能态把"包着核心的那层面"顶起来，
  * 才能同时看到面下的内部核心、以及从缝里溢出的高亮。
@@ -624,13 +699,111 @@ attribute float aThick;     // v5.4：该点处晶体板厚度（顶−底）→
 attribute float aWall;      // v5.5：1 = 断裂侧壁（展开后才显现，闭合态隐藏 → 无暗轮廓线）
 attribute float aCrackU;    // v5.5：裂缝轨迹坐标 u = 面内归一化半径（0=面心，1=外缘）
 attribute float aCrackAz;   // v5.5：裂缝轨迹坐标 v = 方位角/2π（供前沿摆动）
+attribute float aTop;       // v5.31b：1 = 顶面（前沿亮折线只画在顶面 —— 见 dodecaKit 注释）
 attribute float aShard;     // v5.11：片级种子（0..1）→ 每片自己的明暗档
 varying float vSeam;
 varying float vRim;
 varying float vThick;
 varying float vWall;
 varying float vShard;
+varying float vTop;        // v5.31b：1 = 顶面（其余几何无 aTop 属性 → 默认 0）
 varying vec2  vCrackUV;
+
+/* ==================== v5.31：前沿柱面（frontier band） ====================
+ * 用户定标（2026-10-01）："水晶碎块面现在的渐显渐隐只是上下两个脉冲面在向外扩张，
+ *   两个面之间并没有侧柱面相连……我要的是一整个水晶碎块在向外扩张的效果，
+ *   而不是上下两个面。"（方案 B：保留连续细线前沿 + 补一层真的前沿柱面。）
+ *
+ * 柱面 = 本片方位区间 × 晶体厚度 [Z0,Z1] 的一张**竖直曲面**，由独立几何提供
+ * （aBand=1 的顶点；其余几何没有这个属性 → 通用属性默认 0 → 行为完全不变）。
+ * 几何里只烘了**参数**（aBandV = 厚度方向 0..1，aCrackAz = 方位/2π），
+ * 真实 3D 位置在这里按"当前前沿"逐顶点复算：
+ *   front = mix(SHELL_FORM_START, SHELL_FORM_END, u_shell_form)
+ *   t     = clamp(front + 折线抖动(az, aShard·3.1), 本片 lo, 本片 hi)
+ * 抖动用的是**与片元 shellVis 同一个 crystalSegJitter、同一个 seed、同一个方位口径**
+ * （公共块 CRYST_LINE_GLSL）⇒ 柱面严格落在"碎块已显现区域"的边界上，
+ * 顶面亮折线 / 柱面 / 已增生块体三者对齐 —— 这才是"从基准面立起来的墙"。
+ *
+ * ★ 为什么半径要 clamp 在本片 [lo,hi]：柱面是本片自己的生长前沿，
+ *   越过 hi 本片已长满（前沿进入外圈），越过 lo 本片还没开始长 —— 两种情况下
+ *   柱面都不该存在（CPU 侧同步用同一判据关掉 mesh.visible）。
+ * ★ 为什么不在 CPU 侧算位置：见 CRYST_LINE_GLSL 块注释（hash11 跨语言不可复现）。 */
+uniform float u_shell_form;      // 前沿行程（与片元同名 uniform，同一份值）
+/* v5.31b：前沿折线的 seed —— **按面统一**（同一面所有碎块共用同一条 j(az) 折线）。
+ * 原来按片（vShard*3.1）会让相邻碎块的柱面在片界出现径向台阶、且出场时刻错开
+ * → 柱面读成断续的笔触。片元侧 shellVis 用同一个值 ⇒ 柱面与可见边缘仍然同源。 */
+uniform float u_front_seed;
+uniform float u_band_phi0;       // 面：边法线起始角
+uniform float u_band_apo;        // 面：内切半径
+uniform float u_band_sigA;       // 面：方位蜿蜒振幅
+uniform float u_band_sigT;       // 面：半径多谐波振幅
+uniform float u_band_ph;         // 面：蜿蜒相位
+uniform float u_band_f1;         // 面：顶面刻面相位 1
+uniform float u_band_f2;         // 面：顶面刻面相位 2
+uniform vec3  u_band_e1;         // 面内正交基（tangent）
+uniform vec3  u_band_e2;         // 面内正交基（bitangent）
+uniform vec3  u_band_n;          // 面法线
+uniform float u_band_lo;         // 本片半径下界
+uniform float u_band_hi;         // 本片半径上界
+uniform float u_band_face;       // v5.32：面号 0..11（jag 的噪声里含 faceIdx 项）
+attribute float aBand;           // 1 = 前沿柱面几何
+attribute float aBandV;          // 柱面厚度方向参数：0 = 底 Z0，1 = 顶 Z1
+varying float vBand;
+varying float vBandV;
+#define BAND_Z0      -0.012      // 与 dodecaKit CRYST_Z0 镜像
+#define BAND_Z1       0.018      // 与 dodecaKit CRYST_Z1(= CRYST_Z0 + CRYST_H 0.030) 镜像
+#define BAND_H         0.030     // 与 dodecaKit CRYST_H 镜像
+#define BAND_FACET_A  0.012      // 与 dodecaKit FACET_A 镜像
+#define BAND_JAG_A    0.016      // 与 dodecaKit JAG_A 镜像
+#define BAND_JAG_T    0.016      // 与 dodecaKit JAG_T 镜像
+#define BAND_JAG_Z    0.003      // 与 dodecaKit JAG_Z 镜像
+#define BAND_NQA      72.0       // 与 dodecaKit NQA 镜像
+#define BAND_NQT      26.0       // 与 dodecaKit NQT 镜像
+#define BAND_NQZ      3          // 与 dodecaKit NQZ 镜像
+#define PENTA_SEG_G   1.25663706 // 2π/5，与 dodecaKit PENTA_SEG 镜像
+
+/** v5.31：dodecaKit 的 rB / warp / facetH 的 GLSL 镜像 ——
+ *  柱面必须落在**本体晶体同一套参数化**上，否则会浮在晶体外面或陷进去。
+ *  三者全是 sin/cos 的解析式（不含 hash）→ 与 JS 侧数值一致（误差 ~1e-6，不可见）。 */
+float bandRB(float a) {
+  float k = floor((a - u_band_phi0) / PENTA_SEG_G + 0.5);      // = Math.round
+  return u_band_apo / max(1e-4, cos(a - u_band_phi0 - k * PENTA_SEG_G));
+}
+vec2 bandWarp(float a, float t) {
+  float bump = 4.0 * t * (1.0 - t);
+  float A = a + u_band_sigA * bump
+    * (sin(t * 3.1 + u_band_ph) * 0.62 + sin(t * 6.9 + u_band_ph * 1.7) * 0.38);
+  float T = t * (1.0 + u_band_sigT * bump
+    * (sin(2.0 * a + u_band_ph * 1.3) * 0.50
+     + sin(3.0 * a + u_band_ph * 2.3) * 0.32
+     + sin(5.0 * a + u_band_ph * 0.7) * 0.18));
+  float r = T * bandRB(A);
+  return vec2(cos(A) * r, sin(A) * r);
+}
+float bandFacetH(float a, float t) {
+  float g = sin(3.0 * a + u_band_f1) * 0.62 + sin(2.0 * a - t * 5.1 + u_band_f2) * 0.38;
+  return floor(g * 2.0 + 0.5) * 0.5 * BAND_FACET_A;   // = Math.round(g*2)/2 * FACET_A
+}
+/* bandFrontJ 已上移到公共块 SHELL_FRONT_GLSL（片元侧的出场包络也要用它）。 */
+
+/** v5.32：dodecaKit jag(a,t,z) 的 GLSL 镜像 —— **柱面必须带这一层**。
+ *  为什么：碎块本体的顶点是 V(a,t,z) = warp(a+jag_a, t+jag_t) + n·(z+jag_z+刻面)，
+ *  而片元的前沿判定用的是**未加 jag 的参数**(rt, az)。少掉这一层，柱面就会与顶面
+ *  亮折线差出 |∂warp/∂a|·0.016 + |∂warp/∂t|·0.016 ≈ 0.008~0.013u（约 2~3px），
+ *  且 jag 是 72×26 的**块化**噪声 ⇒ 每块的偏移方向与大小都不同 ⇒ 读成"这一处对不上"。
+ *  ★ 噪声源用 jhash（无 sin，乘加）—— 只有它能在 CPU 烘几何与 GPU 复算两侧逐位一致。 */
+vec3 bandJag(float a, float t, float z) {
+  float k  = min(float(BAND_NQZ - 1), max(0.0, floor(((z - BAND_Z0) / BAND_H) * float(BAND_NQZ) + 1e-9)));
+  float na = fract(a * 0.15915494);                     // = norm(a)/2π（aCrackAz 已是 norm 过的）
+  float ia = floor(na * float(BAND_NQA) + 1e-9);
+  float it = floor(t * float(BAND_NQT) + 1e-9);
+  float fi = u_band_face;
+  return vec3(
+    BAND_JAG_A * (jhash(ia * 7.13 + it * 3.71 + k * 11.9 + 1.7 + fi * 0.37) - 0.5) * 2.0,
+    BAND_JAG_T * (jhash(ia * 3.29 + it * 9.17 + k * 5.31 + 4.2 + fi * 0.71) - 0.5) * 2.0,
+    BAND_JAG_Z * (jhash(ia * 5.71 + it * 2.13 + k * 7.77 + 8.1 + fi * 1.13) - 0.5) * 2.0
+  );
+}
 void main() {
   vNormalView = normalize(normalMatrix * normal);
   vNormalWorld = normalize(mat3(modelMatrix) * normal);
@@ -648,7 +821,10 @@ void main() {
   vThick = aThick;
   vWall = aWall;
   vShard = aShard;
+  vTop = aTop;
   vCrackUV = vec2(aCrackU, aCrackAz);
+  vBand = aBand;
+  vBandV = aBandV;
   /* v5.18：抬升 + 浮动。只改 gl_Position，**不动 vObjPos** ——
    * 面板/擦除花纹锁在面自身坐标上，面抬起来时花纹跟着走而不是在面上滑动。
    * 浮动幅度乘在 u_lift 上：u_lift=0 时严格归零，闭合态绝不破坏严丝合缝。
@@ -684,6 +860,52 @@ void main() {
   }
   if (aKind > 0.5) {
     _base = mix(normalize(_base) * u_frustum_r, _base, u_sweep);
+  }
+  /* v5.31：前沿柱面 —— 位置/法线在这里按当前前沿复算（几何里只有参数）。
+   * 放在面自旋/棱台扫掠**之后**：柱面不属于基准台，那两个变换对它都无意义
+   * （u_faceRot* 与 u_sweep 在碎块材质里恒为 0，放在其后只是为了保证语义隔离）。 */
+  if (aBand > 0.5) {
+    float frontB = mix(SHELL_FORM_START, SHELL_FORM_END, u_shell_form);
+    float azB = aCrackAz * 6.2831853;              // = 片元侧 vCrackUV.y * 2π
+    float sdB = u_front_seed;                      // = 片元侧同一个 seed（**按面统一**）
+    /* ★ v5.32：半径 **不再 clamp 到本片 [lo,hi]**，只 clamp 到整个面的 [0,1]。
+     * 原来 clamp 到 [lo,hi] 的后果：前沿 front+j(az) 越过本环带外缘后，柱面被**钉在 hi**
+     * 不动，而顶面亮折线已经走到外圈去了 ⇒ "柱面和线没对上"。jitter 幅度 ±0.075、
+     * 环带宽度 ~0.24 ⇒ 约 29% 的渐显时长处在"被钉住"的窗口里。
+     * 现在柱面永远严格落在 t = front + j(az) 上（与片元判定同源），
+     * 本片该不该有墙交给**出场包络**（片元侧用未 clamp 的 tRaw 判定，见 FRAG）。 */
+    float tRawB = frontB + bandFrontJ(azB, sdB);
+    float tB = clamp(tRawB, 0.0, 1.0);
+    float zRawB = mix(BAND_Z0, BAND_Z1, aBandV);
+    /* ★ v5.32：补上 jag —— 与本体 V(a,t,z) 完全同一个映射（见 bandJag 注释）。 */
+    vec3 jB = bandJag(azB, tB, zRawB);
+    float zB = zRawB + jB.z;
+    if (aBandV > 0.999) zB += bandFacetH(azB, tB);  // 顶行贴着顶面刻面 → 与顶面对齐
+    vec2 pwB = bandWarp(azB + jB.x, tB + jB.y);
+    vec3 PB = u_band_e1 * pwB.x + u_band_e2 * pwB.y + u_band_n * zB;
+    _base = PB;
+    /* 法线：面内、垂直于方位切向、朝外（= 断口的朝向）。
+     * 方位切向用 +0.004 rad 的差分（含抖动随方位的变化，不只是 warp 的变化）。 */
+    float azB2 = azB + 0.004;
+    float tRawB2 = frontB + bandFrontJ(azB2, sdB);
+    float tB2 = clamp(tRawB2, 0.0, 1.0);
+    vec3 jB2 = bandJag(azB2, tB2, zRawB);
+    float zB2 = zRawB + jB2.z;
+    if (aBandV > 0.999) zB2 += bandFacetH(azB2, tB2);
+    vec2 pwB2 = bandWarp(azB2 + jB2.x, tB2 + jB2.y);
+    vec3 PB2 = u_band_e1 * pwB2.x + u_band_e2 * pwB2.y + u_band_n * zB2;
+    vec3 tanB = PB2 - PB;
+    vec3 nB = cross(tanB, u_band_n);
+    float lnB = length(nB);
+    vec3 radB = PB - u_band_n * dot(PB, u_band_n);
+    float lrB = length(radB);
+    vec3 outB = lrB > 1e-6 ? radB / lrB : u_band_n;
+    vec3 nrmB = lnB > 1e-6 ? nB / lnB : outB;
+    if (dot(nrmB, outB) < 0.0) nrmB = -nrmB;
+    vObjNrm = nrmB;
+    vNormalView = normalize(normalMatrix * nrmB);
+    vNormalWorld = normalize(mat3(modelMatrix) * nrmB);
+    /* vTanWorld / vBitanWorld 在柱面分支里用不到（片元柱面分支只读 N 与视线方向） */
   }
   vObjPos = _base;   // v-内容2：面自旋后使用旋转坐标 → 刻痕/面板纹路跟随基准台面转动
   vec3 _nrm = normalize(normal);
@@ -758,6 +980,12 @@ uniform float u_hitGain;
  * 0 = 整壳不显示（用户定标："初始0能量时：水晶碎块不显示，仅留外壳基准面包裹住核心"）；
  * ≥1.35 = 整面完全显现。是一条**空间径向**前沿，不是全局淡入。 */
 uniform float u_shell_form;
+/* v5.31b：前沿折线 seed（**按面统一**，与顶点着色器同一份）—— 见 VERT 同名注释 */
+uniform float u_front_seed;
+/* v5.31：前沿柱面的**本片半径区间**（与顶点着色器共用同一份）→ 片元侧据此判定
+ * "前沿是否已进入/离开本片"，决定这堵墙的出场与退场。 */
+uniform float u_band_lo;
+uniform float u_band_hi;
 /* v-穿帮四次修复：下降同步信号（CPU _dropSync 锁存）。碎块 reveal（闭合/展开实心度）
  * 原来只随 u_deploy：等高能态展开到位（deploy=1 → reveal=1 实白）后拉 0，收拢中段
  * deploy 1→0.4 仍保持 reveal=1 → 冰白碎块重叠成"白色片"（用户 2026-09-29 实测，
@@ -785,7 +1013,7 @@ uniform float u_sweep;               // v-内容1：棱台扫掠包络（0=零�
  * 改 JS 常量时必须同步改这里（GLSL 读不到 JS 的 export）。
  * 只用在不需探针 A/B 的地方；需要 A/B 的一律走 uniform（如 u_seam_glow_fade）。 */
 #define SHELL_FORM_SOFT  0.14   // 水晶壳渐显前沿的软边（半径占比）
-#define SHELL_FORM_EDGE  2.00   // 水晶壳渐显前沿自带的脉冲亮边增益（v5.20：线 0.006 太细被抗锯齿抹暗 → 线放到 0.009 + 峰值再补）
+#define SHELL_FORM_EDGE  1.45   // v5.31b：2.00→1.45（用户"顶面脉冲线太粗"）；与 JS 侧 export 镜像，改一边必须改另一边。v5.20 曾因线细被抹暗补到 2.00 —— 现在线宽与峰值**一起**降，削的是 bloom 的总能量
 /* v5.21：与 JS 侧 SHELL_ARC_COMP / WALL_AMP_FLOOR / WALL_VIS_FLOOR 一一对应（改 JS 需同步改这里）。
  * SHELL_ARC_COMP = 前沿折线的周长补偿，防"到达边缘时闪一下"（详见 JS 侧同名常量注释）。 */
 #define SHELL_ARC_COMP   1.15
@@ -797,8 +1025,8 @@ uniform float u_sweep;               // v-内容1：棱台扫掠包络（0=零�
  * 用户要的是"**少量**"—— 起点 0.35，宁可少了再加，不要一上来就糊成一片。
  * 另外拖尾固定用**冰蓝**（不随能量色变暖）：数据 = 冷色，与主视觉的暖色分族。 */
 #define DATA_TRAIL_DUTY  0.26   // 有多少比例的方格真的亮（越小越稀疏）
-#define SHELL_FORM_END   1.35   // 前沿终点（>1 = 越过五边形边界）
-#define SHELL_FORM_START -0.20  // 前沿起点（<0 → u_shell_form=0 时整壳完全不显示）
+/* SHELL_FORM_START / SHELL_FORM_END / SHELL_J_AMP* 已上移到公共块 SHELL_FRONT_GLSL
+ * （v5.31：顶点着色器算柱面位置也要用同一组端点，不能各写一份） */
 /* v5.18：0.038 → 0.018（与 JS export BASE_RING_SIGMA 镜像，改一边必须改另一边） */
 #define BASE_RING_SIGMA  0.011  // 基准面细线环的高斯半宽（"极薄"）
 #define BASE_WIPE_SOFT   0.16   // 基准面擦除前沿软边
@@ -877,6 +1105,11 @@ varying float vThick;       // v5.4：晶体板厚度（顶−底）→ 体积�
 varying float vWall;        // v5.5：1 = 断裂侧壁（展开后才显现）
 varying float vShard;       // v5.11：片级种子 → 每片自己的明暗档
 varying vec2  vCrackUV;     // v5.5：裂缝轨迹坐标 (径向 u, 方位 az/2π)
+/* v5.31：前沿柱面（frontier band）—— 独立几何，1 = 该片元属于柱面。
+ * 其余几何没有 aBand 属性 → 通用属性默认 0 → vBand=0，行为完全不变。 */
+varying float vBand;
+varying float vBandV;       // 柱面厚度方向：0 = 底 Z0，1 = 顶 Z1
+varying float vTop;         // v5.31b：1 = 顶面
 const vec3 KEY_LIGHT_DIR = vec3(15.0, 20.0, 30.0); // 6.3 主键控光方向
 
 /* —— 正十二面体 SDF：12 个面法线（已归一化） —— *
@@ -901,6 +1134,10 @@ float sdDodeca(vec3 p, float r) {
 
 /* —— 3D value noise + fbm（公共块 NOISE_GLSL）—— */
 ${NOISE_GLSL}
+/* —— 水晶破碎折线（公共块 CRYST_LINE_GLSL，与 VERT 同源 —— 见该块注释）—— */
+${CRYST_LINE_GLSL}
+/* —— 水晶壳渐显前沿端点/振幅（公共块 SHELL_FRONT_GLSL，与 VERT 同源）—— */
+${SHELL_FRONT_GLSL}
 
 /* —— 面局部坐标 —— *
  * 之前的「三轴世界网格」在十二面体上只会画出横平竖直的白条和方格子：它跟五边形面
@@ -928,8 +1165,6 @@ float pxLine(float d, float w) {
   return 1.0 - smoothstep(0.0, w, pd);
 }
 
-float hash11(float p) { return fract(sin(p * 127.1) * 43758.5453); }
-
 /* ==================== v5.17：水晶破碎脉冲线（**全局规则**） ====================
  * 用户定标：
  *   "现在水晶壳的不规则脉冲显现的脉冲边缘线太粗，而且看起来雾蒙蒙的，完全不是水晶块
@@ -946,16 +1181,6 @@ float hash11(float p) { return fract(sin(p * 127.1) * 43758.5453); }
  *   ③ **柱体感**：线之后紧跟一条"侧壁暗带"（wallShade），读作从基准面立起来的墙 ——
  *      亮折线（顶面）+ 暗带（侧壁）+ 块体（已增生部分），三者叠起来才有厚度。
  */
-
-/** 分段随机偏移：把方位切成 segs 段，每段一个随机值，段内线性 → 折线（有尖角） */
-float crystalSegJitter(float az, float segs, float seed) {
-  float a = az * 0.15915494 * segs;            // az/2π × segs
-  float i0 = floor(a);
-  float f0 = fract(a);
-  float j0 = hash11(i0 * 1.317 + seed * 11.3);
-  float j1 = hash11((i0 + 1.0) * 1.317 + seed * 11.3);
-  return (mix(j0, j1, f0) * 2.0 - 1.0);        // −1..1，段内线性 = 折线
-}
 
 /** 水晶破碎线的有符号距离：0 = 线上。<0 = 前沿之后（已扫过），>0 = 尚未扫到。
  *  两层折线叠加；amp1/amp2 建议按几何尺度给（如 0.24·R 与 0.09·R）。 */
@@ -1202,6 +1427,64 @@ void main() {
       if (!gl_FrontFacing) N = -N;
       vec3 Vd = normalize(vViewDir);
       float ndv = clamp(dot(N, Vd), 0.0, 1.0);
+
+      /* ==================== v5.31：前沿柱面（真实几何的竖直断面） ====================
+       * 用户定标（2026-10-01）："水晶碎块面现在的渐显渐隐只是上下两个脉冲面在向外扩张，
+       *   两个面之间并没有侧柱面相连……我要的是一整个水晶碎块在向外扩张的效果，
+       *   而不是上下两个面。"
+       * 柱面 = **独立几何**（z ∈ [Z0,Z1] 的一段竖直曲面，顶点位置在 VERT 里按当前前沿
+       * 复算），不是画在顶/底面上的色带 —— v5.20 那种共面色带已被用户两轮否决
+       * （"我怀疑你把柱面加到了那个贴片上面的那个面上"）。
+       * 读法正是 v5.17 用户自己定下的三件套：亮折线（顶面）+ 墙（本柱面）+ 已增生块体。
+       * ★ 它**不吃**本体那三道门控（shellVis / reveal / wallVis）—— 那三道正是"柱面被
+       *   抹成 0"的根因：v5.21 只给它们加了下限，没有补上柱面本身。柱面自带出场包络。 */
+      if (vBand > 0.5) {
+        float frontB = mix(SHELL_FORM_START, SHELL_FORM_END, u_shell_form);
+        /* ★ v5.32：包络判据改回 **tRaw = front + j(az)**（未 clamp 的真实前沿半径），
+         * 而且过渡带收窄到 ±0.004 —— 这两条必须一起改，缺一条都会留缺陷：
+         * ① 为什么必须用 tRaw：v5.32 起柱面的**位置**就是 tRaw（不再 clamp 到 [lo,hi]），
+         *    判据若仍用 frontB，就会出现"墙画在某个半径、而这个半径上的墙该不该有
+         *    却是按另一个量判的" ⇒ 墙的存在范围与墙的位置不同源（v5.31b 的错位根因）。
+         * ② 为什么过渡带要窄：tRaw 随方位起伏 ±0.075，用宽过渡（v5.31 的 0.08）会
+         *    让同一圈上"抖动小的一端已全亮、抖动大的一端还没进场" ⇒ 一圈墙明暗不均。
+         *    收窄到 ±0.004（约 1px）后，交接只发生在**极窄的一条半径带**上，
+         *    而相邻两环在这个半径上是**共位**的（都在 tRaw），内环淡出与外环淡入互补
+         *    ⇒ 合成 alpha 最低 0.75、且只持续约 1px，肉眼不可见。
+         *    同时"整圈同时进出"的观感保住了：浓度由 tRaw 定，抖动只影响形状。 */
+        float azB = vCrackUV.y * 6.2831853;          // 与 VERT 的 aCrackAz 同一口径
+        float tRawB = frontB + bandFrontJ(azB, u_front_seed);
+        float inB     = smoothstep(0.03, 0.14, u_shell_form);                       // 整体起动
+        float ownIn   = smoothstep(u_band_lo - 0.004, u_band_lo + 0.004, tRawB);    // 前沿进入本圈
+        float ownExit = 1.0 - smoothstep(u_band_hi - 0.004, u_band_hi + 0.004, tRawB); // 前沿离开本圈
+        float envB    = inB * ownIn * ownExit;
+        float lamB  = clamp(dot(N, normalize(KEY_LIGHT_DIR)), 0.0, 1.0);
+        /* ★ v5.31b：柱面改成**暗带** —— 用户 v5.17 自己定下的规格就是
+         *   "亮折线（顶面）+ **暗带（侧壁）** + 块体（已增生部分），三者叠起来才有厚度"。
+         * 上一轮我把它做成亮面（本体峰值 ~1.1 + 顶部 0.70 高光）→ 紧贴顶面亮折线下方
+         * 又多出一整条亮带 ⇒ 前沿整体被加宽一倍、越过 bloom 阈值糊成软笔触
+         * （用户："脉冲线太粗了，可以明显看到像是笔刷的痕迹"）。
+         * 现在：颜色压到"断口微反光"档（≤0.55，绝不触发 bloom），
+         * 但 **alpha 保持 0.62~0.92** ⇒ 它靠**遮挡**（把身后的基准面/块体压暗）
+         * 读作一堵立起来的墙，而不是靠发光。厚度 = 亮线与暗墙的对比。 */
+        float litB  = 0.09 + 0.16 * lamB + 0.13 * ndv;
+        float gradB = 0.55 + 0.45 * vBandV;    // 顶稍亮、底更暗（底插进基准面）
+        vec3 wallCol = mix(frost, vec3(0.82, 0.93, 1.0), 0.45);
+        /* 顶边只留**极弱**的过渡（不再是亮线）—— 让顶面亮折线自然落在墙顶上，
+         * 不再额外增加一条像素级的亮带（那正是"笔刷"观感的来源之一）。 */
+        vec3 pulseColB = mix(u_emissive_color, vec3(0.82, 0.93, 1.0), 0.45);
+        float topB = pow(vBandV, 6.0);
+        vec3 cB = wallCol * litB * gradB
+                + pulseColB * topB * 0.16 * (0.45 + 0.55 * lamB);
+        /* 安全钳：柱面峰值压在 bloom(1.0) 的**一半以下** —— 它不许发光，只许遮挡。 */
+        float _lb = max(max(cB.r, cB.g), cB.b);
+        if (_lb > 0.55) cB *= 0.55 / _lb;
+        /* 预乘混合：c 与 alpha **必须同乘**（只乘 alpha → 背后的基准面亮层透出来
+         * 补偿掉自发光，实测"变淡"反而更亮 —— G2 已证）。 */
+        float aB = clamp(0.62 + 0.20 * ndv + 0.14 * vBandV, 0.0, 0.92);
+        gl_FragColor = vec4(cB * envB, aB * envB);
+        return;
+      }
+
       float fres = 0.05 + 0.95 * pow(1.0 - ndv, 4.0);
 
       // ① 表面反射（环境灯带在棱面上的锐利成像）
@@ -1431,7 +1714,9 @@ void main() {
       float azF = vCrackUV.y * 6.2831853;
       float shellFront = mix(SHELL_FORM_START, SHELL_FORM_END, u_shell_form);
       // 两层折线：大尺度断裂 0.055 + 小尺度碎屑 0.020（面内归一化半径）
-      float sdShell = crystalLineSDF(rt, azF, shellFront, vShard * 3.1, 0.055, 0.020);
+      /* v5.31b：seed 由"按片 vShard*3.1"改为**按面统一 u_front_seed** —— 见 §v5.31b 注释。
+       * 同一面共用一条折线 ⇒ 柱面在碎块边界不再有径向台阶。 */
+      float sdShell = crystalLineSDF(rt, azF, shellFront, u_front_seed, 0.055, 0.020);
       // 前沿判定：几乎硬边（±0.012 抗锯齿）—— 不再是 ±0.14 的软过渡（那正是"雾气"来源）
       float shellVis = smoothstep(0.012, -0.012, sdShell);
       /* 顶面亮折线（脉冲线本体）：v5.18 0.022→0.011，**v5.19 再收到 0.006**。
@@ -1454,16 +1739,30 @@ void main() {
       float shellFront01 = clamp(shellFront, 0.0, 1.0);
       float shellArc  = 1.0 / (1.0 + SHELL_ARC_COMP * shellFront01);
       float shellExit = 1.0 - smoothstep(0.78, 1.06, shellFront);
-      float shellLine = min(crystalBand(sdShell, 0.009), 1.0)
-        * smoothstep(0.03, 0.14, u_shell_form) * shellExit;
+      /* v5.31b：线宽 0.009 → **0.005**（用户："顶面的脉冲线也很粗，都要改细"）。
+       * 为什么同时降**宽度与峰值**：这条线在屏幕上是亚像素宽（0.009 半径 ≈ 0.4 px），
+       * 真正的"粗"来自 **bloom 的扩散**（能量 ∝ 峰值 × 宽度）。只降宽度会把它抹暗、
+       * 只降峰值会让它失去锐度 —— 两个一起降（0.018 → 0.007，约 39%）才既不糊也不暗。
+       * 峰值降到 1.45 仍 >1.0 ⇒ 线仍然发光、仍然锐。 */
+      /* ★ v5.31b：亮折线**只画在顶面**（vTop），并且**不画在断裂侧壁上**（1 - vWall）。
+       * （GLSL 注释里禁止裸反引号 —— 会截断模板字符串，本项目已踩 5 次。）
+       * 原来它同时出现在 顶面 / 底面 / 环向侧壁 —— 环向侧壁的 aCrackU 是常数 lo/hi，
+       * 整面墙会在前沿跨过的那一帧**一次性点亮**；底面那条又与顶面那条只差
+       * CRYST_H=0.030u（侧向看 2~3 px）。三层叠起来就是用户说的"像笔刷的痕迹"。
+       * 现在只有顶面一条细线，厚度感交给下面那堵（暗的）前沿柱面去表达。 */
+      float shellLine = min(crystalBand(sdShell, 0.005), 1.0)
+        * smoothstep(0.03, 0.14, u_shell_form) * shellExit * vTop * (1.0 - vWall);
       /* v5.18：往内的数据流拖尾。内侧 = 面心方向 = sdShell < 0 的那一侧。
        * v5.19：方格尺寸 0.055→**0.032**、拖尾长度 0.26→**0.17** —— 用户说"数据细尾本身
        * 还是过粗了"，细尾要能读作"细流"而不是一片方格地毯。 */
       /* v5.21：拖尾同样要周长/面积补偿 —— 它铺开的是**面积**（∝ front²），比线更容易
        * 在"前沿抵达边缘、整个面都被铺满"的那一刻冲到峰值。故按 shellArc² 收（比线更狠），
        * 读作"数据流随前沿推远而退去"，而不是一张越铺越亮的地毯。同样用 min(..,1.0) 封顶。 */
+      /* v5.31b：拖尾同样收进顶面、排除侧壁（与亮折线同一口径 —— 侧壁上的
+       * sdShell 是常数，整面墙会铺满方格，那是"地毯"不是"细流"）。 */
       float shellTrail = min(dataTrail(-sdShell, azF * 2.5, 0.032, 0.50, vShard * 9.1, 0.17, DATA_TRAIL_DUTY), 1.0)
-        * smoothstep(0.03, 0.14, u_shell_form) * shellExit * shellArc * shellArc;
+        * smoothstep(0.03, 0.14, u_shell_form) * shellExit * shellArc * shellArc
+        * vTop * (1.0 - vWall);
       /* ★ v5.20：这里原来（v5.19）是 float shellWall = crystalWall(sdShell, 0.045);
        * —— 一个**面内环带**，然后当作"柱面"加色。用户第二轮实测直接指出：
        *   「柱面还是没有显现。我怀疑你把柱面加到了那个贴片上面的那个面上，
@@ -3049,7 +3348,26 @@ export class L5Core {
         u_hitP: { value: new THREE.Vector3(0, 0, 0) },
         u_hitT: { value: -1.0 },
         u_hitR: { value: 0.1 },
-        u_hitGain: { value: HIT_LINE_GAIN }
+        u_hitGain: { value: HIT_LINE_GAIN },
+        /* v5.31：前沿柱面的面级常量（warp 的振幅/相位、facetH 的相位、面内正交基、
+         * 面法线）与**本片半径区间** —— 建片时写死，逐帧不变（位置由 VERT 自己算）。 */
+        u_band_phi0: { value: f.phi0 },
+        u_band_apo: { value: f.apo },
+        u_band_sigA: { value: f.sigA },
+        u_band_sigT: { value: f.sigT },
+        u_band_ph: { value: f.ph },
+        u_band_f1: { value: f.f1 },
+        u_band_f2: { value: f.f2 },
+        u_band_e1: { value: f.e1 },
+        u_band_e2: { value: f.e2 },
+        u_band_n: { value: f.normal },
+        u_band_lo: { value: f.bandLo },
+        u_band_hi: { value: f.bandHi },
+        /* v5.32：面号 —— 柱面要复算与本体**完全相同**的 jag(a,t,z)，
+         * 而 jag 的噪声里含 faceIdx 项，必须作为 uniform 传进去。 */
+        u_band_face: { value: f.faceIdx },
+        /* v5.31b：前沿折线 seed（按面统一 —— 同一面的所有碎块同值） */
+        u_front_seed: { value: f.frontSeed }
       });
       const fMat = this._shellMaterial(fUniforms);
       const mesh = new THREE.Mesh(f.geo, fMat);
@@ -3058,7 +3376,17 @@ export class L5Core {
       mesh.position.copy(f.faceCenter);
       const core = new THREE.Mesh(f.geo, this.fragCoreMaterial);
       core.name = 'L5_FragCore';
-      core.renderOrder = 34;          // 本体(32)之后画：内芯叠在晶体表面之下
+      /* ★ v5.32：renderOrder 与本体**同为 32**，不再占 34。
+       * 原因（用户实测："前后同时有水晶面出来的时候都没有前后遮挡关系"）：
+       * three.js 的排序键是 (groupOrder, renderOrder, z, id) —— **renderOrder 优先于
+       * 深度**。把本体/柱面/内芯压成 32/33/34 三层后，"背面那个面"的柱面(33)与内芯(34)
+       * 就**永远**画在"正面那个面"的晶体(32)之后 ⇒ 跨面的前后关系被分层彻底压掉，
+       * 背面的墙和内芯会直接透到正面的晶体上面 —— 这正是"没有遮挡关系"的成因。
+       * 三者同为 32 ⇒ 排序退化为按 z（物体原点的视深度）⇒ 12 个面之间恢复正确的
+       * 由远及近顺序；同面内三者 z 相同 ⇒ 再按 id（= 创建序：本体 → 内芯 → 柱面）稳定排序。
+       * 注意：内芯现在排在柱面**之前**（原来 34 在 33 之后）。内芯是缩到 0.86 的体内层，
+       * 与前沿柱面几乎不共位，这个次序变化不可见。 */
+      core.renderOrder = 32;
       core.scale.setScalar(0.86);     // 相对面心缩小 → 藏在晶体体内
       mesh.add(core);
       /* v5.29：**隐形遮挡体（invisible occluder / depth mask）** —— 让"洞前的碎片"能真正
@@ -3082,8 +3410,27 @@ export class L5Core {
       twin.visible = false;
       mesh.add(twin);
       this.fragTwins.push(twin);
+      /* v5.31：**前沿柱面（frontier band）** —— 20 阈值渐显时前沿处的**竖直断面**，
+       * 把顶面与底面连起来（用户："两个面之间并没有侧柱面相连"）。
+       * · 与本体**同材质** ⇒ 共享 uniforms（u_shell_form 自动同步），且不需要 CPU
+       *   每帧回写顶点（位置在 VERT 里按前沿复算）；
+       * · 与本体**同几何参数化**（同一个 warp / facetH / 面内正交基）⇒ 柱面严格贴在
+       *   碎块可见区域的边界上，不会浮在晶体外面；
+       * · 默认 visible=false —— 只有前沿正跨过本片时才打开（见 sync 的 u_shell_form 段）；
+       * · ★ v5.32：renderOrder 33 → **32**（与本体同层，理由见 core 的注释：
+       *   分层会压掉跨面的深度排序，背面的墙会透到正面的晶体上面）；
+       * · frustumCulled=false：顶点位置由 shader 决定，包围球无意义。 */
+      const band = new THREE.Mesh(f.bandGeo, fMat);
+      band.name = 'L5_FragFrontBand';
+      band.renderOrder = 32;
+      band.frustumCulled = false;
+      band.visible = false;
+      mesh.add(band);
       this.group.add(mesh);
-      return { ...f, mesh, core, mat: fMat, stored: 0, impactW: 0 };
+      /* ★ 字段名必须是 bandMesh：**f.band 已经是"环带序号 0..3"**（v5.23 起
+       * `f.band === 3` 用来挑"每个面最外一圈碎片"给粒子吸附）。若这里也叫 band，
+       * 展开对象会把它覆盖成 mesh → f.band === 3 永远为假 → 吸附环整条失效。 */
+      return { ...f, mesh, core, bandMesh: band, mat: fMat, stored: 0, impactW: 0 };
     });
 
     /* Phase1e：外缘环吸附目标 —— 粒子只撞"每个面边缘的那一环碎片"（轮廓线把面分成的环）。
@@ -3814,6 +4161,19 @@ export class L5Core {
     this._shellT = THREE.MathUtils.clamp(
       this._shellT + (wantShell ? dt : -dt) / SHELL_FORM_DUR, 0, 1);
     this.uniforms.u_shell_form.value = this._shellT;
+    /* v5.31：**前沿柱面的开/关** —— 只有前沿正跨过本片的那几片才画柱面。
+     * 判据与顶点着色器里的 clamp(front + 抖动, lo, hi) 同源：
+     *   front + 抖动 < lo → 本片还没开始长；> hi → 本片已长满（前沿进到外圈）。
+     * 抖动幅度最大 0.055+0.020 = 0.075 → 窗口两端各放宽 0.08，避免"柱面被 clamp 在
+     * 内/外边界上又还没关掉"的那一两帧露馅。
+     * 只在 _shellT 变化（正在渐显/渐隐）时才动；静止态（0 或 1）零开销。 */
+    if (this._bandT !== this._shellT) {
+      const frontB = SHELL_FORM_START + (SHELL_FORM_END - SHELL_FORM_START) * this._shellT;
+      for (const f of this.fragments) {
+        f.bandMesh.visible = frontB > f.bandLo - 0.08 && frontB < f.bandHi + 0.08;
+      }
+      this._bandT = this._shellT;
+    }
 
     /* —— v5.16：基准面「细线环脉冲 + 擦除式半隐」状态机 ——
      * 触发条件是**跨越 0.80 阈值的那一帧**（不再是"p≥0.80 就一直循环"）：
@@ -5322,7 +5682,10 @@ export class L5Core {
   }
 
   dispose() {
-    this.fragments.forEach((f) => f.geo.dispose());   // 本体与内芯层共享同一几何，释放一次即可
+    this.fragments.forEach((f) => {
+      f.geo.dispose();      // 本体与内芯层共享同一几何，释放一次即可
+      f.bandGeo.dispose();  // v5.31：前沿柱面几何（独立一份）
+    });
     // v5.21e：棱线光导管 L5_Rods_Core 已整体移除，不再参与 dispose
     [this.coreMesh, this.shellInner, this.cage, this.cageGhost,
       this.fieldGlow].forEach((m) => m.geometry.dispose());
