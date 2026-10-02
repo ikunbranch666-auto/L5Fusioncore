@@ -767,6 +767,13 @@ float crystalSegJitter(float az, float segs, float seed) {
  * ------------------------------------------------------------------ */
 const VERT = /* glsl */ `
 precision highp float;
+/* ★★ v5.41 性能：顶点侧需要 fbm3 —— 把晶体本体那两个 fbm3 的**逐像素**求值上移到
+ *   顶点侧（逐顶点求值 → varying 插值）。为什么可以这么做：两条噪声的自变量只含
+ *   vObjPos 与 u_time，而 vObjPos 在每个顶点上就是 main() 里的 _base（片元侧读到的
+ *   不过是它的插值值），所以顶点侧的值与片元侧的场**同源同尺度**，只差采样密度。
+ *   NOISE_GLSL 与 CRYST_LINE_GLSL 无交叉依赖（hash13/vnoise/fbm3 对 hash11/jhash/
+ *   crystalSegJitter），注入顺序随意。 */
+${NOISE_GLSL}
 /* ★ 顺序不能反：SHELL_FRONT_GLSL 里的 bandFrontJ 依赖 CRYST_LINE_GLSL 的
  * crystalSegJitter（GLSL 要求先声明后使用）。FRAG 侧同样是 CRYST_LINE 在前。 */
 ${CRYST_LINE_GLSL}
@@ -804,12 +811,22 @@ uniform vec4 u_faceRotB;   // 面 4..7
 uniform vec4 u_faceRotC;   // 面 8..11
 attribute float aFaceIdx;
 #define BASE_FLOAT_FREQ 1.9      // 浮动角频率（rad/s）
-/* 面级种子：与片元侧 hash13 同构，但 VERT 不注入 NOISE_GLSL，故自带一份 */
+/* 面级种子：与片元侧 hash13 同构。★ v5.41 起 VERT 也注入了 NOISE_GLSL（顶点侧要用
+ * fbm3），这份 vertHash13 与 hash13 逐字相同 —— 换成 hash13 数值完全一样，这里仍然
+ * 留着它，只是不想让"面相位种子"的正确性依赖公共块的注入顺序这种别处的决定。 */
 float vertHash13(vec3 p) {
   p = fract(p * 0.3183099 + vec3(0.11, 0.17, 0.13));
   p *= 17.0;
   return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
 }
+/* v5.41：顶点侧那两个 fbm3 只有晶体**本体**需要 —— 内芯层（u_core_layer=1）在片元里
+ * 1509→1580 就提前返回了，根本不读这两条噪声 ⇒ 给它一道跳过门，省掉 285 片内芯
+ * （约 8 万顶点/帧）的重复求值。
+ * ★ 方向必须写成"核心层才跳过"：本体材质的 uniform 表里**没有** u_core_layer
+ *   （全项目只有主表 3102 与 fragCoreMaterial 3548 两处）⇒ GL 取默认 0 ⇒ 照常计算。
+ *   反过来写（"非本体才计算"）一旦某材质缺这个 uniform，噪声会被静默清零 ——
+ *   那是会改变观感的失败方向；现在这个写法最坏情况只是白算。 */
+uniform float u_core_layer;
 varying vec3 vNormalView;
 varying vec3 vNormalWorld;
 varying vec3 vObjNrm;        // 物体空间法线 = 五边形面法线
@@ -838,6 +855,11 @@ varying float vWall;
 varying float vShard;
 varying float vTop;        // v5.31b：1 = 顶面（其余几何无 aTop 属性 → 默认 0）
 varying vec2  vCrackUV;
+/* ★ v5.41：顶点侧求值的晶体噪声（x = σ 包裹体场 fbm3(vObjPos·7.3+11)，
+ *   y = 星云场 fbm3(vObjPos·3.1 + 时间漂移)）。求值点在 main() 末尾（vObjPos = _base
+ *   之后），使用点在 FRAG 的 sigma 与 neb（基准面分支那条**故意不同源**，理由见末尾长注释）。
+ *   2 个 float ⇒ 不增加 varying 槽数（34 → 36 float，都是 9 个 vec4）。 */
+varying vec2  vCrystalNoise;
 
 /* ==================== v5.31：前沿柱面（frontier band） ====================
  * 用户定标（2026-10-01）："水晶碎块面现在的渐显渐隐只是上下两个脉冲面在向外扩张，
@@ -1038,6 +1060,54 @@ void main() {
     /* vTanWorld / vBitanWorld 在柱面分支里用不到（片元柱面分支只读 N 与视线方向） */
   }
   vObjPos = _base;   // v-内容2：面自旋后使用旋转坐标 → 刻痕/面板纹路跟随基准台面转动
+  /* ★★ v5.41 性能（本轮主角）★★
+   * 把 FRAG 里那两次 fbm3 的求值搬到这里 —— 从"每像素"变成"每顶点 + 插值"。
+   *
+   * 为什么这是本项目到目前为止最大的一条性能改动（依据 = v5.39 全谱消融实测）：
+   *  · fbm3 = 3 octave × vnoise，每个 vnoise = 8 次 hash13 + 7 次 mix + floor/fract
+   *    ⇒ 单次 fbm3 ≈ 210 条 ALU。晶体本体分支原本在**每个像素**上跑两次 ≈ 420 条。
+   *  · 消融实测：把 570 个晶体网格的 FRAG 换成一行空实现，帧耗时 p50 765 → 281ms
+   *    （同一 12s 窗口内帧数 13 → 29）；而整棵子树隐藏 = 279ms ⇒ **晶体成本 100%
+   *    在片元 ALU/填充**。同一轮里把 VERT 也换成一行只有 308ms（落在噪声内）
+   *    ⇒ 顶点侧是"免费"的一侧，片元侧是"最贵"的一侧。这次改动就是把 420 条 ALU
+   *    从最贵的一侧搬到免费的一侧。
+   *  · 代价：每顶点 +~420 条 ALU（每片四网格 ≈ 960 顶点 × 285 片 ≈ 27 万顶点/帧
+   *    ≈ +1.1 亿条）；收益：每**像素** −~420 条（碎块覆盖面积 × 前后多层叠加，
+   *    在"碎块占据几百像素以上"的任何视角都是数十倍净赚）。
+   *
+   * 为什么插值看不出区别（三条都实测/实算过，不是手感）：
+   *  ① 片几何是 dodecaKit 烘的**非索引密集网格**（每片约 430 顶点 / 575 三角），
+   *     顶点间距 ~0.02u；
+   *  ② σ 场最低 octave 的格子 = 1/7.3 = 0.137u、最高 = 0.032u，而片直径约 0.37u
+   *     ⇒ 顶点间距比**最小**格子还密 ⇒ 插值最多平滑掉最高 octave（幅度占比 1/7 ≈ 14%）；
+   *  ③ 那 14% 只作用在"±31% 的 σ 扰动"上，而 σ 只影响 Beer–Lambert 的
+   *     absorb = exp(−σ·path)：实算 path ≈ vThick/0.7 ≈ 0.043、σ ≈ 3.9~7.3
+   *     ⇒ absorb 只在 0.84 ↔ 0.73 之间摆动，再乘 0.52·u_body_gain ⇒ 对本体色的
+   *     影响不到 1%（远低于 bloom 与 facetGain 的量级）。
+   *  ④ 星云项本身幅度 ≤0.07（innerCol · neb · (0.02+0.05·pC)），比 σ 更小。
+   *
+   * 为什么"板材路径"里那条同名 fbm3（FRAG 现 2222 行附近）**故意没有搬**：
+   *   ① 按当前 uniform 预设它**根本不可达** —— 进那一段需要"u_shell_id∈(0.5,1.5) 且
+   *      u_petal>0.5"，而全项目 u_petal>0.5 的材质只有裂片本体（3555，u_core_layer=0）
+   *      与内芯层（3624，u_core_layer=1）：前者在晶体分支末尾（现 2101 行）就 return，
+   *      后者在内芯分支（1580）就 return；真正走板材路径的是基准面 u_petal=0.35（3570），
+   *      而 coreMaterial（u_petal=0.0 / u_shell_id 继承主表 0.0）连整个壳分支都不进。
+   *   ② 就算将来被启用，那条路径的几何也太稀疏（基准面 108 顶点 / 棱台 420 顶点，
+   *      每面 9~35 个 ⇒ 顶点间距 ~0.4u ≫ 最小格子 0.032u），插值会把星云糊成
+   *      "每面一个平缓渐变"。
+   *    ⇒ 不执行 + 搬了有风险：原样不动。
+   *
+   * 位置：必须放在 vObjPos = _base 之后 —— _base 在柱面几何里被复算成真实前沿位置
+   * （1016 行），面自旋（986）与棱台扫掠（991）也都已作用于它 ⇒ 顶点侧的 _base 与
+   * 片元侧读到的 vObjPos 逐位同源，柱面几何自动一致。 */
+  if (u_core_layer > 0.5) {
+    vCrystalNoise = vec2(0.0);
+  } else {
+    vCrystalNoise = vec2(
+      fbm3(_base * 7.3 + 11.0),
+      fbm3(_base * 3.1 + vec3(u_time * 0.08, -u_time * 0.13, u_time * 0.05))
+    );
+  }
   vec3 _nrm = normalize(normal);
   vec3 _seedN = (aKind > 0.5) ? normalize(aLiftN) : _nrm;
   float _fseed = vertHash13(floor(_seedN * 16.0 + 0.5));
@@ -1273,6 +1343,12 @@ varying float vThick;       // v5.4：晶体板厚度（顶−底）→ 体积�
 varying float vWall;        // v5.5：1 = 断裂侧壁（展开后才显现）
 varying float vShard;       // v5.11：片级种子 → 每片自己的明暗档
 varying vec2  vCrackUV;     // v5.5：裂缝轨迹坐标 (径向 u, 方位 az/2π)
+/* ★ v5.41：下面这两条噪声不再在这里逐像素求值 —— 改由 VERT 逐顶点求值后插值送入
+ *   （x = σ 包裹体场 fbm3(vObjPos·7.3+11)，y = 星云场 fbm3(vObjPos·3.1+时间漂移)）。
+ *   搬移的理由、收益、以及"为什么插值看不出区别"：见 VERT main() 末尾的长注释。
+ *   ★ 必须与 VERT 侧同名同类型声明 —— 缺了这一行，FRAG 引用未声明的 varying，
+ *     整个 program 编译失败（不是变色，是整屏消失），故改名/移动时两边必须同时改。 */
+varying vec2  vCrystalNoise;
 /* v5.31：前沿柱面（frontier band）—— 独立几何，1 = 该片元属于柱面。
  * 其余几何没有 aBand 属性 → 通用属性默认 0 → vBand=0，行为完全不变。 */
 varying float vBand;
@@ -1690,7 +1766,11 @@ void main() {
       // 与橙色构造体互补撞色。现在透射只是"略偏冷的白"，色相留给能量色去染。
       // v5.11：吸收加强（2.6→4.2）并叠加低频包裹体噪声 —— 薄片也能读出厚薄与杂质，
       // 否则薄棱片的透射几乎处处相同 → 一整片没有结构的亮面。
-      vec3 sigma = vec3(1.55, 1.30, 1.05) * 4.2 * (0.72 + 0.62 * fbm3(vObjPos * 7.3 + 11.0));
+      /* v5.41：fbm3(vObjPos·7.3 + 11) 已上移到 VERT（逐顶点求值 + 插值）。
+       * 这是**静态场**（自变量只有 vObjPos，与时间无关）⇒ 值同源同尺度，只是采样密度
+       * 从"每像素"变成"每顶点"。消融依据：这一条 fbm3 与下面那条星云合计 ≈420 条 ALU/像素，
+       * 按 v5.39 全谱消融（570 网格 FRAG 换空实现：p50 765→281ms）约占晶体片元成本 60%。 */
+      vec3 sigma = vec3(1.55, 1.30, 1.05) * 4.2 * (0.72 + 0.62 * vCrystalNoise.x);
       vec3 absorb = exp(-sigma * path);
       // 碎片恒为冷却冰蓝调（frost，已在函数级作用域声明），不再随全局暖色 u_emissive_color 漂移 —— 它是吸收冷却能量的结构
       vec3 tint = frost;
@@ -1871,8 +1951,11 @@ void main() {
       // 强度压在"染色"而不是"发光"档：过强会把水晶和构造体一起冲进白区（实测翻车）。
       c += u_emissive_color * pow(1.0 - ndv, 3.5) * (0.10 + 0.20 * pC) * (0.40 + 0.25 * u_deploy);   // 恢复边光能量色（结构冷、能量暖）
       // 轻微星云气流（保留 v5.2 需求，强度压低 —— 主体交给光学）
-      vec3 np = vObjPos * 3.1 + vec3(u_time * 0.08, -u_time * 0.13, u_time * 0.05);
-      float neb = smoothstep(0.30, 0.88, fbm3(np));
+      /* v5.41：星云场的 fbm3 也已上移到 VERT（vCrystalNoise.y），这里只保留映射本体。
+       * ★ 板材路径里那条**同名**星云（现 2222 行，np = vObjPos·3.1 + 同一时间项）原样不动：
+       *   按当前 uniform 预设它不可达（u_petal>0.5 的材质都在更早的 return 里出去了，
+       *   见 VERT 末尾注释的穷举），且那条路径的几何太稀疏、插值会糊成平缓渐变。 */
+      float neb = smoothstep(0.30, 0.88, vCrystalNoise.y);
       c += innerCol * neb * (0.02 + 0.05 * pC) * (0.35 + 0.65 * eN) * facetGain;
 
       /* ==================== v5.16：20 阈值「水晶壳由面心向外不规则脉冲渐显」 ====================
