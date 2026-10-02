@@ -5658,7 +5658,30 @@ export class L5Core {
 
   /** 视觉增强总开关：false → 回退到规格字面渲染 */
   setEnhancements(on) {
-    this.coreMaterial.uniforms.u_vol_steps.value = on ? 32 : 0;
+    /* ★★ v5.40 性能修复：**核心外壳上那段"算完就丢"的 32 步射线步进** ★★
+     *
+     * 旧代码：`this.coreMaterial.uniforms.u_vol_steps.value = on ? 32 : 0;`
+     *
+     * 为什么它是纯浪费（本轮逐行复核，不是推测）：
+     *  · `coreMaterial` 的 `u_core_shell = 1.0`（构造于上方约 3200 行，**全项目无第二个写入者**
+     *    —— `u_core_shell.value` 只出现在构造里，同步/调参/tune 通道都不碰它）；
+     *  · `coreMaterial` 自己的 `u_vol_steps` 构造值就是 **0**，注释写着"双保险：壳体分支之前
+     *    旧等离子分支直接跳过"—— 意图正确，但下面这行把它**改回了 32**（`setEnhancements(true)`
+     *    是默认状态 ⇒ 实际永远是 32）；
+     *  · FRAG 的执行顺序（相对行号）：`main` → 1217 `if (u_vol_steps > 0)` 跑 ≤32 步
+     *    `sdDodeca` + `fbm3` 射线步进 → 1298 写 `gl_FragColor` → 1309 `if (u_core_shell > 0.5)`
+     *    **在末尾无条件再写一次 `gl_FragColor`（1363）**。该分支内部**没有任何早返回**
+     *    （v5.40 已逐行核对到 `main` 结束），所以 `plasma` 这个值对核心外壳的每个像素都
+     *    必然被丢弃。
+     *  · `coreMesh` 只有 36 个三角形（`dodeca(R_CORE)`），但它的屏幕足迹在放大倍率下能从 ~4%
+     *    长到铺满全屏 ⇒ 这笔白烧**随 zoom² 放大**，正是"倍数一放大就开始卡"的一条直接来源。
+     *
+     * 修法：只在**确实会走等离子分支**（`u_core_shell ≈ 0`）时才允许打开步进。
+     * 这样既保住"增强开关驱动体积核"的原始语义（若将来把 u_core_shell 关掉，行为与旧版一致），
+     * 又在当前外壳态下恒为 0 —— 对画面是**逐像素等价**的（那段结果本来就被覆盖掉）。
+     * ⚠ 这里读的是构造期常量；若将来 `u_core_shell` 变成可运行时切换，本行必须改为随它一起同步。 */
+    const coreUsesPlasmaBranch = this.coreMaterial.uniforms.u_core_shell.value < 0.5;
+    this.coreMaterial.uniforms.u_vol_steps.value = (on && coreUsesPlasmaBranch) ? 32 : 0;
     /* v5.21：这三条**必须回读 setLayer 的记录**再决定 —— 否则 FX 总开关一开
      * 就把用户在「几何与分层」里取消勾选的诊断线框 / 棱线光导管重新点亮。 */
     const lf = this._layerFlags || {};
