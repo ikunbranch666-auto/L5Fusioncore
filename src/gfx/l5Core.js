@@ -1121,7 +1121,82 @@ void main() {
 /* ------------------------------------------------------------------ *
  *  片元着色器（Prog_HDRCore）
  * ------------------------------------------------------------------ */
-const FRAG = /* glsl */ `
+/* ==================================================================== *
+ *  v6 步 1 · 晶体本体「节点式层栈」注册表（declarative layer stack）
+ *
+ *  形态 = **注册表 + 边界标记**，而不是把 400 行 GLSL 搬进字符串数组。理由：
+ *   ① 本步唯一的目标是「零观感变化」，而本项目不允许跑任何东西来验证 ⇒ 纯插入注释标记后
+ *      生成的 GLSL 语句**逐字节相同**，零变化因此是**可证明的**
+ *      （验收：git diff 除下面 1 行 FRAG→FRAG_RAW 重命名外，只应有插入、无删除）。
+ *   ② 把代码搬进模板字符串数组**并不改善正确性** —— 顺序与表达式一字不变，只是换个存放位置，
+ *      读代码还要在注释与片段之间来回跳。真正的修复在「混合模式纪律」（步 2/3），
+ *      而它需要的只是**可枚举的层名与模式**，不是新位置。
+ *   ③ 层与层之间共享块作用域变量（N / Vd / ndv / c / alpha）⇒ 片段被搬走反而更难读。
+ *
+ *  ⇒ 本表 = 层的唯一权威清单（**数组顺序即执行顺序**），下面 FRAG 里的 @Lxx 边界标记由本表的
+ *     id 生成，编译期消融也由 id 驱动。**步 2/3 加一层 = 本表加一条 + 在对应标记处加一段实现。**
+ *
+ *  5 种混合模式（设计提案 §3）：
+ *    over      预乘 alpha 合成（c 与 alpha 必须同乘，只乘 alpha 会让背后亮层透出而更亮）
+ *    mix(f)    因子混合；f 必须零均值或乘性 ⇒ 只拉层次、不整体抬亮
+ *    mul       乘性衰减，k ≤ 1 ⇒ 结构上不可能「填平」
+ *    addSparse 稀疏加色；mask 均匀度 std/mean ≥ 6、峰值 ≤ bloom 阈（刻线除外）
+ *    coatF     菲涅尔清漆；正面权重必须 → 0
+ * ==================================================================== */
+const CRYST_LAYERS = [
+  { id: 'L01', name: 'env-reflect',       mode: 'over' },       // 解析环境反射 envProc(reflect(-Vd,N)) × 冷色偏
+  { id: 'L02', name: 'transmit-disperse', mode: 'over' },       // 折射 + 一次底面反弹 + R/G/B 三档 IOR 色散
+  { id: 'L03', name: 'absorption',        mode: 'mul' },        // Beer-Lambert：σ(path, 包裹体场) ⇒ absorb
+  { id: 'L04', name: 'body-composite',    mode: 'over' },       // c = mix(透射, 反射, fres)
+  { id: 'L05', name: 'hue-shift',         mode: 'mix' },        // 展开度驱动的色相迁移（钳在 bloom 下）
+  { id: 'L06', name: 'key-light',         mode: 'mul' },        // 世界空间主光 pow(key,1.25)
+  { id: 'L07', name: 'facet-gain',        mode: 'mix' },        // 片级明暗档（零均值：只拉层次）
+  { id: 'L08', name: 'inner-scatter',     mode: 'mul' },        // ⚠ 现状是 c += （加色 + 近常数 absorb = 填平底噪）⇒ 步 2 改 mul
+  { id: 'L09', name: 'body-gain',         mode: 'mul' },        // 本体整体降档 0.52
+  { id: 'L10', name: 'seam-mask',         mode: 'compute' },    // 轮廓/脉冲/爆发的掩码，无混合
+  { id: 'L11', name: 'seam-groove',       mode: 'mul' },        // 刻线两侧先压暗（亮线才读作「刻进晶体」）
+  { id: 'L12', name: 'body-clamp',        mode: 'mul' },        // 本体硬钳 0.70（不触发 bloom）
+  { id: 'L13', name: 'seam-glow',         mode: 'addSparse' },  // ⚠ 基线 + 脉冲 + 爆发挤在同一个 c += ⇒ 步 2 拆成 3 层
+  { id: 'L14', name: 'wall-break',        mode: 'coatF' },      // 断口（断裂侧壁）掠射反光
+  { id: 'L15', name: 'rim-light',         mode: 'coatF' },      // 边缘光（把结构缝进环境）
+  { id: 'L16', name: 'nebula',            mode: 'addSparse' },  // ⚠ 现状是加色 + 宽 smoothstep ⇒ 均匀毯子 = 雾 ⇒ 步 2 改 mul/删
+  { id: 'L17', name: 'shell-front-mask',  mode: 'compute' },    // 20 阈值显现前沿（折线 SDF + 周长补偿）
+  { id: 'L18', name: 'shell-apply',       mode: 'mul' },        // c *= shellVis; alpha *= shellVis;（合成闸门，非材质层）
+  { id: 'L19', name: 'reveal',            mode: 'mul' },        // u_retract 同步淡出（c 与 alpha 同乘）
+  { id: 'L20', name: 'wall-vis',          mode: 'mul' },        // 侧壁显现门控（带下限）
+  { id: 'L21', name: 'cool-shift',        mode: 'mix' },        // 储能变冷 + 增透
+  { id: 'L22', name: 'hit-pulse',         mode: 'addSparse' },  // 片级撞击脉冲（以击中点为中心）
+  { id: 'L23', name: 'shell-line',        mode: 'addSparse' },  // 顶面亮折线 + 数据细流
+  { id: 'L24', name: 'final-clamp',       mode: 'mul' },        // 安全网 1.5
+];
+
+/** 编译期消融：把层 id 填进来即整层从程序里剔除（默认空 ⇒ applyLayerMask 原样返回）。
+ *  ⚠ 只能用于**自包含**的层：若被剔的层声明了后续层要用的变量，会编译失败（这是刻意的，便于发现）。 */
+const CRYST_LAYERS_OFF = new Set([]);
+
+/** 层栈清单（编译期注入 FRAG，纯注释；id/名称/模式与上表同源）。不得含反引号。 */
+const CRYST_LAYER_MANIFEST = '/* ===== crystal body layer stack (v6 step1; order = execution order) =====\n'
+  + CRYST_LAYERS.map((l) => ' *  ' + l.id + '  ' + l.name.padEnd(17, ' ') + l.mode).join('\n')
+  + '\n * ======================================================================= */';
+
+/** 按 CRYST_LAYERS_OFF 剔除被禁用的层：从标记起、到「下一个标记之前」为一段。
+ *  空集 ⇒ **直接返回原串**（逐字节相同，零风险）。 */
+function applyLayerMask(src, off) {
+  if (!off || off.size === 0) return src;
+  const re = /^[ \t]*\/\*@(L\d{2})[^\n]*\n/gm;
+  const hits = [];
+  let m;
+  while ((m = re.exec(src)) !== null) hits.push({ id: m[1], i: m.index });
+  if (hits.length === 0) return src;
+  let out = src.slice(0, hits[0].i);
+  for (let k = 0; k < hits.length; k++) {
+    const seg = src.slice(hits[k].i, k + 1 < hits.length ? hits[k + 1].i : src.length);
+    if (!off.has(hits[k].id)) out += seg;
+  }
+  return out;
+}
+
+const FRAG_RAW = /* glsl */ `
 precision highp float;
 
 uniform float u_main_param;          // 44.4 GPU Guard：着色器内必须再次 clamp
@@ -1739,6 +1814,8 @@ void main() {
         return;
       }
 
+      ${CRYST_LAYER_MANIFEST}
+      /*@L01 env-reflect | over*/
       float fres = 0.05 + 0.95 * pow(1.0 - ndv, 4.0);
 
       // ① 表面反射（环境灯带在棱面上的锐利成像）
@@ -1747,6 +1824,7 @@ void main() {
       // 白块修复 F2：envR 系数 0.76→0.45，并加冷色偏 vec3(0.78,0.88,1.0)（压 R，保蓝水晶感；envProc 仅碎片侧使用，不影响核）
       vec3 envR = envProc(R) * 0.45 * vec3(0.78, 0.88, 1.0);
 
+      /*@L02 transmit-disperse | over*/
       // ② 折射进入晶体 + 在底面反弹一次后出射（宝石的"内部火"）
       float ior = 1.62;
       vec3 dR = refract(-Vd, N, 1.0 / (ior - 0.022));
@@ -1760,6 +1838,7 @@ void main() {
       if (dot(oG, oG) < 1e-6) { oR = reflect(dR, backN); oG = reflect(dG, backN); oB = reflect(dB, backN); }
       vec3 envT = vec3(envProc(oR).r, envProc(oG).g, envProc(oB).b);
 
+      /*@L03 absorption | mul*/
       // ③ Beer–Lambert：路程 = 厚度 / cos(入射角)，逐通道吸收系数不同 → 出彩色
       float path = vThick / max(0.32, ndv);
       // v5.6：吸收改"轻微偏冷"（略吸红）而不是强吸红绿 —— 后者会把晶体染成紫，
@@ -1778,13 +1857,16 @@ void main() {
       // 而是"被这台机器的能量照亮并透射出来的介质" → 与构造体同源。
       vec3 innerCol = mix(frost, frost * 1.12, 0.35);
 
+      /*@L04 body-composite | over*/
       vec3 c = mix(envT * absorb * (0.55 + 0.45 * tint), envR, fres);
+      /*@L05 hue-shift | mix*/
       // 晶体自身的色相：随展开度从"环境色"偏向"水晶色"（低饱和矿物色，不撞色）
       /* v-fix：晶体色相迁移钳在 bloom(1.0) 以下——原 tint*1.06+0.14 把蓝通道推到 1.253，
        * 使每个完全展开的碎片整体越界触发 bloom，整壳糊成白雾。改为上限 0.95 的冷偏移项，
        * 只偏色不到 1.0，色相仍来自 frost / 能量色。 */
       c *= mix(vec3(1.0), clamp(tint * 1.02 + 0.06, 0.0, 0.95), 0.32 * u_deploy);
 
+      /*@L06 key-light | mul*/
       /* v5.11：主光 —— 此前水晶**只有**环境反射 + 体吸收，没有任何直接光项，
        * 亮度几乎只随 fresnel 缓慢起伏 → 整壳大面积同亮度（探针 facet.cv 仅 0.07，
        * p10/p90 挤在 0.67/0.79，即用户说的"一片白、看不清结构"）。
@@ -1798,6 +1880,7 @@ void main() {
       float key = clamp(dot(N, Lw), 0.0, 1.0);
       c *= 0.26 + 0.74 * pow(key, 1.25);
 
+      /*@L07 facet-gain | mix*/
       /* v5.11：片级明暗档 —— 每片自己的解理/包裹体浓度不同 → 相邻片不同亮度。
        * 这是"外壳读不读得出结构"的直接来源：vObjPos 是**片局部**坐标，基于它的噪声
        * 在 ~285 片上完全重复，只有片内细节；片与片之间必须有差异才成结构。
@@ -1815,11 +1898,13 @@ void main() {
         1.0 + (0.12 + 0.18 * pC) * u_facet_jit * (shardSeed * 2.0 - 1.0), step(0.5, u_petal));
       c *= facetGain;
 
+      /*@L08 inner-scatter | mul  VIOLATION-additive*/
       /* 体内能量（内芯层之外的第二次体内散射）
        * v5.11：这一项正是"填平元凶" —— 薄片 absorb≈1、正面 (1-fres)≈0.95，故它几乎
        * 处处同值、随 pC 线性增长，把暗面片一路抬到亮面片的水平。乘上 facetGain 之后
        * 它跟着片级明暗一起起伏：不再填平，而是把已有的层次**放大**。 */
       c += innerCol * (0.02 + 0.045 * pC) * (0.35 + 0.65 * eN) * (1.0 - fres) * absorb * facetGain;
+      /*@L09 body-gain | mul*/
       /* v5.11：本体整体降档（0.82 → 0.72 × u_body_gain）—— 亮度余量让给轮廓线 /
        * 脉冲 / 断口，那几项才是要被看见的结构。
        * 关键在于这是**预乘 alpha 混合**：dst = c + dst·(1−alpha)。c 压低而 alpha 不变
@@ -1827,6 +1912,7 @@ void main() {
        * 顶成一片白；壳体退到中低亮度，刻线/脉冲才有对比空间。 */
       c *= 0.52 * u_body_gain;   /* 白块修复 F2：本体增益 0.72→0.52（正面 envT 透射压暗，R 从 ~150 sRGB 推到阈值下；保留蓝水晶+橙缝） */
 
+      /*@L10 seam-mask | compute*/
       /* —— 分割线（v5.9 修订：阈值后**一次性**渐显，随后亮度呼吸）——
        * v5.5 的做法是"填充前沿随能量 20→80 持续推进"—— 轮廓线的亮度因此一直挂在
        * 能量上，越推越亮，没有"出现"这个事件。用户修订：
@@ -1893,6 +1979,7 @@ void main() {
        * hotFrac 0.06→0.016 —— 这正是"外壳糊成一片白"的主因。
        * 侧壁的照明交给下面专属的断口项（受 u_wall_amp 控制，可单独调）。 */
       seamEdge *= 1.0 - vWall;
+      /*@L11 seam-groove | mul*/
       /* v5.11：轮廓沟槽 —— 刻线两侧的本体先压暗一档。
        * 亮线是**加**在本体上的：本体已经很亮时再往上加，等于没加（"轮廓看不清"的
        * 成因之一）。先刻出暗槽，亮线才读作"刻进晶体里的光"，而不是浮在表面的一片白。
@@ -1909,6 +1996,7 @@ void main() {
        *    "脉冲环内部的线明显比外部暗很多"：环内是内裂纹线、环外靠近边界线，静态落差
        *    被误读成脉冲造成的。落差压平后，"轮廓线显现的亮度"在整面上才是同一个值，
        *    脉冲经过前/经过后的线亮度也就一致了（不会再读出"变回暗状态"）。 */
+      /*@L12 body-clamp | mul*/
       /* v-fix：结构层亮度预算——在叠加发光导管（轮廓/边光）之前把"晶体本体"钳到
        * bloom(1.0) 以下（≤0.85），本体绝不触发 bloom；发光项随后叠加可越界产生细线辉光。
        * 这是"冷色暗玻璃 + 发光线条"与"整壳白雾"的分水岭。 */
@@ -1916,6 +2004,7 @@ void main() {
         float _slc = max(max(c.r, c.g), c.b);
         if (_slc > 0.70) c *= 0.70 / _slc;   /* 白块修复 F2：本体硬钳 0.85→0.70（降低亮面天花板，展开态掠射棱面不再成片过白） */
       }
+      /*@L13 seam-glow | addSparse  TODO-split-into-3*/
       /* v5.19：白雾删除 + 用户定标"35-80 阶段的轮廓线太淡、脉冲高亮不明显"
        * → 底线幅度 (0.26+0.09·pC) → (0.46+0.20·pC)，脉冲 0.60 → 1.05。
        * 之所以现在才敢提亮：以前提亮会被白雾的均匀底噪吃掉（抬的是底噪不是线），
@@ -1929,6 +2018,7 @@ void main() {
          + pulseCol * pow(seamEdge, 1.8) * mix(0.90, 1.0, vRim) * pulse * 1.05 * u_pulse_gain * u_pulse_gate
          /* ③ 0.80 爆发 —— 铺满全部轮廓线后的整体高亮；靠覆盖面积而非单点亮度读作事件。 */
          + pulseCol * pow(seamEdge, 1.8) * mix(0.75, 1.0, vRim) * bInst * 1.05;
+      /*@L14 wall-break | coatF*/
       // 断口（断裂侧壁）在展开后要有自己的反光，否则侧面一片死黑；
       // v5.6：反光荣用**能量色**一半 —— 断口被机器自身的光照亮 → 把水晶缝进场景。
       /* v5.21：断口反光**不再随 u_deploy 归零**。
@@ -1947,9 +2037,11 @@ void main() {
          * mix(WALL_AMP_FLOOR + 1.7 * wallOuter, 1.0 + 0.9 * wallOuter,
               smoothstep(0.0, 0.30, u_deploy))
          * u_crack_mul * u_wall_amp;
+      /*@L15 rim-light | coatF*/
       // v5.6 融合项：轮廓边光用能量色 —— 经典"边缘光把物体缝进环境"手法。
       // 强度压在"染色"而不是"发光"档：过强会把水晶和构造体一起冲进白区（实测翻车）。
       c += u_emissive_color * pow(1.0 - ndv, 3.5) * (0.10 + 0.20 * pC) * (0.40 + 0.25 * u_deploy);   // 恢复边光能量色（结构冷、能量暖）
+      /*@L16 nebula | addSparse  VIOLATION-additive*/
       // 轻微星云气流（保留 v5.2 需求，强度压低 —— 主体交给光学）
       /* v5.41：星云场的 fbm3 也已上移到 VERT（vCrystalNoise.y），这里只保留映射本体。
        * ★ 板材路径里那条**同名**星云（现 2222 行，np = vObjPos·3.1 + 同一时间项）原样不动：
@@ -1958,6 +2050,7 @@ void main() {
       float neb = smoothstep(0.30, 0.88, vCrystalNoise.y);
       c += innerCol * neb * (0.02 + 0.05 * pC) * (0.35 + 0.65 * eN) * facetGain;
 
+      /*@L17 shell-front-mask | compute*/
       /* ==================== v5.16：20 阈值「水晶壳由面心向外不规则脉冲渐显」 ====================
        * 用户定标："初始0能量时：水晶碎块不显示，仅留外壳基准面包裹住核心……
        *   能量上升到达20阈值时：完整的水晶壳通过在每个基准面中心由内向外不规则脉冲渐显，
@@ -2033,6 +2126,7 @@ void main() {
        * 见文件头部 v5.21f 记录；shader 内不再需要任何"假柱面"项。）
        * （保留 shellVis 门控，它管的是"板本身显不显现"。） */
 
+      /*@L18 shell-apply | mul*/
       // 闭合态(d≈0)压低 alpha → 透出背后 R=0.96 基准面的五边形轮廓外壳（用户：20–80 能量要看到带轮廓线的外壳）；
       // 展开(d→1)升为实心晶片。碎片 depthWrite=false，基准面先渲染，故透明碎片处轮廓可透出。
       // （closed 已在函数级作用域声明，晶体/基准面两分支共用）
@@ -2042,6 +2136,7 @@ void main() {
       // 不再靠压暗暗示。柱面在下方单独加色，不受这次门控影响。
       c *= shellVis;
       alpha *= shellVis;
+      /*@L19 reveal | mul*/
       // v-new（用户选 A）：闭合态碎片退为半透晶纱 —— 预乘(OneFactor)混合下只降 alpha
       // 不压 c 时颜色仍整强度叠加，基准面五边形轮廓照样被冲掉；必须两者同乘。
       // v-穿帮四次修复：u_retract（下降同步）时 reveal 提前随 deploy 淡出 ——
@@ -2053,6 +2148,7 @@ void main() {
         : mix(0.42, 1.0, smoothstep(0.0, 0.40, u_deploy));
       c *= reveal;
       alpha *= reveal;
+      /*@L20 wall-vis | mul*/
       /* —— 断裂侧壁的显现门控（v5.5，消除低能态暗轮廓线）——
        * 闭合态相邻片的侧壁严丝合缝地对贴在一起，双面叠加会在每条裂缝处
        * 印出一道暗/亮描边（用户圈出的"低能态暗轮廓线"）。侧壁只在展开后
@@ -2065,6 +2161,7 @@ void main() {
       c *= mix(1.0, wallVis, vWall);
       alpha *= mix(1.0, wallVis, vWall);
 
+      /*@L21 cool-shift | mix*/
       /* —— Round G：撞击的可见化方式彻底换掉（用户定标：不是整片变白、不是冷光）——
        * 旧实现是「命中点一圈冷蓝光斑」（exp(−d²·260)·0.22）。实测撞击频率其实不低
        * （p=0.955 下 ~50 次/秒、同时 69~71 片带 u_impact>0.05），但因为它是 σ≈0.06u
@@ -2078,6 +2175,7 @@ void main() {
       c += vec3(0.10, 0.16, 0.28) * u_cool;             /* 白块修复 F3：储能辉亮 0.07/0.12/0.20→0.10/0.16/0.28（增强击中冷蓝可见反馈；R 被 coolShift 压暗，不产 R>140 白） */
       alpha = clamp(alpha * (1.0 + 0.60 * u_cool), 0.0, 0.97);   /* 白块修复 F3：储能增透 0.45→0.60（击中片更透亮，黑底不透白） */
 
+      /*@L22 hit-pulse | addSparse*/
       /* ==================== v5.17：片级撞击脉冲（用户重构） ====================
        * 用户定标："现在粒子打在碎块上，整个碎块面的中心出来一道脉冲，这是完全错误的。
        *   我的构思是：粒子只会打在最外面一圈的碎片上，打中后，以**击中点为中心**，
@@ -2120,6 +2218,7 @@ void main() {
         c += vec3(0.42, 0.80, 1.0) * hTrail * u_data_trail * (0.35 + 0.65 * lambert);
       }
 
+      /*@L23 shell-line | addSparse*/
       /* v5.17：水晶壳显现的**顶面亮折线** —— 放在最末尾叠加，避开上面对 c 的乘性压暗
        * （reveal / shellVis / coolShift），保证"脉冲线"本身是干净锐利的细线。 */
       /* 脉冲线颜色抽出来 —— 柱面必须与顶面**同色**，否则就读成两块不相干的面。 */
@@ -2131,6 +2230,7 @@ void main() {
       /* v5.18：冰蓝数据细流 —— 固定冷色，不掺能量色（数据感与主视觉的暖色分族）。 */
       c += vec3(0.42, 0.80, 1.0) * shellTrail * u_data_trail * (0.35 + 0.65 * lambert);
 
+      /*@L24 final-clamp | mul*/
       // v-fix：最终亮度预算——结构层已钳到 0.85（不触发 bloom），此处仅作安全网，
       // 允许细发光导管（轮廓/边光）越过 1.0 产生辉光但防止失控；阈值从 1.25 提到 1.5
       // 让轮廓线辉光更明显，同时仍远低于原"整壳白雾"量级。
@@ -3103,6 +3203,9 @@ const BH_GRAV_FRAG = /* glsl */ `
     gl_FragColor = vec4(col, 1.0);
   }
 `;
+
+/* 编译期层栈掩膜：CRYST_LAYERS_OFF 为空 ⇒ 原样返回（此时 FRAG === FRAG_RAW，逐字节相同）*/
+const FRAG = applyLayerMask(FRAG_RAW, CRYST_LAYERS_OFF);
 
 /** 把测地线偏折角烘成一张 n×1 贴图（r 通道 0..255 ↔ 0..2π）。
  *  ucs：非均匀采样 s∈[0,1] → u = 1 + (uMax−1)·s³，临界曲线附近最密。 */
