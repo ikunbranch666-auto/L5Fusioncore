@@ -244,6 +244,14 @@ const SHARD_HDR = 0.24;           // 亮度增益（加色）。★ 定标史：
                                   // 可见时按"单片看着合适"定标必然过曝；而且它贴在本来就接近
                                   // 白饱和的晶面上，越亮越读不出形状 ⇒ 只能压到比母面更暗，
                                   // "剥离下来的那一层"才看得出来。
+/** ★ v5.8.10 碎片**深度预Pass 孪生体**的层序（业界标准 depth prepass，见日志第 20 条）。
+ *  · 本体（颜色层）= **33**（沿用原值）。
+ *  · 孪生体（只写深度）必须**严格小于**本体，否则它后画、深度写晚了**遮不住任何东西**
+ *    —— 这正是母片孪生体（35）> 碎片（33）的历史教训：碎片永远不会被母片孪生体挡住。
+ *  · 取 **32**：与晶体本体/柱面/内芯同层（规则 5「同类物体必须同层」在**深度**语境下成立：
+ *    它们都是"结构层"，而结构层之间本来就该互相遮挡），且**小于** 33。
+ *  · ⚠ 改任何一层的 renderOrder 时必须回来看这个大小关系。 */
+const SHARD_DEPTH_ORDER = 32;
 /** ★ 结膜门槛（`cool` = u_cool 归一值 ≥ 此值才裂）。
  *  ★★ v5.8.2：0.85 → **0.18**（= `stored ≥ 1`，即"**被命中过一次 = 这一片有膜了**"）。
  *   为什么这次是"语义错"而不是"阈值调参"：
@@ -3897,7 +3905,15 @@ export class L5Core {
       fragmentShader: FRAG,
       uniforms,
       transparent: true,
-      depthWrite: false,
+      /* ★★ v5.8.11 **depthWrite: false -> true**（母片本体自己写深度）。
+       * 【"碎片被水晶碎块遮挡 / 突兀多出来的碎片"消失的真根因】母片本体 renderOrder 32
+       *   却不进深度缓冲 => 排在它之后的碎片颜色层(33)永远挡不住它。
+       *   碎片深度预Pass(v5.8.10)只解决"碎片<->碎片"；母片孪生体排 35 在碎片之后、深度写晚了。
+       * 【为什么不能靠"把母片孪生体提前"】它排 35 不是疏忽而是必须：提前到 32 会先写深度，
+       *   随后母片本体(同样 32、depthTest:true)被**自己的孪生体**剔掉 => 母片缺一块（v5.32 踩过）。
+       * 影响 3 类：母片晶体(32，目标) / 基准面 shellInner(31) / 探针代理(layer3 无影响)。
+       *   用户实测母片自身渲染正常。 */
+      depthWrite: true,
       depthTest: true,
       side: THREE.DoubleSide,
       blending: THREE.CustomBlending,
@@ -4619,17 +4635,72 @@ export class L5Core {
     });
     this.shardMesh = new THREE.Mesh(_shardGeo, this.shardMaterial);
     this.shardMesh.name = 'L5_ShardBurst';
-    this.shardMesh.renderOrder = 33;             // 见上「为什么这里 33 是安全的」
+    this.shardMesh.renderOrder = 33;   // 颜色层：必须在 SHARD_DEPTH_ORDER(32) **之后**
     this.shardMesh.frustumCulled = false;        // 顶点由 CPU 逐帧写，包围球无意义
     this.shardMesh.userData.noGlowMask = true;   // 不进辐射链（否则又被糊成一层光晕）
     this.shardMesh.visible = false;
+
+    /* ★★★ v5.8.10 碎片**深度预Pass 孪生体** —— 只解决"碎片 ↔ 碎片"的遮挡（用户定标）。
+     *
+     * 【为什么必须是"独立 mesh"，而不是给本体开 depthWrite】（这是本项目已踩过的坑）
+     *   本体整层 = **一个 draw call / 一份缓冲**。单个 draw call 内部**没有任何按深度的
+     *   排序** —— 三角形严格按**槽位顺序**光栅化，而槽位由环形游标（`_takeShard`）分配、
+     *   与远近毫无关系。给本体开 depthWrite ⇒ "先写缓冲的槽位遮挡后写缓冲的槽位"
+     *   ⇒ 远端剔掉近端；而**同一片内那 N 块此刻是精确拼合的**（既定不变式），必然互相咬掉
+     *   ⇒ v5.8.4 用户实测"原本的外圈碎块面也不完整了"。
+     *   ⇒ **只要还在同一个 draw call 里，depthWrite 就不可能安全。**
+     *
+     * 【业界标准解法：depth prepass】（调研结论，见日志第 20 条）
+     *   遮挡体与被遮挡体必须是**两个独立 mesh** ⇒ three.js 会按物体排序（renderOrder → z）
+     *   ⇒ 远的先被剔、近的留下 ⇒ **完全绕开"单 draw call 内无排序"这个死结**。
+     *   本项目已有同款机制（母片的 `L5_FaceFragment_DepthMask` / `_makeDepthTwin`，
+     *   renderOrder 35），本孪生体是它的碎片版，**母片那份一行未动**。
+     *
+     * 【关键实现细节】
+     *   · **共享同一份 BufferGeometry**（`_shardGeo`）—— 顶点由 CPU 逐帧写一次即可，
+     *     孪生体与本体看到**逐位相同**的顶点 ⇒ 深度轮廓与可见碎片完全一致。
+     *     ⚠ 因为共享 attribute，`needsUpdate` 只在 update 末尾设一次即可（本体那边已设）。
+     *   · **renderOrder 必须 < 本体**：否则孪生体后画，深度写晚了遮不住任何东西
+     *     （这正是母片孪生体 35 > 碎片 33 的历史问题）。
+     *   · **fragShader 用空实现**：碎片 FRAG 无任何 `discard`（本文件的 discard 只在
+     *     场辉光与透镜两个着色器里）⇒ "几何覆盖到的像素全部写深度" ⇒ 空片元不改变覆盖关系。
+     *   · **blending 必须与本体一致（Additive）**：孪生体 colorWrite:false 不写颜色，
+     *     但 three.js 仍按 blending 决定是否走加色路径；保持一致最安全。
+     *   · `frustumCulled = false` / `noGlowMask = true` 与本体相同。
+     *   · visible 与本体同步（见 _updateShardBurst 末尾）—— 空池时两者都不画。
+     */
+    this.shardDepthMaterial = new THREE.ShaderMaterial({
+      vertexShader: this.shardMaterial.vertexShader,   // ★ 必须同源：顶点位移决定深度轮廓
+      fragmentShader: [
+        'precision highp float;',
+        'void main() {',
+        '  /* 颜色已被 colorWrite=false 丢弃 —— 这里只需产生片元去写深度。',
+        '     刻面 / envProc / 贴边亮棱线全部与深度无关，整段省掉。 */',
+        '  gl_FragColor = vec4(0.0);',
+        '}'
+      ].join('\n'),
+      uniforms: this.shardMaterial.uniforms,          // 共享 ⇒ 自动跟随
+      transparent: true,                  // 必须在 transparent 队列，否则被提前到 opaque 之前
+      depthWrite: true,                   // ★ 本孪生体的唯一职责
+      depthTest: true,
+      colorWrite: false,                  // ★ 只进深度缓冲
+      side: this.shardMaterial.side,
+      blending: THREE.AdditiveBlending,   // 与本体一致（不写颜色，但保持混合链一致）
+      fog: false
+    });
+    this.shardDepth = new THREE.Mesh(_shardGeo, this.shardDepthMaterial);
+    this.shardDepth.name = 'L5_ShardBurst_DepthMask';
+    this.shardDepth.renderOrder = SHARD_DEPTH_ORDER;  // = 32，在本体(33)**之前**
+    this.shardDepth.frustumCulled = false;
+    this.shardDepth.userData.noGlowMask = true;
+    this.shardDepth.visible = false;
     this.shardTrail = new THREE.Mesh(_trailGeo, this.shardTrailMaterial);
     this.shardTrail.name = 'L5_ShardTrails';
     this.shardTrail.renderOrder = 33;            // 与碎片本体同层（拖尾是它自己的流线，不该被晶面吃掉半截）
     this.shardTrail.frustumCulled = false;
     this.shardTrail.userData.noGlowMask = true;
     this.shardTrail.visible = false;
-    this.group.add(this.shardMesh, this.shardTrail);
+    this.group.add(this.shardMesh, this.shardTrail, this.shardDepth);
     this._shardPos = _shardPos;
     this._shardCol = _shardCol;
     this._shardPieces = _shardPieces;
@@ -7955,11 +8026,16 @@ export class L5Core {
       tcol[to + 6] = 0; tcol[to + 7] = 0; tcol[to + 8] = 0;      // 尾部归零 = 流线淡出
       tcol[to + 9] = 0; tcol[to + 10] = 0; tcol[to + 11] = 0;
     }
-    /* 没有活跃碎片就整体不画（省两次 draw call），缓冲保持全 0 不脏。 */
+    /* 没有活跃碎片就整体不画（省 draw call），缓冲保持全 0 不脏。
+     * ★ v5.8.10：深度孪生体与本体**同步 visible** —— 它共享同一份 geometry，
+     *   本体不画时它也不该画（否则会白写一遍深度）。 */
     this._shardActive = nActive;               // 观测口（见 _revStats.shard）
     this.shardMesh.visible = any;
     this.shardTrail.visible = any;
+    this.shardDepth.visible = any;             // 深度预Pass 层（v5.8.10）
     if (any) {
+      /* ★ 共享 geometry ⇒ `needsUpdate` 只需设一次，本体与孪生体都吃到同一份上传。
+       * 顶点由 CPU 逐帧写进 _shardPos / _shardCol，孪生体的 VERT 同源 ⇒ 深度轮廓逐位一致。 */
       this.shardMesh.geometry.attributes.position.needsUpdate = true;
       this.shardMesh.geometry.attributes.color.needsUpdate = true;
       /* v5.4（B 方案）：aLocal/aRad/aSeed 是**块局部量**（发射时写一遍、终生不变）⇒ 只在
