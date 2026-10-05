@@ -200,25 +200,39 @@ const DP_INHALE_MAX = 10;       // 20-80 段 80 时的每秒吸入数
  *   · 碎片从**外缘环**产生 —— 只有那一圈会变白（数据粒子捕获池「_pickFragmentIndex」只在
  *     radialN ≥ 0.72 的外缘环里选片），与用户观察一致；
  *   · 与数据粒子（DP）是两套东西：DP 是能量粒子，这里是碎块白膜裂出的晶片。 */
-const SHARD_MAX = 2300;           // 碎片池上限。★ v5.8.2：1400 → 2300 —— 用户定标"**每个白了的碎块面
-                                  // 都要碎**"⇒ 需要量 = 外缘环片数（band3，≈60~132）× 每片 12~16
-                                  // ≈ 720~2100 ⇒ 池必须够，否则后挑中的片会被静默丢弃。
-                                  // ⚠⚠ **硬天花板 = 2340，不许再往上抬**：碎片几何的索引缓冲是
-                                  // `Uint16Array`，索引 = `s * SHARD_PIECE_V + k`，最大 = `SHARD_MAX × 28 − 1`；
-                                  // 超过 65535 会**静默回绕**（不报错、几何错乱）。2340×28−1 = 65519 是极限。
-                                  // 池不足会**静默丢弃**（观测口 `_shardMissed`）；代价只有内存（≈7MB）
-                                  // + 命中时的定长循环，draw call 恒为 2。
+const SHARD_MAX = 1300;           // 碎片池上限。★★ v5.8.12：2300 → **1300**（加厚度的**连带**下调）。
+                                  // 需要量 = 外缘环实测 88 片 × 每片 8~12 块 ≈ 704~1056 ⇒ 1300 够用。
+                                  // ⚠⚠ **硬天花板由 SHARD_PIECE_V 决定，不许再往上抬**：索引缓冲是
+                                  // `Uint16Array`，索引 = `s * SHARD_PIECE_V + k`，必须
+                                  // `SHARD_MAX × SHARD_PIECE_V ≤ 65536`。1300 × 50 = 65000 ✔（上限 1310）。
+                                  // 超过 65535 会**静默回绕**（不报错、几何错乱）。
+                                  // 池不足会静默丢弃（观测口 `_shardMissed`）。
 const SHARD_RING_N = 0.72;        // 只有 radialN ≥ 此值（= 捕获池覆盖的外缘环）才可能变白
-const SHARD_PIECE_V = 28;         // 每块碎片的**最大顶点数**（动态缓冲按此定长）。
-                                  // v5.4（B 方案）：顶点池布局从「[v0..v_{m-1}]」改成
-                                  // 「[质心, v0, v1, …, v_{m-1}, b0(重复)]」—— 锚点必须是**块质心**
-                                  // （胞是凸的 ⇒ 顶点平均必在块内），否则连最基础的
-                                  // "心暗边亮/心到边的径向坐标"都拿不到（每块只有一圈边界点）。
-                                  // 容量：胞 = 母片轮廓（≤ SHARD_HULL_MAX 条边）被最多
-                                  // (SHARD_TILE_NMAX−1) 个半平面各裁一刀、凸多边形每刀净增 ≤1 顶点
-                                  // ⇒ m ≤ 10 + 15 = 25；扇形锚点 = 质心 ⇒ 需 m + 2 = 27 顶点。
-                                  // ★ v5.8：24 → 28（块数从 9 提到 16 之后，槽位必须够 27）。
-                                  // 代价 = 每帧多变换 4 顶点/槽（仅爆发期可见，且 VERT 侧近免费）。
+/* ★★★ v5.8.12 碎片加厚度：零厚度面片 → **有厚度的薄棱柱**（顶面 + 底面 + 侧壁裙边）。
+ *
+ * 【为什么母片是实体、碎片却是纸片】v5.4/v5.5 的水晶母片本来就是 **0.030u 真厚板**
+ *   （CRYST_Z0=−0.012 ~ CRYST_Z1=+0.018，顶面/底面/4 面断裂侧壁）。碎片从母片剥离时却
+ *   退化成"一张纸" ⇒ 掀开后仍是纸 ⇒ 永远读不出体积，"剥离"只能靠姿态而非实体感表达。
+ *
+ * 【关键前提：v5.8.10/11 的遮挡已通 ⇒ 加厚无遮挡副作用】
+ *   遮挡由**独立的 `shardDepth` 孪生体（层序 32，先于本体 33）** + **母片本体 depthWrite:true**
+ *   承担 ⇒ 碎片本体保持 `depthWrite:false` ⇒ 同片内精确拼合的 N 块不会互相咬掉。
+ *
+ * 【顶点预算 —— 改 thickness 必算的账（同一个 Uint16 约束的三面，拆不开）】
+ *   布局 = 顶面(质心+m) + 底面(质心+m) + 侧壁裙边(顶m+底m) = **4m + 2**。
+ *   m 取 `SHARD_M_MAX = 12`（理论天花板 `SHARD_HULL_MAX + (NMAX−1) = 21`，但实测 Voronoi
+ *   胞平均只有 4~6 条边，12 已是宽裕余量）⇒ **50 顶点/块**（零厚度版是 28）。
+ *   ⇒ 池容量 2300×28=64400 → 1300×50=65000 ⇒ 减半 ⇒ 块数必须下调（见 SHARD_TILE_NS）。
+ *   ⚠ 改 SHARD_PIECE_V 或 SHARD_MAX 时**必须同时验算 `SHARD_MAX × SHARD_PIECE_V ≤ 65536`**。
+ */
+const SHARD_M_MAX = 12;           // 单块边界点数上限（厚度版布局用；见上面的账）
+const SHARD_THICK = 0.012;        // 碎片厚度（u）。取母片 0.030u 的 40%：深度缓冲是浮点，
+                                  //   0.012u 足够让近/远面产生可分辨的差；而屏幕上
+                                  //   （zoom 2.5 时 1u ≈ 81px）仅 ≈1px，不会读成"厚板"。
+const SHARD_PIECE_V = 50;         // 每块碎片的**最大顶点数**（动态缓冲按此定长）。
+                                  // ★ v5.8.12：28 → **50**。厚度版槽位映射（索引缓冲 / 发射端
+                                  //   属性 / update 三处必须逐字一致，见构造处）：
+                                  //   [顶质心, 顶b0..b_{m-1}, 底质心, 底b0..b_{m-1}, 侧壁顶m, 侧壁底m]
 const SHARD_HULL_MAX = 10;        // 每片碎块**凸包轮廓**的顶点上限（重分网格的片包络点可能
                                   // 几十个 ⇒ 单调链求完凸包后等距抽稀到这个数）
 const SHARD_LIFE_MIN = 0.90;      // 碎片生命下限（s）
@@ -239,11 +253,21 @@ const SHARD_DRAG = 1.0;           // 阻尼（1/s）。★ v3：1.6→1.0 ⇒ �
 const SHARD_SPIN_MAX = 2.2;       // 自转角速度上限（rad/s）。★ v4：8.0→2.2，且**出生相位 = 0**
                                   // —— 块出生那一刻必须与邻块拼合成完整白膜（"裂开"的前提），
                                   // 随机相位 + 快速自转会直接读成"一堆乱飞的碎屑"。
-const SHARD_HDR = 0.24;           // 亮度增益（加色）。★ 定标史：1.45（整屏炸白）→ 0.55
-                                  // （仍是一片"白色的片"）→ 0.24。加色是**叠加**：几百片同时
-                                  // 可见时按"单片看着合适"定标必然过曝；而且它贴在本来就接近
-                                  // 白饱和的晶面上，越亮越读不出形状 ⇒ 只能压到比母面更暗，
-                                  // "剥离下来的那一层"才看得出来。
+const SHARD_HDR = 0.07;            // 亮度增益（加色）。★ 定标史：1.45（整屏炸白）→ 0.55
+                                  // （仍是一片"白色的片"）→ 0.24（零厚度）→ **0.07**（厚度版·定死）。
+                                  // ★ v5.8.12 **用户定标（定死，不再回调）**：0.07 ⇒ 总亮度 ≈0.315
+                                  //   （旧版 0.24 的 131%），距 bloom 阈值 1.0 仍有 3.2 倍余量。
+                                  //   此前试过 0.0138（总亮度 0.062，太暗）与 0.04（总亮度 0.18，
+                                  //   仅用于观察形态），用户均判偏暗 ⇒ 定在 0.07。
+                                  // ★ 加色层的"单价 × 遍数 = 总亮度"（改这个数前务必分清）：
+                                  //   加厚度后单块碎片被画「顶面 + 底面 + 侧壁裙边」共约 **4.5 遍**
+                                  //   （顶/底在屏幕上几乎完全重合 = 2 遍；侧壁每块 m≈5 条边 ≈ 2.5 遍），
+                                  //   材质是 AdditiveBlending ⇒ **单块实际贡献 = SHARD_HDR × 4.5**。
+                                  //   ⚠ 改几何（面数/层数/厚度）时必须同步重算这个数，否则必然过曝。
+                                  // ★★ 用户对厚度的定性（很重要，别再改错方向）：
+                                  //   "这种片就应该是看不清厚度的，只是做成有厚度的会方便遮挡"
+                                  //   ⇒ **厚度是遮挡手段，不是视觉卖点**。别再去调亮侧壁 /
+                                  //   加厚 SHARD_THICK 求"看出体积"—— 目标是遮挡正确 + 亮度定死。
 /** ★ v5.8.10 碎片**深度预Pass 孪生体**的层序（业界标准 depth prepass，见日志第 20 条）。
  *  · 本体（颜色层）= **33**（沿用原值）。
  *  · 孪生体（只写深度）必须**严格小于**本体，否则它后画、深度写晚了**遮不住任何东西**
@@ -399,16 +423,24 @@ const SHARD_CHIP_CHUNK = 0.34;
  *  ⚠ 这里填的是**请求块数**，不是最终块数：母片凸包的**尖角**处必然产生楔形胞，
  *    它们会被细长闸门（SHARD_CHIP_CHUNK）合并给邻居 ⇒ 最终块数通常比请求数少 1~3。
  *    所以请求数留了余量，最终落在 10~16（下限由 SHARD_TILE_MIN 兜底）。
- *  ⚠ 这个数组的第二列与 SHARD_TIERS 的第二列**必须一一对应**（tile 索引 = 档位序号）。 */
-const SHARD_TILE_NS = [12, 14, 16];
+ *  ⚠ 这个数组的第二列与 SHARD_TIERS 的第二列**必须一一对应**（tile 索引 = 档位序号）。
+ *  ★ v5.8.12：**[12,14,16] → [8,10,12]、硬地板 10 → 8** —— 这是加厚度的**连带下调**，
+ *    不是审美偏好：每块顶点 28 → 50 ⇒ 同一 Uint16 预算下池容量 2300 → 1300
+ *    ⇒ 必须压块数才装得下 88 片 × N（88×8=704 ≤ 1300 ✔；88×12=1056 ✔）。
+ *    权衡：块数越多，每块的屏幕面积越小（实测每块约 4~5px ⇒ 读不出形状、像三角碎片）
+ *    ⇒ **块数与可辨识度直接对抗**，8~12 是这个约束下的折中点。 */
+const SHARD_TILE_NS = [8, 10, 12];
 const SHARD_TILE_N = SHARD_TILE_NS.length;                  // 每片烘 3 份（索引 = 档位序号）
-const SHARD_TILE_NMAX = SHARD_TILE_NS[SHARD_TILE_N - 1];    // 单次请求上限 = 16（= PART_N，槽位上限）
-/** ★ 用户硬地板：**每片至少崩 10 块**。少数凸包太尖、楔形被合并得太多时会跌破它 ⇒
+const SHARD_TILE_NMAX = SHARD_TILE_NS[SHARD_TILE_N - 1];    // 单次请求上限 = 12（= PART_N，槽位上限）
+/** 每片至少崩 8 块（v5.8.12 由 10 下调，理由见上）。少数凸包太尖、楔形被合并得太多时会跌破它 ⇒
  *  烘格期为这一档**放宽闸门重切一次**（见 _shardBakeTiles），宁可那一两块薄一点。 */
-const SHARD_TILE_MIN = 10;
-/** 预烘格**单胞**的顶点上限：胞 = 母片轮廓（≤ SHARD_HULL_MAX 顶）被最多 (NMAX−1) 个半平面裁，
- *  顶点数 ≤ `SHARD_HULL_MAX + (SHARD_TILE_NMAX − 1)` = 25。 */
-const SHARD_TILE_V = SHARD_HULL_MAX + SHARD_TILE_NMAX - 1;
+const SHARD_TILE_MIN = 8;
+/** 预烘格**单胞**的顶点上限 —— ★ v5.8.12 改为**按厚度版槽位容量**收紧到 `SHARD_M_MAX`。
+ *  ⚠ 不能按理论天花板（`SHARD_HULL_MAX + (NMAX−1) = 21`）放行：厚度版槽位只放得下 12 个
+ *    边界点，放行 m=13~21 的胞会让 update 只写 12 个边界点 ⇒ **多出的顶点沿用上一槽位的
+ *    残值** ⇒ 碎片形状错乱（且不报错）。实测 Voronoi 胞平均只有 4~6 条边，12 极少触及；
+ *    真触到时该格作废、这片不裂，可接受。 */
+const SHARD_TILE_V = SHARD_M_MAX;
 /** ★ 预烘格：胞的分割只依赖（母片轮廓, 块数）——两者都在加载期就定死了 ⇒ **加载时烘一次、
  *  崩裂帧直接查表**（崩裂帧内零迭代、零分配）。每片烘 `SHARD_TILE_N` 份（= 档位数）。 */
 
@@ -4569,18 +4601,49 @@ export class L5Core {
       new THREE.BufferAttribute(_shardRad, 1).setUsage(THREE.DynamicDrawUsage));
     _shardGeo.setAttribute('aSeed',
       new THREE.BufferAttribute(_shardSeed, 3).setUsage(THREE.DynamicDrawUsage));
+    /* ★★★ v5.8.12 厚度版索引缓冲 —— 槽位映射是**全篇唯一真相**（发射端属性写入与 update
+     *   的顶点变换必须与它**逐字一致**）：
+     *
+     *   槽位 0                    = 顶面质心（局部 (0,0)）
+     *   槽位 1 .. m               = 顶面边界 b0..b_{m-1}
+     *   槽位 OFF_B0               = 底面质心            OFF_B0 = 1 + SHARD_M_MAX
+     *   槽位 OFF_B0+1 .. OFF_B0+m = 底面边界（与顶面同序）
+     *   槽位 OFF_S0 .. +m-1       = 侧壁顶边           OFF_S0 = OFF_B0 + 1 + SHARD_M_MAX
+     *   槽位 OFF_S0+m .. +2m-1    = 侧壁底边
+     *   m < SHARD_M_MAX 时多出的槽位**复制 b0** ⇒ 零面积三角形，任何混合模式下不产生像素
+     *
+     * 三角 = 顶面扇形 m + 底面扇形 m + 侧壁 2m 个四边形带。
+     * ⚠ 底面**必须反向绕序**，否则它的法线朝内、与顶面同向 ⇒ 掀开时上下两面明暗会反。 */
+    const OFF_B0 = 1 + SHARD_M_MAX;
+    const OFF_S0 = OFF_B0 + 1 + SHARD_M_MAX;
+    this._shardOffB0 = OFF_B0;
+    this._shardOffS0 = OFF_S0;
     {
-      const tri = SHARD_PIECE_V - 2;               // 以 0 号（= 块质心）为基准的扇形三角数（28 顶点 → 26）
-                                                   // 实际块顶点数 m ≤ 25 ⇒ 需要 m 个三角；多余的落在
-                                                   // "复制 b0"的零面积三角上（加色下不可见）。
-                                                   // ⚠ tri 必须 ≥ 块顶点上限 m，否则最外侧的楔形**
-                                                   // 画不出来**（碎片缺一个从质心到首末边的口子）。
+      const MM = SHARD_M_MAX;
+      const tri = MM * 4;                  // 顶 m + 底 m + 侧 2m
       const idx = new Uint16Array(SHARD_MAX * tri * 3);
       for (let s = 0; s < SHARD_MAX; s++) {
         const base = s * SHARD_PIECE_V;
-        for (let k = 0; k < tri; k++) {
-          const o = (s * tri + k) * 3;
-          idx[o] = base; idx[o + 1] = base + k + 1; idx[o + 2] = base + k + 2;
+        let o = s * tri * 3;
+        /* ① 顶面扇形：质心(0) → 顶面边界(1..MM)，绕序使法线朝 +nrm */
+        for (let k = 0; k < MM; k++) {
+          idx[o] = base; idx[o + 1] = base + 1 + k; idx[o + 2] = base + 1 + ((k + 1) % MM);
+          o += 3;
+        }
+        /* ② 底面扇形：**反向绕序** ⇒ 法线朝 −nrm（朝外） */
+        for (let k = 0; k < MM; k++) {
+          idx[o] = base + OFF_B0;
+          idx[o + 1] = base + OFF_B0 + 1 + ((k + 1) % MM);
+          idx[o + 2] = base + OFF_B0 + 1 + k;
+          o += 3;
+        }
+        /* ③ 侧壁裙边：顶边 → 底边，每条边 2 个三角。绕序使法线朝外。 */
+        for (let k = 0; k < MM; k++) {
+          const k2 = (k + 1) % MM;
+          const t0 = base + OFF_S0 + k,      t1 = base + OFF_S0 + k2;
+          const b0 = base + OFF_S0 + MM + k, b1 = base + OFF_S0 + MM + k2;
+          idx[o] = t0; idx[o + 1] = b0; idx[o + 2] = b1; o += 3;
+          idx[o] = t0; idx[o + 1] = b1; idx[o + 2] = t1; o += 3;
         }
       }
       _shardGeo.setIndex(new THREE.BufferAttribute(idx, 1));
@@ -7860,16 +7923,42 @@ export class L5Core {
         let hB = Math.sin(cuu * 269.5 + cvv * 183.3 + i * 41.3) * 28001.8384;
         let hC = Math.sin(cuu * 419.2 + cvv * 371.9 + i * 96.1) * 19999.1234;
         hA -= Math.floor(hA); hB -= Math.floor(hB); hC -= Math.floor(hC);
-        for (let v = 0; v < SHARD_PIECE_V; v++) {
-          const sv = v === 0 ? -1 : (v <= m ? v - 1 : 0);
-          const o2 = (ab + v) * 2, o3 = (ab + v) * 3;
-          sRad[ab + v] = sv < 0 ? 0 : 1;
+        /* ★ v5.8.12 厚度版属性写入：按索引缓冲的槽位映射填（**三处必须逐字一致**）。
+         *   槽位 0          = 顶面质心                       aRad = 0
+         *   槽位 1..MM      = 顶面边界（m 个有效，余复制 b0）   aRad = 1
+         *   槽位 OFF_B0     = 底面质心                       aRad = 0
+         *   槽位 OFF_B0+1.. = 底面边界（同顶面序）             aRad = 1
+         *   槽位 OFF_S0..   = 侧壁顶边（复制顶面）             aRad = 1
+         *   槽位 OFF_S0+MM..= 侧壁底边（复制底面）             aRad = 1
+         * ★ 侧壁 aRad 也给 1：它是壳的侧棱，贴边亮棱线应该沿它走。
+         * ★★ 底面/侧壁用**同一套 (u,v)**（不减、不镜像）—— 因为 update 里它们是
+         *   "顶面同位置沿 nrm ∓h/2 平移"得到的，aLocal 只用于面内微结构取样，必须同源。 */
+        const OFF_B0L = this._shardOffB0, OFF_S0L = this._shardOffS0, MML = SHARD_M_MAX;
+        for (let v = 0; v < MML; v++) {
+          const sv = v >= m ? 0 : v;                 // 越界槽位复制 b0 ⇒ 零面积
+          const lu = (pool[pb + sv * 2] - cuu) * invR;
+          const lv = (pool[pb + sv * 2 + 1] - cvv) * invR;
+          let o2 = (ab + 1 + v) * 2, o3 = (ab + 1 + v) * 3;      // 顶面边界
+          sRad[ab + 1 + v] = 1; sLoc[o2] = lu; sLoc[o2 + 1] = lv;
           sSeed[o3] = hA; sSeed[o3 + 1] = hB; sSeed[o3 + 2] = hC;
-          if (sv < 0) { sLoc[o2] = 0; sLoc[o2 + 1] = 0; }
-          else {
-            sLoc[o2] = (pool[pb + sv * 2] - cuu) * invR;
-            sLoc[o2 + 1] = (pool[pb + sv * 2 + 1] - cvv) * invR;
-          }
+          o2 = (ab + OFF_B0L + 1 + v) * 2; o3 = (ab + OFF_B0L + 1 + v) * 3;  // 底面边界
+          sRad[ab + OFF_B0L + 1 + v] = 1; sLoc[o2] = lu; sLoc[o2 + 1] = lv;
+          sSeed[o3] = hA; sSeed[o3 + 1] = hB; sSeed[o3 + 2] = hC;
+          o2 = (ab + OFF_S0L + v) * 2; o3 = (ab + OFF_S0L + v) * 3;            // 侧壁顶边
+          sRad[ab + OFF_S0L + v] = 1; sLoc[o2] = lu; sLoc[o2 + 1] = lv;
+          sSeed[o3] = hA; sSeed[o3 + 1] = hB; sSeed[o3 + 2] = hC;
+          o2 = (ab + OFF_S0L + MML + v) * 2; o3 = (ab + OFF_S0L + MML + v) * 3; // 侧壁底边
+          sRad[ab + OFF_S0L + MML + v] = 1; sLoc[o2] = lu; sLoc[o2 + 1] = lv;
+          sSeed[o3] = hA; sSeed[o3 + 1] = hB; sSeed[o3 + 2] = hC;
+        }
+        /* 两个质心槽位（局部 (0,0)） */
+        {
+          let o2 = ab * 2, o3 = ab * 3;
+          sRad[ab] = 0; sLoc[o2] = 0; sLoc[o2 + 1] = 0;
+          sSeed[o3] = hA; sSeed[o3 + 1] = hB; sSeed[o3 + 2] = hC;
+          o2 = (ab + OFF_B0L) * 2; o3 = (ab + OFF_B0L) * 3;
+          sRad[ab + OFF_B0L] = 0; sLoc[o2] = 0; sLoc[o2 + 1] = 0;
+          sSeed[o3] = hA; sSeed[o3 + 1] = hB; sSeed[o3 + 2] = hC;
         }
         this._shardDirty = true;                    // 下一帧把这些属性上传一次（见 _updateShardBurst）
         /* 速度：沿法线剥离为主 + **沿块自己的朝外方向四散**（草图：四块箭头各指一方）
@@ -7940,30 +8029,48 @@ export class L5Core {
       const pvx = px - tgx * hh, pvy = py - tgy * hh, pvz = pz - tgz * hh;
       const R0 = T0 * bright, R1 = T1 * bright, R2 = T2 * bright;
       /* 块顶点源 = 裂缝块池里本槽位的 (u,v)（发射时写入、已减块质心）；mvc = 边界点数 m。
-       * ★ v5.4 起 0 号顶点 = **块质心**（局部 (0,0)），边界点整体后移一格；超出 mvc 的部分
-       * **复制 b0**（不是复制末点，见下）⇒ 索引扇形多出的三角形零面积、加色下不可见。 */
+       * ★ v5.8.12 厚度版：槽位映射与索引缓冲 / 发射端属性写入**三处必须逐字一致**（表见构造处）。
+       *   同一个 (u,v) 算两遍 —— 一遍沿 +nrm 抬 h/2（顶面）、一遍沿 −nrm 压 h/2（底面）——
+       *   再加侧壁裙边两份 ⇒ 侧壁是严格的"直线挤出"，顶/底绝不会错位。 */
       const pcArr = this._shardPieces, pcb = s.slot * SHARD_PIECE_V * 2, mvc = s.vcount;
-      for (let v = 0; v < SHARD_PIECE_V; v++) {
-        /* ★ v5.4（B 方案）顶点映射：v=0 → **块质心**（局部 (0,0)）；v=1..mvc → 边界 b_{v-1}；
-         *   v>mvc → **复制 b0**（闭合楔形 (质心, b_{m-1}, b0) 靠它画出来）。
-         *   必须与 _emitShardBurst 里写 aLocal/aRad 的映射**逐字一致**。 */
-        const bi = v === 0 ? -1 : (v <= mvc ? v - 1 : 0);
-        const u0 = bi < 0 ? 0 : pcArr[pcb + bi * 2];
-        const v0 = bi < 0 ? 0 : pcArr[pcb + bi * 2 + 1];
-        const uu = (u0 * cr - v0 * sr) * size;
-        const vv = (u0 * sr + v0 * cr) * size;
-        /* ① 平铺（未掀开）位置 → 相对枢轴 ② 绕 â 做 Rodrigues 旋转 ③ 回到世界 */
-        const rx = px + ax.x * uu + ay.x * vv - pvx;
-        const ry = py + ax.y * uu + ay.y * vv - pvy;
-        const rz = pz + ax.z * uu + ay.z * vv - pvz;
+      const OFF_B0 = this._shardOffB0, OFF_S0 = this._shardOffS0, MM = SHARD_M_MAX;
+      const half = SHARD_THICK * 0.5 * size;
+      const _uv = this._shardUV || (this._shardUV = [0, 0]);
+      /** 源边界序号 → 自转后的面内偏移。**sv < 0 = 质心**（局部 (0,0)，不是 b0！）。 */
+      const spinUV = (sv, out) => {
+        const src = sv < 0 ? -1 : (sv >= mvc ? 0 : sv);
+        const u0 = src < 0 ? 0 : pcArr[pcb + src * 2];
+        const v0 = src < 0 ? 0 : pcArr[pcb + src * 2 + 1];
+        out[0] = (u0 * cr - v0 * sr) * size;
+        out[1] = (u0 * sr + v0 * cr) * size;
+      };
+      /** 面内 (uu,vv) + 法线侧偏移 dn ⇒ 世界坐标写进 pos[w..w+2]。 */
+      const place = (w, uu, vv, dn) => {
+        /* ① 平铺位置 → 相对枢轴 ② 沿 nrm 偏 dn（厚度）③ 绕 â Rodrigues ④ 回世界 */
+        const rx = px + ax.x * uu + ay.x * vv - pvx + nrmx * dn;
+        const ry = py + ax.y * uu + ay.y * vv - pvy + nrmy * dn;
+        const rz = pz + ax.z * uu + ay.z * vv - pvz + nrmz * dn;
         const dd = hx * rx + hy * ry + hz * rz;
         const qx = rx - hx * dd, qy = ry - hy * dd, qz = rz - hz * dd;
         const cxq = hy * qz - hz * qy, cyq = hz * qx - hx * qz, czq = hx * qy - hy * qx;
-        const w = o + v * 3;
         pos[w] = pvx + hx * dd + qx * cth + cxq * sth;
         pos[w + 1] = pvy + hy * dd + qy * cth + cyq * sth;
         pos[w + 2] = pvz + hz * dd + qz * cth + czq * sth;
         col[w] = R0; col[w + 1] = R1; col[w + 2] = R2;
+      };
+      /* ① 顶面：质心(槽 0) + 边界(槽 1..MM)，沿 +nrm 抬 half */
+      spinUV(-1, _uv); place(o, _uv[0], _uv[1], half);
+      for (let v = 0; v < MM; v++) { spinUV(v, _uv); place(o + (1 + v) * 3, _uv[0], _uv[1], half); }
+      /* ② 底面：质心(槽 OFF_B0) + 边界，沿 −nrm 压 half */
+      spinUV(-1, _uv); place(o + OFF_B0 * 3, _uv[0], _uv[1], -half);
+      for (let v = 0; v < MM; v++) {
+        spinUV(v, _uv); place(o + (OFF_B0 + 1 + v) * 3, _uv[0], _uv[1], -half);
+      }
+      /* ③ 侧壁裙边：顶边(OFF_S0..) 与底边(OFF_S0+MM..)，与顶/底同 uv */
+      for (let v = 0; v < MM; v++) {
+        spinUV(v, _uv);
+        place(o + (OFF_S0 + v) * 3, _uv[0], _uv[1], half);
+        place(o + (OFF_S0 + MM + v) * 3, _uv[0], _uv[1], -half);
       }
       /* 拖尾锚点 ★ v5.1：**块内缘的那个真实边界点**（发射时记在 s.eu/s.ev）——
        *   走与块顶点**完全相同**的一套变换（自转 → 绕 â Rodrigues）⇒ 锚点精确落在碎片边界上。
