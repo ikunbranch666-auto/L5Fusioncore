@@ -192,6 +192,232 @@ const DP_INHALE_MAX = 10;       // 20-80 段 80 时的每秒吸入数
 /* v-内容4-形：DP_FLOW_R1 / DP_FLOW_R2（>80 双股环流轨道半径）已随 flow 模式一并删除
  * —— 用户定标">80 是全部被吸入，不存在环流"。 */
 
+/* ★ v-碎膜：**碎膜飞散**（用户构思）—— 跌破 80 时，外围那圈变白的碎块表面不再"瞬间褪白"，
+ * 而是**白膜裂成一系列微小水晶碎片、往外剥离消散**。
+ *   · 碎片形状与大小**来自各自碎块面的简化轮廓**（不是通用小方块）⇒ 每片形状都不同；
+ *   · 因此**不能用 InstancedMesh**（它要求全部实例共享一份几何，装不下 285 种形状）
+ *     ⇒ 走**动态顶点缓冲**：每个碎片把自己的轮廓顶点写进同一个 BufferGeometry ⇒ 仍是一次 draw call；
+ *   · 碎片从**外缘环**产生 —— 只有那一圈会变白（数据粒子捕获池「_pickFragmentIndex」只在
+ *     radialN ≥ 0.72 的外缘环里选片），与用户观察一致；
+ *   · 与数据粒子（DP）是两套东西：DP 是能量粒子，这里是碎块白膜裂出的晶片。 */
+const SHARD_MAX = 2300;           // 碎片池上限。★ v5.8.2：1400 → 2300 —— 用户定标"**每个白了的碎块面
+                                  // 都要碎**"⇒ 需要量 = 外缘环片数（band3，≈60~132）× 每片 12~16
+                                  // ≈ 720~2100 ⇒ 池必须够，否则后挑中的片会被静默丢弃。
+                                  // ⚠⚠ **硬天花板 = 2340，不许再往上抬**：碎片几何的索引缓冲是
+                                  // `Uint16Array`，索引 = `s * SHARD_PIECE_V + k`，最大 = `SHARD_MAX × 28 − 1`；
+                                  // 超过 65535 会**静默回绕**（不报错、几何错乱）。2340×28−1 = 65519 是极限。
+                                  // 池不足会**静默丢弃**（观测口 `_shardMissed`）；代价只有内存（≈7MB）
+                                  // + 命中时的定长循环，draw call 恒为 2。
+const SHARD_RING_N = 0.72;        // 只有 radialN ≥ 此值（= 捕获池覆盖的外缘环）才可能变白
+const SHARD_PIECE_V = 28;         // 每块碎片的**最大顶点数**（动态缓冲按此定长）。
+                                  // v5.4（B 方案）：顶点池布局从「[v0..v_{m-1}]」改成
+                                  // 「[质心, v0, v1, …, v_{m-1}, b0(重复)]」—— 锚点必须是**块质心**
+                                  // （胞是凸的 ⇒ 顶点平均必在块内），否则连最基础的
+                                  // "心暗边亮/心到边的径向坐标"都拿不到（每块只有一圈边界点）。
+                                  // 容量：胞 = 母片轮廓（≤ SHARD_HULL_MAX 条边）被最多
+                                  // (SHARD_TILE_NMAX−1) 个半平面各裁一刀、凸多边形每刀净增 ≤1 顶点
+                                  // ⇒ m ≤ 10 + 15 = 25；扇形锚点 = 质心 ⇒ 需 m + 2 = 27 顶点。
+                                  // ★ v5.8：24 → 28（块数从 9 提到 16 之后，槽位必须够 27）。
+                                  // 代价 = 每帧多变换 4 顶点/槽（仅爆发期可见，且 VERT 侧近免费）。
+const SHARD_HULL_MAX = 10;        // 每片碎块**凸包轮廓**的顶点上限（重分网格的片包络点可能
+                                  // 几十个 ⇒ 单调链求完凸包后等距抽稀到这个数）
+const SHARD_LIFE_MIN = 0.90;      // 碎片生命下限（s）
+const SHARD_LIFE_MAX = 1.40;      // 碎片生命上限（s）
+const SHARD_OUT_SPD = 0.85;       // 沿面法线"往外剥离"的初速（u/s）。★ v3：0.55→0.85 ——
+                                  // 太慢时位移只有 ~0.3u，贴在晶面上读不出"剥离"，像原地淡出。
+const SHARD_SPREAD = 0.16;        // ★ v4 语义变更：块沿**自身朝外方向**的四散速度（u/s）——
+                                  // 用户草图（四块各标 1/2/3/4、箭头各指一方）：裂开的块不是
+                                  // 整体一起平移，而是各沿"片心→块心"的方向散开；另加少量
+                                  // 切向抖动错开块与块。
+/** ★ 掀开角（rad）：碎片绕**本片内缘的铰链线**从 0 向外掀到该角度 —— 这是"从面上向外剥离"
+ *  的视觉主语。正交/小 FOV 下，沿法线的平移几乎就是沿视线 ⇒ 屏幕上根本不动；只有**姿态**的
+ *  改变（轮廓被拍扁/转过去）才读得出来。★ 枢轴取"内缘"（片心 − t̂·半宽）而不是片心：
+ *  绕自身中心转 = 两半反向翻 = 读成"碎屑翻滚"；绕内缘转 = 一条边钉住、另一边掀起来
+ *  = 读成"舱门/膜片往外开"。 */
+const SHARD_TILT_MAX = 1.15;
+const SHARD_DRAG = 1.0;           // 阻尼（1/s）。★ v3：1.6→1.0 ⇒ 终止位移 ≈ 0.85u，明确离开晶面
+const SHARD_SPIN_MAX = 2.2;       // 自转角速度上限（rad/s）。★ v4：8.0→2.2，且**出生相位 = 0**
+                                  // —— 块出生那一刻必须与邻块拼合成完整白膜（"裂开"的前提），
+                                  // 随机相位 + 快速自转会直接读成"一堆乱飞的碎屑"。
+const SHARD_HDR = 0.24;           // 亮度增益（加色）。★ 定标史：1.45（整屏炸白）→ 0.55
+                                  // （仍是一片"白色的片"）→ 0.24。加色是**叠加**：几百片同时
+                                  // 可见时按"单片看着合适"定标必然过曝；而且它贴在本来就接近
+                                  // 白饱和的晶面上，越亮越读不出形状 ⇒ 只能压到比母面更暗，
+                                  // "剥离下来的那一层"才看得出来。
+/** ★ 结膜门槛（`cool` = u_cool 归一值 ≥ 此值才裂）。
+ *  ★★ v5.8.2：0.85 → **0.18**（= `stored ≥ 1`，即"**被命中过一次 = 这一片有膜了**"）。
+ *   为什么这次是"语义错"而不是"阈值调参"：
+ *   · 命中分配由 `_buildHitQueue(ring, …)` 保证「每个转动间隔内，本面外圈**每片**至少一次」
+ *     （见 _updateHitQueues），所以外圈每片都会攒到 `stored` —— 用户看到的是**整圈膜**；
+ *   · 而 0.85 要求 `stored ≥ 4.7`（≈**同一片被命中 5 次**，需要站住 5 个转动窗口）⇒ 它筛掉的
+ *     是"膜还不够厚"的片，**不是**"没膜的片" ⇒ 与用户"每个碎块的面都该碎"的诉求正好相反；
+ *   · 膜**厚薄**本来就只该决定碎片的**亮度**（`cool` 已在做这件事），不该决定裂不裂。
+ *  ⚠ 与 v1「stored > 0」的区别（当时被否过，为什么现在可以）：v1 是"挨过一两粒就裂"**且**
+ *    每片只有 3/6/9 块、保险丝还是"按比例缩块数" ⇒ 满屏小碎片糊成一片白。现在每片 12~16 块、
+ *    保险丝**按片数入选**且预算 = 外圈池需要量 ⇒ "整圈膜一起碎成晶片"是用户新定标的效果。
+ *  ⇒ 教训（沿用）：**别拿"阈值落在饱和区哪一侧"解释"物体没出现"**；但反过来也成立 ——
+ *    **别拿"调阈值"去修"数量不对"**，先问这个阈值的语义是不是错的。 */
+const SHARD_COOL_MIN = 0.18;
+/** 单次爆发**碎片总量预算上限**（白屏保险丝）。
+ *  ★ v5.8：260 → 400，且**保险丝改口径**（原来"按比例缩每片的块数、保底 2 片"，现在"按白得
+ *    最狠优先挑片、每片块数一个都不削"）。用户定标："碎片至少要分 10 块" ⇒ 块数不许被削，
+ *    要控总量只能**少挑几片**。
+ *  ★★ v5.8.2：400 → **1800**，而且**不再拿它当实际预算** —— 崩裂帧取
+ *    `budget = min(SHARD_BURST_MAX, 外圈池片数 × 每片最多块数)`（见 _emitShardBurst）。
+ *    为什么必须抬：用户定标"**每个白了的碎块面都要碎成很多片**"⇒ 需要量 = 外圈池（band3，
+ *    约 60~132 片）× 12~16 ≈ 720~2100 块；而 400 只够 `400/12 ≈ 33 片` ⇒ 它本身就是
+ *    "其余碎块根本没碎片出来"的第二条成因（第一条见 SHARD_COOL_MIN 的语义修正）。
+ *  ★ 为什么加大总量不会更亮：碎块**精确拼合**母片 ⇒ 加色总量 ∝ 覆盖面积，跟切成几块无关；
+ *    且膜薄的片 `cool` 低 ⇒ 碎片本身就暗，整圈一起碎不会把画面推白。
+ *  ⚠ 上界受 SHARD_MAX 约束（Uint16 索引硬天花板 2340，见 SHARD_MAX 注）。 */
+const SHARD_BURST_MAX = 1800;
+const SHARD_TINT = [0.80, 0.90, 1.00];   // 碎片本体：冷蓝白（比纯白偏蓝 ⇒ 压在晶面上不会直接拉白）
+/** ★ 拖尾色 = **白**（v5.1：用户定标 —— 不要青色流线，和碎片本体同一族白）。
+ *  定标史：v3 青 [0.36,0.78,1.00]（"能量笔迹"）→ v5.1 纯白。 */
+const SHARD_TRAIL_TINT = [1.00, 1.00, 1.00];
+/** stored 分档 → **档位序号**（第二列 = SHARD_TILE_NS 的下标，不是块数本身）。
+ *  ★ v5.8：块数从「3/6/9」改成「10/13/16」（用户："至少要分 10 块"）；门槛沿用 15/35/50
+ *    ⇒ 门槛以下的片（stored 刚过结膜闸 4.7 的那批）现在也裂 **10** 块，不再是 3 块。
+ *  门槛在 SHARD_COOL_MIN（不够白 = 没结膜 = 不裂）。 */
+const SHARD_TIERS = [[15, 0], [35, 1], [50, 2]];
+/** 出生时沿面法线的微小抬离（u）：碎片一出生就**离开**晶面一点点，
+ *  否则第一帧它和母面完全重合、又都是加色白 ⇒ 看起来"不是从面上剥出来的"。 */
+const SHARD_LIFT = 0.014;
+const SHARD_TRAIL_LEN = 0.24;     // 拖尾长度**上限**（u）。实际长度按块自身尺寸定标（见 update）。
+                                  // ★ v5.6：0.34 → 0.24 —— 用户实测把拖尾读成"细长条"：细长 =
+                                  // 长且窄，先砍长（宽的根治见 update 里的"屏幕面内宽度"）。
+const SHARD_TRAIL_W = 0.022;      // 拖尾宽度（u）。★ v5：0.010→0.022 —— 0.010u 在屏上只有 ≈2~3px，
+                                  // 又贴在白膜上，等于没画。
+const SHARD_TRAIL_ALPHA = 1.0;    // 拖尾亮度（相对本体）。★ v3 0.34→0.85，v5 →1.0（与本体同量级）
+/** ★ v5 关键修正：拖尾整条沿 +nrm 抬这么多（u），保证它**浮在母面之上**。
+ *  根因：旧版方向 = −vel，而 vel 的主导项是**面法线**（OUT_SPD 0.85 vs 切向 0.16）⇒ 尾巴往回伸
+ *  0.22u 时碎片只抬离了 0~0.4u ⇒ 大半条沉到晶面以下，被 depthTest 的晶体几何整条剔掉（与规则 27
+ *  同源：法线方向在正交相机下既不产生屏幕位移、也会被自己挡掉）⇒ 用户"一条都没看到"。
+ *  现在方向先投影到**切平面**，再整体抬高 ⇒ 永不被母面遮挡、且必然有屏幕投影。 */
+const SHARD_TRAIL_LIFT = 0.020;
+/** ★ v5.6：整条再沿 **+Z（朝相机）** 抬这么多。相机是固定正交（视线恒 −Z）⇒ 这个抬升**在屏幕上
+ *  零位移**，只改深度：把拖尾从壳面"拎"到相机这一侧 ⇒ 宽度方向改成屏幕面内之后（见 update），
+ *  掠射角那部分带子也不会再被壳体 depthTest 削掉半条。可见面片沿 +Z 必然离开凸壳（可见点 =
+ *  该视线进入壳体的入口，再往前就是壳外）。 */
+const SHARD_TRAIL_ZLIFT = 0.030;
+
+/* ==================== v5.4 碎膜**质感**（B 方案 · 见《碎片质感调研_2026-10-02.md》§5）====================
+ * 用户："碎片只有一个色块，没有质感" —— 根因是本体走 MeshBasicMaterial + 逐顶点色，
+ * 而顶点色**块内是同一个数**（发射时「TINT × bright」一次算完，块里 m 个顶点同值）
+ * ⇒ 没有光照、没有棱面、没有边，屏上就是一撮平色片。
+ *
+ * 三条杠杆（调研 §2）：① 逐块**刻面法线** → envProc 的灯带在棱面上扫过（"活光"，最关键）；
+ * ② **贴边一圈亮棱线**（晶片的"棱"，见 SHARD_RIM_P/SHARD_EDGE_K）；③ 面内微结构（#define 可整层消融）。
+ *
+ * ★ 亮度策略：**基底仍是顶点色**（= TINT × bright，死亡时归零 ⇒ 加色下"消失"，这条机制
+ *   不能丢），着色器只乘一个**块内/块间调制因子** ⇒ 整体亮度与改前同级，拉开的是对比。
+ *   定标（按 envProc 的实测取值域估）：天光底 0.008~0.05、水平环带 ~0.24、灯带峰 ~1.4；
+ *   取"归一后的加性高光"模型 shade = BODY·(1 + K·env/(HL+env))：
+ *     env→0 : 0.95（纯本体，不黑）   env 0.15 : 1.36   灯带峰 1.4 : 1.97
+ *   ⇒ 不会出现"环境暗处碎片变黑"，亮带扫过时约 2 倍闪烁。单旋钮 = SHARD_ENV_K。 */
+const SHARD_FACET_K = 0.50;       // 刻面法线混合量：N = mix(真实面法线, 每块随机方向, 此值)
+                                  // 0 = 整块一个朝向（回到平色）；0.50 ≈ 最大偏 30°
+                                  // ★ v5.5：0.30 → 0.50 —— 0.30 只偏 17°，相邻块的反射方向
+                                  //   几乎一样（灯带要么都扫到、要么都扫不到）⇒ 块间没明暗差；
+                                  //   0.50 才能让"有的块亮、有的块暗"真正看得出来。
+const SHARD_ENV_HL = 0.30;        // envProc 归一化的半饱和常数（Reinhard 式压缩 ⇒ 不作黑）
+const SHARD_ENV_K = 1.30;         // ★ 唯一旋钮：环境反射增益（越小越平，越大越闪）
+const SHARD_BODY = 0.95;          // 环境反射 = 0 处的本体亮度倍数（保证背光棱面不黑）
+const SHARD_RIM_P = 6.0;          // 边缘亮线的 pow 指数：越大亮线越细、越贴边
+                                  // ★ v5.5：3 → 6 —— 3 的"边亮"摊在半径后半段，屏上读作
+                                  //   "块内渐变"；6 才收成贴边 1~2px 的一条**轮廓亮线**，
+                                  //   碎晶的"棱"就是靠它读出来的。
+const SHARD_EDGE_K = 1.00;        // 边缘亮线的增益（边缘最亮 = (1 + 此值) 倍；0 = 关）
+                                  // ★ v5.5 删掉旧 SHARD_RIM_BASE / SHARD_CRACK_DARK：
+                                  //   旧"心暗边亮 + 沿裂缝暗带"是**减光**，而碎片是加色层，
+                                  //   在已很亮的晶面上减掉 0.06 的加色 = 屏上几个灰阶 ⇒ 看不见。
+                                  //   看得见的方向只有一个：**加**（贴边加亮，轮廓自己发光）。
+const SHARD_SURF_GAIN = 1.15;     // 总体重定标（见上定标）
+const SHARD_MICRO = true;         // false = 编译期消融"面内微结构"整层（规则 18 的手法）
+const SHARD_MICRO_SCALE = 5.5;    // 微结构格子密度（块局部坐标 × 此值）
+const SHARD_MICRO_K = 0.22;       // 微结构幅度（0 = 关）
+
+/* ★★ v5.5 碎块改成「**长出来**」而不是「切出来」——三个旋钮 ──────────────────
+ * 旧法（Voronoi 把母片切成 n 份）的结构性缺陷：**胞的形状被母片长宽比锁死**。
+ * 母片（外圈环带）是 2~4:1 的长条 ⇒ 填满条宽的胞自身就有 2~4:1；边界胞更被包边
+ * 斜切成长三角。v5.3 的闸门是"删掉细长胞让邻胞长大补"，但邻胞长大**又**变细长
+ * ⇒ 删一批长一批，永远追不完（用户实测"还是有非常多的细长三角形"）。
+ * 新法：每颗种子**自己长一块**各向同性的多边形小晶片（半径抖动 + 随机相位），
+ * 半径取 min(按面积分摊的基准, 到包边距离×FIT) ⇒ **塞不进的地方自动缩小**，
+ * 细长条从结构上不可能出现。 */
+/* ★★ v5.7 **等面积分割**（power diagram / 加权 Voronoi）：把"能拼合"和"不出细长条"同时拿回来 ────
+ * ★ 既定不变式（**不许再丢**）：白膜崩出来的碎块**必须能拼回原来那片碎片面** —— 块与块共享
+ *   裂缝边、所有块合起来 = 母片轮廓（精确覆盖）。v5.5/v5.6 为了消灭细长条改成"每块自己长"，
+ *   把这条不变式丢了（用户点名："这些白色碎片要能拼成原来的碎片面"）。
+ *
+ * 为什么普通 Voronoi 会出细长条、而"等面积"能治：普通 Voronoi 只保证"离谁近归谁"，**不保证面积**，
+ * 一格被两边挤住的胞就摊成条；面积一旦拉平，长条母片里的胞会自动排成砖块阵 ⇒ 每块都敦实。
+ * 做法 = 给每颗种子一个权重 w，把裁剪线从"垂直平分线"挪到"带权平分线"：
+ *     |p−Sk|² − wk ≤ |p−Sj|² − wj   ⟺   p·n ≤ c， n = (Sj−Sk)/|Sj−Sk|，
+ *     c = (|Sj|² − |Sk|² + wk − wj) / (2|Sj−Sk|)
+ *   ⇒ **同一个 `_shardClipHalf`**，只是裁剪中点由 (Sk+Sj)/2 挪到 c·n。
+ * 迭代：裁一遍 → 按面积误差调权重（增量重定心，只有差值有意义）→ 再裁 …… 直到各胞面积落进容限。
+ * ⚠⚠ 权重是"加"进裁剪刀的 ⇒ **抬权 ⇒ 胞变大**（c 里带 `+wk`）。所以面积**超出**目标的胞必须
+ *   **降权**（`w_k -= GAIN·err`）。★ v5.7 这里写成了 `+=`（连理由都记反了）⇒ **正反馈**：
+ *   越大的胞越大、邻居被挤成 0 顶点 ⇒ 细长闸门把邻居全删掉 ⇒ pc 从 12 塌到 1~4，
+ *   凸包偏长的片连最后一块都过不了闸门（`keep < 1 ⇒ return 0`）⇒ **整片不崩**。
+ *   用户 v5.7「碎片太少了」与 v5.8「根本没有分出 10 片」都是这一条，**不是块数档位的问题**。
+ *   v5.8 修正：更新方向取反 + 步长改阻尼（见 SHARD_TILE_GAIN 注）。w 与面积同量纲 ⇒ 步长 O(1)。
+ * ⚠ 只做**权重**配平、**不做** Lloyd 重心松弛 —— Lloyd 会收敛成蜂窝六边形（用户刚否过"全是六边形"），
+ *   权重配平保留不规则种子的布局 ⇒ 胞的形状/朝向/边数依旧五花八门。 */
+const SHARD_TILE_PASS = 10;       // 每轮配平迭代上限（提前收敛即退出）
+const SHARD_TILE_TOL = 0.30;      // 面积相对误差容限（各胞落进各自目标的 ±30% 即停）
+/** ★★ v5.8 修正：权重步长 **0.90 → 0.45**（配合下面"更新方向反了"的修正一起改的）。
+ *  一个胞的每条边界都由「到某个邻居的带权平分线」给出 ⇒ 抬权 δ 会把**每条**边界同时往外推
+ *  ⇒ 面积响应 ∂A/∂w ≈ 2（正方形胞估法：周长 4s × 位移 δ/(2s) = 2δ）。
+ *  · 原 0.90 ⇒ 迭代因子 |1 − 0.9·2| = 0.8 ⇒ **来回震荡**，10 趟都压不进 SHARD_TILE_TOL；
+ *  · 0.45 ⇒ |1 − 0.45·2| = 0.1 ⇒ 两三趟收敛。
+ *  单步上限仍由 SHARD_TILE_STEP 兜底（防初始大误差一步过冲）。 */
+const SHARD_TILE_GAIN = 0.45;
+const SHARD_TILE_STEP = 0.25;     // 单次权重修正上限（× 该胞目标面积）⇒ 防震荡
+const SHARD_TILE_ROUND = 3;       // "删细长胞 → 重新配平"的最大轮数（删了种子必须重配，否则邻胞长大又变细）
+/** ★ v5.8 种子最小间距²（× 面积/块数）—— 见 _shardPartitionN 的"抛镖采样"。
+ *  越小 ⇒ 越容易扎堆（会出小屑、多几个被闸门删掉的胞）；越大 ⇒ 越像点阵（"切菜"的味道回来了）。 */
+const SHARD_SEED_GAP = 0.25;
+/** ★ v5.8 面积目标的**随机幅度**：每块目标面积 = 平均面积 × (1 ± 此值)。
+ *  0 = 等面积（**用户否掉的"切菜等宽段"**）；0.55 ⇒ 最大块 / 最小块 ≈ 3.4:1 ⇒ 有大块有小屑。 */
+const SHARD_TILE_SIZE_VAR = 0.55;
+/** 细长闸门：q = 2·√面积/周长，越小越细长（正方形 0.50 / 等边三角形 0.44 / 1:3.5 ≈ 0.42 /
+ *  1:5 ≈ 0.37 / 1:8 ≈ 0.31）。低于此值的胞**连种子一起删掉再配平** —— 它占的那块区域会被
+ *  邻胞接管（仍是精确拼合，只是那一片归了隔壁）。 */
+const SHARD_CHIP_CHUNK = 0.34;
+/** ★ v5.8 **每片白膜按档位切几块**（索引 = 档位序号，档位见 SHARD_TIERS）。
+ *  用户定标（v5.7 实测）："分的碎片太少了…… 碎片至少要分 10 块" ⇒ 最低档从 3 提到 12。
+ *  ⚠ 这里填的是**请求块数**，不是最终块数：母片凸包的**尖角**处必然产生楔形胞，
+ *    它们会被细长闸门（SHARD_CHIP_CHUNK）合并给邻居 ⇒ 最终块数通常比请求数少 1~3。
+ *    所以请求数留了余量，最终落在 10~16（下限由 SHARD_TILE_MIN 兜底）。
+ *  ⚠ 这个数组的第二列与 SHARD_TIERS 的第二列**必须一一对应**（tile 索引 = 档位序号）。 */
+const SHARD_TILE_NS = [12, 14, 16];
+const SHARD_TILE_N = SHARD_TILE_NS.length;                  // 每片烘 3 份（索引 = 档位序号）
+const SHARD_TILE_NMAX = SHARD_TILE_NS[SHARD_TILE_N - 1];    // 单次请求上限 = 16（= PART_N，槽位上限）
+/** ★ 用户硬地板：**每片至少崩 10 块**。少数凸包太尖、楔形被合并得太多时会跌破它 ⇒
+ *  烘格期为这一档**放宽闸门重切一次**（见 _shardBakeTiles），宁可那一两块薄一点。 */
+const SHARD_TILE_MIN = 10;
+/** 预烘格**单胞**的顶点上限：胞 = 母片轮廓（≤ SHARD_HULL_MAX 顶）被最多 (NMAX−1) 个半平面裁，
+ *  顶点数 ≤ `SHARD_HULL_MAX + (SHARD_TILE_NMAX − 1)` = 25。 */
+const SHARD_TILE_V = SHARD_HULL_MAX + SHARD_TILE_NMAX - 1;
+/** ★ 预烘格：胞的分割只依赖（母片轮廓, 块数）——两者都在加载期就定死了 ⇒ **加载时烘一次、
+ *  崩裂帧直接查表**（崩裂帧内零迭代、零分配）。每片烘 `SHARD_TILE_N` 份（= 档位数）。 */
+
+/* ★ 碎块分割（等面积 power diagram）的定长 scratch —— 模块级、加载期分配一次；
+ * **只在加载期（预烘格）用**，崩裂帧只从 `this._shardTiles` 拷进这里 ⇒ 渲染帧内零分配
+ * （见状态池同款约束：运行期 new 会造成 GC 抖动）。
+ * 槽位约定：「_PART_POOL[0..pc-1]」= pc 个胞，**槽 PART_HULL 专门存母片轮廓**（裁剪时它必须
+ * 保持不变）；pc ≤ SHARD_TILE_NMAX = 16 ⇒ 0..15 够用。每槽定长 SHARD_PIECE_V 个 (u,v)。 */
+const PART_N = SHARD_TILE_NMAX;                           // 胞的槽数上限（0 .. PART_N-1）
+const PART_HULL = PART_N;                                 // 母片轮廓专用槽（= 16，永不被写）
+const _PART_POOL = new Float32Array((PART_N + 1) * SHARD_PIECE_V * 2);
+const _PART_N = new Uint8Array(PART_N + 1);               // 各多边形的顶点数
+const _PART_A = new Float32Array(SHARD_PIECE_V * 2 + 4);  // 半平面裁剪的输出缓冲
+const _PART_S = new Float32Array(PART_N * 2);             // 种子点（每胞一个 (u,v)）
+const _PART_W = new Float32Array(PART_N);                 // 各胞的**权重**（power diagram 用）
+const _PART_T = new Float32Array(PART_N);                 // 各胞的**面积目标系数**（随机 ⇒ 有大块有小屑）
+
 /** 内壳展开的 MainParam 阈值区间（激发态切换点） */
 // v5.4：用户指定能量档位 —— <20 不显示分割线 / 20~80 显示切割线 / >80 展开
 export const DEPLOY_START = 0.80;
@@ -331,6 +557,51 @@ export const SHELL_ARC_COMP = 1.15;
 export const WALL_AMP_FLOOR = 0.55;
 /** v5.21：侧壁显现门控 wallVis 的下限（原 smoothstep(0.02,0.30,u_deploy) 在渐显段恒为 0） */
 export const WALL_VIS_FLOOR = 0.60;
+
+/* ==================================================================== *
+ *  v6 步 2 · 晶体学区 + 生长扇区（设计提案 P1 → 步 2b 修正）
+ *
+ *  历史病根 = 把结构放进**加色通道**（v5.11 自认"填平元凶"；v5.18 探针实测内芯冷光均匀度
+ *  std/mean = 3.11 = 雾，轮廓线 11.6 = 线）⇒ 结构只能走 mul/attenuation 或**方向**。
+ *
+ *  ⚠ 步 2b 修正（实测教训，已成规则 21/22）：初版把学区**只**喂 σ，实机"看不出任何变化"。
+ *  根因不是接线而是通道：本片板厚 0.030±0.012、路径 = 厚度/max(0.32,ndv) ⇒ τ = σ·path ≈ 0.2
+ *  ⇒ absorb ≈ 0.72~0.94 **处处≈1**（σ 改 ±55% 只让 absorb 动 ~10%，级联后只剩 2~5 灰阶）。
+ *  而同 program 内的 L06（c *= 0.26+0.74·key^1.25）一眼可见 ⇒ **差别在通道，不在幅度**。
+ *  ⇒ 学区改为三层协同：L01a **方向**（法线微扰，借 L01/L02 环境成像 + L06 主光）、
+ *    L03a σ（保留：物理归属正确，τ 抬升后自动生效）、L04a **c 乘性**（无条件保底可见）。
+ *
+ *  对齐依据（不是新发明的形状，而是把**基准面已有的**结构线搬到碎块上）：
+ *   · 环半径 0.30 / 0.66 —— 与 panelHeight() mode-0 的 sdPentagon(uv, apo*0.30 / apo*0.66)
+ *     **逐点等价**：碎块的 t = vCrackUV.x 由 dodecaKit 的 warp 用 r = T·rB(A) 归一化
+ *     ⇒ t 的等值线本身就是同心五边形，t = R ⇔ 内切半径 apo·R 的那个五边形。
+ *     （dodecaKit 注释里的 "0.62" 是旧值；实际渲染的是 GLSL 侧的 0.66。）
+ *   · 辐条方向 = 五边形**顶点**方向 = u_band_phi0 − 36° + k·72°
+ *     （phi0 = 边法线起始角；顶点方位 = 边法线 −36°，与 dodecaKit 的 vertAz 同相位。）
+ *
+ *  ★ 与项目旧的「GLSL #define + JS 侧镜像双写」惯例不同：本组常量只用**模板插值单向注入**
+ *    FRAG（单一真源），不存在"改一边忘了另一边"的漏改面。
+ * ==================================================================== */
+/** 内环半径（归一化）—— 0.30 与基准面 d2 同心五边形重合 */
+export const CRYST_ZONE_R1 = 0.30;
+/** 外环半径（归一化）—— 0.66 与基准面 d1 同心五边形重合 */
+export const CRYST_ZONE_R2 = 0.66;
+/** 环的半宽（归一化半径单位）；0.030 与 vCrystalNoise 噪声的最小格子同量级 */
+export const CRYST_ZONE_W = 0.030;
+/** 辐条角向半宽：用「Δa · t」度量 ⇒ 弧长近似恒定，面心不会糊成一团 */
+export const CRYST_SPOKE_W = 0.055;
+/** 环/辐条处的额外吸收：σ 乘 (1 + amt·zone) ⇒ 纹路更"实"、更暗 */
+export const CRYST_ZONE_AMT = 0.55;
+/** 生长扇区色带幅度：σ 逐通道微偏，三通道**和恒为 0** ⇒ 只偏色相、不改总吸收 */
+export const CRYST_SEC_AMT = 0.22;
+/** v6 步 2b · L01a：学区处的**法线微扰幅度**（rad；mask=1 时的倾斜角）。
+ *  环上因 czZone 是帐篷形，实际有效值 ≈ 一半（≈11°）；辐条处可达满值。
+ *  这是本组的**主杠杆**：N 一动 ⇒ reflect / refract / fres / 主光同时改，且纹路随视角移动。 */
+export const CRYST_ZONE_TILT = 0.38;
+/** v6 步 2b · L04a：学区处对 c 的**直接乘性压暗**（无条件、逐像素生效）。
+ *  存在意义 = 保底：法线微扰只在"环境里有可成像亮源"时才出强对比（envProc 两条灯带很窄），
+ *  没吃到灯带的片会若隐若现；这一项保证环/辐条一定被看见。 */
+export const CRYST_ZONE_DARK = 0.34;
 /* —— Round G：面内径向「脉冲环 + 半隐扩散」——*
  * ★ v5.16 重构（用户明确指出：这些行为都该在**基准面**上，不该在水晶碎块上）：
  *   原实现把三种触发全部做在 285 片水晶碎块的材质上（_writeFaceRev 只写碎片 uniform），
@@ -704,6 +975,38 @@ float fbm3(vec3 p) {
 }
 `;
 
+/* —— 共享 GLSL：程序化环境成像 envProc（**v5.4 抽成公共块**）——
+ * 为什么抽出：碎膜质感（B 方案）要在**独立的碎片 program** 里采样同一片"解析天空"。
+ * 晶体之所以读作晶体，靠的是"反射了什么"；碎块从母壳上剥下来之后，如果反射的是另一片
+ * 天空（或干脆没有反射），一眼就是"另一层材料贴上去的"。
+ * ★ 规则 18：碎片**不并入** uber-FRAG（那份一份源服务全部晶体/核心/代理，寄存器按最重
+ *   分支分配），所以这段只能搬成公共块、两处各注入一份 —— 与 NOISE_GLSL 同一套机制。 */
+const ENV_PROC_GLSL = /* glsl */ `
+/**
+ * v5.4 程序化环境（水晶/宝石专用）
+ *
+ * 水晶之所以是水晶，靠的是**反射了什么**，而不是表面明暗：
+ * 一块真实晶体放在纯漫反射环境里就是一块灰玻璃 —— 它的"闪"全部来自环境里的
+ * 高对比亮源（灯带、窗、环形灯）在棱面上的锐利成像。这里没有环境贴图，
+ * 就用解析式造一个：暗底 + 顶部天光渐变 + 两条高斯灯带 + 一道水平亮环。
+ * 棱面法线一转，灯带像就在棱面上扫过 → 宝石的"活光"。
+ */
+vec3 envProc(vec3 d) {
+  float up = clamp(d.y * 0.5 + 0.5, 0.0, 1.0);
+  vec3 sky = mix(vec3(0.008, 0.013, 0.024), vec3(0.26, 0.38, 0.58), pow(up, 1.7));
+  // 两条竖直灯带（主高光 / 副高光）：角向高斯，越靠上越强
+  float az = atan(d.z, d.x);
+  float bar1 = exp(-pow(sin(az * 0.5 - 0.75) * 5.5, 2.0));
+  float bar2 = exp(-pow(sin(az * 0.5 + 2.05) * 8.5, 2.0));
+  sky += vec3(0.95, 0.98, 1.0) * (bar1 * 0.90 + bar2 * 0.42) * smoothstep(0.02, 0.70, up);
+  // 水平亮环（模拟环境里的环形灯），给侧壁断裂面一条横向反光
+  sky += vec3(0.40, 0.62, 1.0) * exp(-pow((d.y - 0.10) * 6.5, 2.0)) * 0.20;
+  // 底部微弱回光，避免背光面纯黑（纯黑会读成塑料）
+  sky += vec3(0.03, 0.05, 0.09) * smoothstep(0.35, 0.0, up);
+  return sky;
+}
+`;
+
 /* —— 共享 GLSL：水晶破碎折线（v5.17 全局规则；**v5.31 抽出供 VERT 复用**）——
  * 为什么必须抽出：v5.31 的前沿柱面（frontier band）要在**顶点着色器**里算出真实
  * 3D 位置，而它必须落在"碎块可见边缘"上 —— 那条边缘是片元 shellVis 用
@@ -759,6 +1062,107 @@ float crystalSegJitter(float az, float segs, float seed) {
   float j0 = hash11(s0 * 1.317 + seed * 11.3);
   float j1 = hash11(s1 * 1.317 + seed * 11.3);
   return (mix(j0, j1, f0) * 2.0 - 1.0);        // −1..1，段内线性 = 折线
+}
+`;
+
+/* ==================== v5.4 碎膜质感（B 方案）：碎片专用小 program ====================
+ * ★ 三条杠杆落在哪：①「N = mix(真实法线, 每块随机方向, SHARD_FACET_K)」→「envProc(reflect)」
+ *   扫过棱面；②「rim = pow(aRad, ·)」心暗边亮 + 紧贴外缘的裂缝暗带；③ 块局部坐标里的晶体斑。
+ *
+ * ★★ 法线为什么**不用属性**：碎片是真·刚性运动 —— CPU 每帧算自转 + 绕铰链的 Rodrigues
+ *   掀开（最大 SHARD_TILT_MAX 1.15 rad ≈ 66°）。片元侧「dFdx/dFdy(vShWorld)」拿到的就是
+ *   **这一帧真实几何**的面法线 ⇒ 掀开过程中反射跟着转（"活光"）。若改存一份静态法线属性，
+ *   掀开那 66° 的旋转就完全没有光学响应 —— 那是本项目最贵的一段动作。
+ *   退化保护：零面积三角形（末尾复制顶点那一圈）导数可能为 0 ⇒ 必须判长度再归一（规则 2）。
+ *   ★ three r186 把**非 RawShaderMaterial 一律编成 GLSL3** ⇒ dFdx 是核心函数，无需扩展声明
+ *   （同文件 pxLine 早已在用 fwidth）。所以这里仍写 GLSL1 风格（attribute/varying），
+ *   three 会在前面加「#define attribute in」等兼容定义。
+ *
+ * ★ 为什么另起 program：规则 18 —— uber-FRAG 一份源服务全部晶体/核心/代理，寄存器按最重
+ *   分支分配；碎片这点 ≈90~110 ALU 的小活儿塞进去，会把**所有**材质的占用率一起拉低。
+ *
+ * ★ 属性只在**发射时写一遍**（块局部量，终生不变）⇒ 每帧的 CPU 开销为零。
+ *   aLocal = 块局部坐标 ÷ 块半径（|aLocal| ≤ 1）；aRad = 0 质心 / 1 边界；
+ *   aSeed = 每块一个稳定三维种子（刻面方向 / 微结构相位）。 */
+const SHARD_VERT = /* glsl */ `
+precision highp float;
+attribute vec2 aLocal;      // 块局部坐标 ÷ 块半径 ⇒ |aLocal| ≤ 1（v0 = 块质心 = (0,0)）
+attribute float aRad;       // 0 = 块质心，1 = 块边界（**整条边界**都是 1，不是归一化半径）
+attribute vec3 aSeed;       // 每块一个稳定三维种子
+varying vec3 vShWorld;
+varying vec3 vShCol;
+varying vec2 vShLocal;
+varying float vShRad;
+varying vec3 vShSeed;
+void main() {
+  vShLocal = aLocal;
+  vShRad = aRad;
+  vShSeed = aSeed;
+  vShCol = color;                                   // = TINT × 亮度（死亡归零 ⇒ 加色下不可见）
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  vShWorld = wp.xyz;
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}
+`;
+
+const SHARD_FRAG = /* glsl */ `
+precision highp float;
+varying vec3 vShWorld;
+varying vec3 vShCol;
+varying vec2 vShLocal;
+varying float vShRad;
+varying vec3 vShSeed;
+
+${NOISE_GLSL}
+${ENV_PROC_GLSL}
+${SHARD_MICRO ? '#define SHARD_MICRO' : '/* 微结构层已消融（SHARD_MICRO = false） */'}
+
+#define SHARD_FACET_K   ${SHARD_FACET_K.toFixed(2)}
+#define SHARD_ENV_HL    ${SHARD_ENV_HL.toFixed(2)}
+#define SHARD_ENV_K     ${SHARD_ENV_K.toFixed(2)}
+#define SHARD_BODY      ${SHARD_BODY.toFixed(2)}
+#define SHARD_RIM_P     ${SHARD_RIM_P.toFixed(1)}
+#define SHARD_EDGE_K    ${SHARD_EDGE_K.toFixed(2)}
+#define SHARD_SURF_GAIN ${SHARD_SURF_GAIN.toFixed(2)}
+#define SHARD_MICRO_SCALE ${SHARD_MICRO_SCALE.toFixed(1)}
+#define SHARD_MICRO_K   ${SHARD_MICRO_K.toFixed(2)}
+
+void main() {
+  vec3 Vd = normalize(cameraPosition - vShWorld);
+  /* ① 本帧真实面法线（自转 + 掀开都在里面）—— 双面 ⇒ 一律翻向相机 */
+  vec3 gn = cross(dFdx(vShWorld), dFdy(vShWorld));
+  float g2 = dot(gn, gn);
+  vec3 N = g2 > 1e-12 ? gn * inversesqrt(g2) : vec3(0.0, 0.0, 1.0);   // 规则 2：退化不能全 0
+  N *= (dot(N, Vd) < 0.0 ? -1.0 : 1.0);
+
+  /* ② 刻面：把法线往**每块固定**的随机方向偏 —— 同块内朝向一致、块与块不同
+   *    （"刻面"= 块自身的棱面，而不是逐像素噪声。逐像素噪声只会把白片染花，调研 §4）
+   *    ⚠ 种子三分量都在 0.5 附近时 vShSeed*2−1 → 0 ⇒ 必须判长度再归一（规则 2：
+   *      对可能为 0 的向量直接 normalize 会得到 NaN，几何"消失"却不报错）。 */
+  vec3 sv3 = vShSeed * 2.0 - 1.0;
+  float sl2 = dot(sv3, sv3);
+  vec3 fs = sl2 > 1e-8 ? sv3 * inversesqrt(sl2) : vec3(0.0, 0.0, 1.0);
+  N = normalize(mix(N, fs, SHARD_FACET_K));
+
+  /* ③ 与母壳**同一片解析天空**的反射成像（+ 冷色偏保水晶调：压 R、抬 B） */
+  vec3 env = envProc(reflect(-Vd, N)) * vec3(0.80, 0.90, 1.05);
+
+  /* ④ 贴边亮棱线：aRad 沿**整条边界**为 1 ⇒ 长条形块的窄边也吃得到（不能用 |局部坐标|，
+   *    那对细长块只在两个端头亮）。★ v5.5：只**加**不减 —— 碎片是加色层，叠在已很亮的
+   *    晶面上，"减光"（心暗/暗带）只有几个灰阶、等于没画；"贴边加亮"才是看得见的方向，
+   *    而且晶片的"棱"正是靠这圈 1~2px 的亮线读出来的（RIM_P=6 ⇒ 亮线只占半径外 6%）。 */
+  float rr = clamp(vShRad, 0.0, 1.0);
+  float edge = pow(rr, SHARD_RIM_P);
+
+  /* ⑤ 加性高光模型（不作黑）：env→0 时 shade = BODY；灯带扫到时≈2× */
+  vec3 shade = vec3(SHARD_BODY) * (vec3(1.0) + SHARD_ENV_K * env / (vec3(SHARD_ENV_HL) + env));
+  shade *= 1.0 + SHARD_EDGE_K * edge;
+#ifdef SHARD_MICRO
+  /* ⑦ 面内微结构：块局部坐标量化成格子取**一次** hash ⇒ 稀疏晶斑（1 次 hash ≈ 13 ALU） */
+  float sp = hash13(vec3(floor(vShLocal * SHARD_MICRO_SCALE), vShSeed.z * 7.0));
+  shade *= 1.0 + SHARD_MICRO_K * (sp - 0.5);
+#endif
+  gl_FragColor = vec4(vShCol * shade * SHARD_SURF_GAIN, 1.0);
 }
 `;
 
@@ -1144,10 +1548,14 @@ void main() {
  *    coatF     菲涅尔清漆；正面权重必须 → 0
  * ==================================================================== */
 const CRYST_LAYERS = [
+  { id: 'L01a', name: 'crystal-zone-norm', mode: 'compute' },  // ★ v6 步 2b：学区法线微扰。**必须在 L01 之前** ⇒ fres/R/refract/主光全吃到
   { id: 'L01', name: 'env-reflect',       mode: 'over' },       // 解析环境反射 envProc(reflect(-Vd,N)) × 冷色偏
   { id: 'L02', name: 'transmit-disperse', mode: 'over' },       // 折射 + 一次底面反弹 + R/G/B 三档 IOR 色散
   { id: 'L03', name: 'absorption',        mode: 'mul' },        // Beer-Lambert：σ(path, 包裹体场) ⇒ absorb
+  { id: 'L03a', name: 'crystal-zone',     mode: 'mul' },        // ★ v6 步 2：环 0.30/0.66 + 顶点辐条**喂 σ**（⚠ τ≈0.2 ⇒ 近乎不可见，仅作物理归属保留）
+  { id: 'L03b', name: 'growth-sector',    mode: 'mix' },        // ★ v6 步 2：5 扇区 σ 逐通道色带（零和 ⇒ 只偏色相）
   { id: 'L04', name: 'body-composite',    mode: 'over' },       // c = mix(透射, 反射, fres)
+  { id: 'L04a', name: 'crystal-zone-shade', mode: 'mul' },      // ★ v6 步 2b：学区 **c 乘性压暗**（无条件保底可见性）
   { id: 'L05', name: 'hue-shift',         mode: 'mix' },        // 展开度驱动的色相迁移（钳在 bloom 下）
   { id: 'L06', name: 'key-light',         mode: 'mul' },        // 世界空间主光 pow(key,1.25)
   { id: 'L07', name: 'facet-gain',        mode: 'mix' },        // 片级明暗档（零均值：只拉层次）
@@ -1180,10 +1588,12 @@ const CRYST_LAYER_MANIFEST = '/* ===== crystal body layer stack (v6 step1; order
   + '\n * ======================================================================= */';
 
 /** 按 CRYST_LAYERS_OFF 剔除被禁用的层：从标记起、到「下一个标记之前」为一段。
- *  空集 ⇒ **直接返回原串**（逐字节相同，零风险）。 */
+ *  空集 ⇒ **直接返回原串**（逐字节相同，零风险）。
+ *  id 允许 L\d{2} 带一个可选小写后缀（v6 步 2 的 L03a/L03b：它们调制的是同一个物理量 σ，
+ *  属于吸收层的**子层**，因此不像整层那样顶掉后面的编号 —— 顺序仍严格等于执行顺序）。 */
 function applyLayerMask(src, off) {
   if (!off || off.size === 0) return src;
-  const re = /^[ \t]*\/\*@(L\d{2})[^\n]*\n/gm;
+  const re = /^[ \t]*\/\*@(L\d{2}[a-z]?)[^\n]*\n/gm;
   const hits = [];
   let m;
   while ((m = re.exec(src)) !== null) hits.push({ id: m[1], i: m.index });
@@ -1257,6 +1667,13 @@ uniform float u_hitGain;
 uniform float u_shell_form;
 /* v5.31b：前沿折线 seed（**按面统一**，与顶点着色器同一份）—— 见 VERT 同名注释 */
 uniform float u_front_seed;
+/* v6 步 2：晶体学区 / 生长扇区要在**片元**里拿到「方位角」与「五边形顶点方向」——
+ * 这两个面级 uniform 此前只在 VERT 声明（VERT 用来复算柱面几何）。
+ * 本体材质（fUniforms）本来就带它们；内芯材质没有，但内芯在 u_core_layer 分支里已
+ * 提前 return，根本走不到晶体本体分支 ⇒ 取 GL 默认 0 对画面无影响。 */
+uniform float u_band_phi0;       // 面内「边法线起始角」：顶点方位 = phi0 − 36° + k·72°
+uniform float u_band_face;       // 面号 0..11（生长扇区相位按面错开）
+#define PENTA_SEG_G  1.25663706  // 2π/5，与 VERT / dodecaKit PENTA_SEG 镜像
 /* v5.31：前沿柱面的**本片半径区间**（与顶点着色器共用同一份）→ 片元侧据此判定
  * "前沿是否已进入/离开本片"，决定这堵墙的出场与退场。 */
 uniform float u_band_lo;
@@ -1546,29 +1963,10 @@ float dataTrail(float inDist, float lineU, float cellSize, float flow,
   return sq * fade;
 }
 
-/**
- * v5.4 程序化环境（水晶/宝石专用）
- *
- * 水晶之所以是水晶，靠的是**反射了什么**，而不是表面明暗：
- * 一块真实晶体放在纯漫反射环境里就是一块灰玻璃 —— 它的"闪"全部来自环境里的
- * 高对比亮源（灯带、窗、环形灯）在棱面上的锐利成像。这里没有环境贴图，
- * 就用解析式造一个：暗底 + 顶部天光渐变 + 两条高斯灯带 + 一道水平亮环。
- * 棱面法线一转，灯带像就在棱面上扫过 → 宝石的"活光"。
- */
-vec3 envProc(vec3 d) {
-  float up = clamp(d.y * 0.5 + 0.5, 0.0, 1.0);
-  vec3 sky = mix(vec3(0.008, 0.013, 0.024), vec3(0.26, 0.38, 0.58), pow(up, 1.7));
-  // 两条竖直灯带（主高光 / 副高光）：角向高斯，越靠上越强
-  float az = atan(d.z, d.x);
-  float bar1 = exp(-pow(sin(az * 0.5 - 0.75) * 5.5, 2.0));
-  float bar2 = exp(-pow(sin(az * 0.5 + 2.05) * 8.5, 2.0));
-  sky += vec3(0.95, 0.98, 1.0) * (bar1 * 0.90 + bar2 * 0.42) * smoothstep(0.02, 0.70, up);
-  // 水平亮环（模拟环境里的环形灯），给侧壁断裂面一条横向反光
-  sky += vec3(0.40, 0.62, 1.0) * exp(-pow((d.y - 0.10) * 6.5, 2.0)) * 0.20;
-  // 底部微弱回光，避免背光面纯黑（纯黑会读成塑料）
-  sky += vec3(0.03, 0.05, 0.09) * smoothstep(0.35, 0.0, up);
-  return sky;
-}
+/* —— 程序化环境成像：**已抽成公共块 ENV_PROC_GLSL**（v5.4）——
+ * 碎膜质感（B 方案）的碎片 program 要采样同一片天空 ⇒ 两边必须跑同一段源。
+ * 见文件上方该常量处的注释（规则 18：碎片不并入 uber-FRAG，只能公共块双边注入）。 */
+${ENV_PROC_GLSL}
 
 /**
  * 板材高度场：返回 [0,1]，1 = 缝隙（凹槽底）。
@@ -1815,6 +2213,50 @@ void main() {
       }
 
       ${CRYST_LAYER_MANIFEST}
+
+      /* ==== 晶体学区 · 共享掩码（v6 步 2b）====
+       * 本块**故意放在第一个层标记之前**（= applyLayerMask 的前导段，永不消融）：L01a / L03a /
+       * L04a 三层都要消费它，若把它塞进某一层，消融该层就会让另外两层引用到未定义的变量 ⇒
+       * 编译失败（OFF 只能剔自包含层）。放进前导段后，三层各自仍可独立消融。
+       * 三层全 OFF 时这些量无人引用 ⇒ 被编译器 DCE 消除（规则 18 记录的"非杠杆"经验）。
+       * 形状与基准面**同源**：czT = vCrackUV.x 的等值线本身就是同心五边形（dodecaKit 的 warp
+       * 用 r = T·rB(A) 归一化）⇒ czT = 0.30 / 0.66 与 panelHeight() mode-0 的
+       * sdPentagon(uv, apo*0.30 / apo*0.66) **逐点等价**；辐条方位 = u_band_phi0 − 36° + k·72°。 */
+      float czA  = vCrackUV.y * 6.2831853;              // 方位角（与 u_band_phi0 同一坐标系）
+      float czT  = clamp(vCrackUV.x, 0.0, 1.0);         // 归一化半径：1 = 五边形边界
+      /* 两条环：降序 smoothstep(e0 > e1) = 以 e1 为峰、向两侧衰减的软带（规则 11） */
+      float czRing = clamp(
+          smoothstep(${CRYST_ZONE_W}, 0.0, abs(czT - ${CRYST_ZONE_R1}))
+        + smoothstep(${CRYST_ZONE_W}, 0.0, abs(czT - ${CRYST_ZONE_R2})), 0.0, 1.0);
+      float czSeg  = (czA - (u_band_phi0 - 0.5 * PENTA_SEG_G)) / PENTA_SEG_G;
+      float czAd   = abs(czSeg - floor(czSeg + 0.5)) * PENTA_SEG_G;   // 到最近顶点方向的角距离
+      float czSpoke = smoothstep(${CRYST_SPOKE_W}, 0.0, czAd * czT)   // Δa·t ⇒ 弧长宽度近似恒定
+        * smoothstep(0.22, 0.34, czT)                                 // 面心留白（同基准面做法）
+        * smoothstep(1.00, 0.94, czT);                                // 不压到五边形边界上
+      /* 断裂侧壁的 czT 是常数（= 该环带边界）⇒ 整堵墙会被同一个环带值覆盖成一整片暗。
+       * 侧壁本来另有专属照明项，这里把学区衰减到 20% ⇒ 只留一点"裂纹面更致密"的暗示。 */
+      float czZone = clamp(czRing + czSpoke, 0.0, 1.0) * (1.0 - 0.80 * vWall);
+      /* 到最近环的**有符号**距离：把环做成"棱脊"要用它 —— 环心两侧反向 ⇒ 读作斜面而非平涂 */
+      float czSd = czT - ((abs(czT - ${CRYST_ZONE_R1}) < abs(czT - ${CRYST_ZONE_R2}))
+                          ? ${CRYST_ZONE_R1} : ${CRYST_ZONE_R2});
+
+      /*@L01a crystal-zone-norm | compute*/
+      /* v6 步 2b · 学区的**方向杠杆** —— σ 通道失效后的正解（规则 21/22）。
+       * 为什么必须落在 L01 **之前**：L01 的 reflect(-Vd,N)、L02 的三路 refract(-Vd,N,..) 与
+       * L01 的 fres 全部按**当时**的 N 定稿；把 N 改在这里 ⇒ 环境反射成像、折射成像、主光
+       * 同时吃到 —— 而这条链路才是"水晶读作水晶"的本体（envT 在 c 里权重 ≈0.72，其杠杆是 σ 的
+       * 5~10 倍，且纹路随视角移动）。
+       * 微扰方向 = 面内切向 cross(N,Vd)，幅度带 sign(czSd) ⇒ 环心两侧反向 ⇒ 形成一道**棱脊**：
+       * 一侧吃光、一侧背光 ⇒ 读作刻进晶体的斜面，而不是"画上去的暗纹"。
+       * ⚠ 有意**不重算 ndv**（它在本分支开头就已定稿）：L14/L15 的 pow(1-ndv,3) 掠射边缘光因此
+       *   不跟着环抖（否则整圈轮廓会发脏）⇒ 微扰的爆炸半径被限制在成像链路内。 */
+      {
+        vec3  czTg = cross(N, Vd);
+        float czTl = length(czTg);
+        czTg = czTl > 1e-4 ? czTg / czTl : vec3(0.0, 1.0, 0.0);   // 退化保护（N ∥ Vd 时 cross→0）
+        N = normalize(N + czTg * (${CRYST_ZONE_TILT} * czZone * sign(czSd)));
+      }
+
       /*@L01 env-reflect | over*/
       float fres = 0.05 + 0.95 * pow(1.0 - ndv, 4.0);
 
@@ -1850,6 +2292,31 @@ void main() {
        * 从"每像素"变成"每顶点"。消融依据：这一条 fbm3 与下面那条星云合计 ≈420 条 ALU/像素，
        * 按 v5.39 全谱消融（570 网格 FRAG 换空实现：p50 765→281ms）约占晶体片元成本 60%。 */
       vec3 sigma = vec3(1.55, 1.30, 1.05) * 4.2 * (0.72 + 0.62 * vCrystalNoise.x);
+
+      /*@L03a crystal-zone | mul-feed-sigma*/
+      /* v6 步 2 · 晶体学区 —— σ 通道（掩码与几何见 L01a 之前的**共享块**）。
+       * ⚠ 规则 21：本片光学厚度 τ = σ·path ≈ 0.2 ⇒ absorb 处处≈1 ⇒ **这一路几乎不可见**
+       *   （实测：CRYST_ZONE_AMT 已开到 0.55，屏上仍只有 2~5 个灰阶差）。
+       *   可见性改由 L01a（方向）与 L04a（c 乘性）承担；本层保留是因为"结构走 mul"在物理上
+       *   是正确归属，且板厚/吸收一旦抬升（τ 上升）它会自动开始生效，无需再动结构。 */
+      /* 掩码（czA / czT / czRing / czSpoke / czZone / czSd）**不在此重算** —— 见 L01a 之前的
+       * 共享块。单一定义点：三层消费同一份掩码，日后改形状不会出现两处漂移。 */
+      sigma *= 1.0 + ${CRYST_ZONE_AMT} * czZone;
+
+      /*@L03b growth-sector | mix-feed-sigma*/
+      /* v6 步 2 · 生长扇区 —— 以面心放射，边界**正好落在辐条上**（与共享块同一个 czSeg 取整）。
+       * 逐通道 Δ 之和恒为 0 ⇒ 只把吸收往不同色相偏，不改整体深浅（P4 同源相干：方向基与
+       * 辐条共用 u_band_phi0，相位由 u_band_face 按面错开 ⇒ 12 面各不相同）。
+       * ⚠ 本层自带 (a, t)，**刻意不引用共享块的局部量** ⇒ 单独从层栈剔除 L03a 也不会编译失败。
+       *   命名刻意避开 CRYST_ZONE_TILT（那是 L01a 的法线倾角，单位 rad）；这里是**色偏向量**。 */
+      float czT2 = clamp(vCrackUV.x, 0.0, 1.0);
+      float czSec = floor((vCrackUV.y * 6.2831853 - (u_band_phi0 - 0.5 * PENTA_SEG_G))
+                          / PENTA_SEG_G + 0.5);
+      float czSh = hash13(vec3(czSec, u_band_face, 4.3));
+      vec3  czSecTilt = vec3(czSh - 0.5, hash13(vec3(czSec, u_band_face, 9.1)) - 0.5, 0.0);
+      czSecTilt.z = -0.5 * (czSecTilt.x + czSecTilt.y);       // 三通道和恒为 0
+      sigma *= 1.0 + ${CRYST_SEC_AMT} * czSecTilt * smoothstep(0.0, 0.35, czT2);
+
       vec3 absorb = exp(-sigma * path);
       // 碎片恒为冷却冰蓝调（frost，已在函数级作用域声明），不再随全局暖色 u_emissive_color 漂移 —— 它是吸收冷却能量的结构
       vec3 tint = frost;
@@ -1859,6 +2326,17 @@ void main() {
 
       /*@L04 body-composite | over*/
       vec3 c = mix(envT * absorb * (0.55 + 0.45 * tint), envR, fres);
+
+      /*@L04a crystal-zone-shade | mul*/
+      /* v6 步 2b · 学区的**保底可见性**：直接乘在 c 上（与 L06 同一类 —— 作用通道是 c）。
+       * 为什么还要保底：L01a 的法线微扰只在"环境里恰有可成像亮源"时才出强对比（envProc 两条
+       * 灯带很窄，bar1 的角向宽度 ≈0.37 rad），没吃到灯带的片会若隐若现；而 c 乘性是**无条件**的
+       * （逐像素按 czZone 压暗）⇒ 保证环/辐条一定被看见。两项叠加后纹路既不"平涂"、也不"时隐时现"。
+       * 能穿过 285 片叠压的依据见规则 22：预乘 alpha 下最前片 alpha 权重最高，乘性项得以保留；
+       * 被 1/√N 平均掉的是**加法**项（v5.11 片级种子），不可外推到乘法项。
+       * 之所以落在 L04 之后：c 直到 L04 才诞生；而"喂 σ"那条路已被实测证否（规则 21）。 */
+      c *= 1.0 - ${CRYST_ZONE_DARK} * czZone;
+
       /*@L05 hue-shift | mix*/
       // 晶体自身的色相：随展开度从"环境色"偏向"水晶色"（低饱和矿物色，不撞色）
       /* v-fix：晶体色相迁移钳在 bloom(1.0) 以下——原 tint*1.06+0.14 把蓝通道推到 1.253，
@@ -2987,7 +3465,12 @@ const BH_HORIZON_VERT = /* glsl */ `
   ${BH_CRUSH_GLSL}
   void main() {
     vec3 n = normalize(position);
-    float dent = min(u_bh_crush * 0.62 * bhCrushField(n, u_time), 0.78);  // 别压过球心
+    /* ★ 一致分支门控（= 候选③手法）：常态 u_bh_crush = 0 ⇒ 整块 6-lobe 挤压场（≈42 trig + 150 ALU）
+     * 被跳过。等价性：crush = 0 时 dent 恒为 0（bhCrushField 每项 amp>0、lobe≥0、jit>0 ⇒ 值域 ≥0，
+     * min(0, 0.78) = 0），而 dent 的下游只有 vD（→ glow = rim·vD·1.35）与顶点位移 (position − n·dent)，
+     * 两者在 dent = 0 时都退化为原样 ⇒ 逐顶点完全相同。 */
+    float dent = 0.0;
+    if (u_bh_crush > 0.0) dent = min(u_bh_crush * 0.62 * bhCrushField(n, u_time), 0.78);
     vD = dent;
     vN = normalize(normalMatrix * n);
     vec4 mv = modelViewMatrix * vec4(position - n * dent, 1.0);
@@ -3022,7 +3505,9 @@ const BH_CORE_VERT = /* glsl */ `
   ${BH_CRUSH_GLSL}
   void main() {
     vec3 n = normalize(position);
-    float dent = min(u_bh_crush * 0.52 * bhCrushField(n, u_time), 0.72);
+    /* ★ 一致分支门控（同 BH_HORIZON_VERT）：常态整块 6-lobe 场被跳过，crush=0 ⇒ dent=0 ⇒ 同形。 */
+    float dent = 0.0;
+    if (u_bh_crush > 0.0) dent = min(u_bh_crush * 0.52 * bhCrushField(n, u_time), 0.72);
     vON = n;
     vN = normalize(normalMatrix * normal);
     vec4 mv = modelViewMatrix * vec4(position - n * dent, 1.0);
@@ -3065,10 +3550,27 @@ const BH_CORE_FRAG = /* glsl */ `
     // 引力扭曲：环被往里拽 + 方位涟漪（时空往里塌的湍流感）
     float rip = sin(az * 6.0 + u_time * 9.0) * sin(r * 34.0 - u_time * 13.0);
     // v5.23-crush：挤压深的方位环被压得更靠里（与视界的凹痕同场 → 轮廓一致）
-    float cf = bhCrushField(normalize(vON), u_time);
+    /* ★ 一致分支门控（本处收益最大：这是**逐像素**求值，黑洞占屏 10~20% ⇒ 每次省下数万次 6-lobe 场）。
+     * 等价性：cf 的三个下游 —— ringR 的 (−0.10·u_bh_crush·cf)、press = smoothstep(…,cf)·u_bh_crush、
+     * dentL = min(u_bh_crush·0.52·cf, 0.72) —— 在 crush = 0 时全部含 crush 因子或变成 min(0,·) = 0
+     * ⇒ cf 取 0 与取原值的结果逐像素相同。 */
+    float cf = 0.0;
+    if (u_bh_crush > 0.0) cf = bhCrushField(normalize(vON), u_time);
+    /* v-塌修（用户："黑洞塌缩缩小时黑球被挤压了，引力透镜的环没被压塌、还是圆形"）：
+     * 视界轮廓**本身**在塌缩时是内凹的 —— 本壳（BH_CORE_VERT）与不透明视界球
+     * （BH_HORIZON_VERT）都在做 position − n·dent ⇒ 该方位的视界投影半径**不是常数**
+     * u_bh_vh，而是 u_bh_vh·(1−dent)。
+     * 旧版把下限写成**常数** max(ringR, u_bh_vh + 0.006)：塌缩②段 bhWarp=1 时基础值
+     * 0.667+0.020−0.030=0.657 恒被 0.673 吃满 ⇒ −0.030·u_bh_warp 与
+     * −0.10·u_bh_crush·cf **两项一起整项失效**（v5.24 专门加的形变 100% 没生效）。
+     * 现在下限跟着同一个 dent 收缩，环就能跟着凹痕往里塌。
+     * ★ 幅度与系数刻意用本壳自己的 0.52/0.72（BH_CORE_VERT）—— 不用视界球的 0.62/0.78：
+     *   下限的语义是"别掉进本壳坐标系里的视界投影"，本壳压多少，占比 u_bh_vh 就少多少。 */
+    float dentL = min(u_bh_crush * 0.52 * cf, 0.72);
     float ringR = u_bh_vh + 0.020 - 0.030 * u_bh_warp + 0.012 * u_bh_warp * rip
                 - 0.10 * u_bh_crush * cf;       // v5.24：挤压深的方位环被压得更靠里（幅度加大 → 看得见）
-    ringR = max(ringR, u_bh_vh + 0.006);        // 环绝不能掉进视界里
+    /* 常态（u_bh_crush=0 ⇒ dentL=0）此式还原成 u_bh_vh+0.006 ⇒ **零观感变化**。 */
+    ringR = max(ringR, u_bh_vh * (1.0 - dentL) + 0.006);   // 环绝不能掉进**被压凹后**的视界里
     // 光子环：贴着视界外缘的**极细**亮环（宽度 0.010 ≈ 数像素）
     float pr = exp(-pow((r - ringR) / 0.010, 2.0));
     // 多普勒束射：一侧更亮（g^4 的弱化余弦调制；不对称 = 真实感来源）
@@ -3136,9 +3638,42 @@ const BH_CORE_FRAG = /* glsl */ `
  *   "远处的透镜看起来和没透镜一样"这件事，靠的是**偏折角趋于 0**（见片段 ②），
  *   不是靠两张图半透明叠加。代价写在 renderOrder 的那段注释里。 */
 const BH_GRAV_VERT = /* glsl */ `
+  /* ★ v-塌修（用户："黑洞塌缩缩小时黑球被挤压了，引力透镜的环没被压塌、还是圆形"）：
+   * 成因 = 本环**从来没有**挤压场输入 —— 它只是 RingGeometry 刚体环 + setScalar 等比缩放，
+   * 而 u_bh_crush 只写给了 bhCoreMaterial / bhLensMaterial（见每帧写入段）⇒
+   * 阴影边界在数学上必然是**正圆**，与旁边被压凹的视界球自相矛盾。
+   * 修法 = 与视界球用**同一个场、同一个幅度（0.62 / 上限 0.78）**，把顶点在环平面内按
+   * 该方位的压痕深度往里收。几何一收，片元的 b = |vW − 洞心| 自动跟着变小 ⇒ 偏折角按新的
+   * b 查表 ⇒ **"阴影边界"与"被弯折的背景"一起随压痕形状走**，片元侧一行都不用改。
+   *
+   * ⚠ 必须做空间变换：父链 scene→assembly→group 在自旋（见 sync 里"抵消 assembly 自旋"
+   *   那条注释）⇒ 世界空间 ≠ bhGroup 空间。压痕场的 6 条轴是在**视界球的物体空间**里
+   *   定义的（bhCore 顶点用的就是 normalize(position)），直接拿世界方向求值会让环的凹坑
+   *   与黑球的凹坑错位（各自转各自的）。u_gv_rotinv = 世界→bhGroup 空间的旋转，
+   *   bhCore / bhLens / bhGrav 同为 bhGroup 的子节点且都无自身旋转/缩放
+   *   （bhGroup 自身也从不设 rotation/scale）⇒ 三者空间严格同一，取一次即可。
+   *   注：bhGroup 若恒不旋转此项退化为单位阵，只是白乘一次，无副作用。 */
+  uniform float u_bh_crush;    // 与视界/透镜壳同一帧同一个值
+  uniform float u_time;        // 必须同源：压痕是 churn 的，时间不同相位就对不上
+  uniform vec3  u_gv_center;   // 洞心（世界）—— 与片元同名共用同一个 uniform
+  uniform mat3  u_gv_rotinv;   // 世界 → 黑洞物体空间（正交矩阵的逆 = 转置）
   varying vec3 vW;
+  ${BH_CRUSH_GLSL}
   void main() {
-    vec4 wp = modelMatrix * vec4(position, 1.0);
+    vec3 p = position;
+    /* ★ 一致分支门控（同另外三处）：常态 u_bh_crush = 0 ⇒ 整块 6-lobe 场 + 一次多余的
+     * modelMatrix 乘法一起被跳过。crush=0 ⇒ dent=0 ⇒ p 保持原样 ⇒ 逐顶点完全相同。 */
+    if (u_bh_crush > 0.0) {
+      vec4 wp0 = modelMatrix * vec4(position, 1.0);
+      vec3 nH = normalize(u_gv_rotinv * (wp0.xyz - u_gv_center));
+      float dent = min(u_bh_crush * 0.62 * bhCrushField(nH, u_time), 0.78);
+      /* 环面 ⊥ 视线 ⇒ 局部 xy 就是屏幕平面 ⇒ 直接按同一深度径向收进去。
+       * 这与视界的 (position − n·dent) 是**同一个方程**在本几何上的写法：
+       * 环上某点原半径 R，被收到 R·(1−dent)；视界轮廓同方位同样收 (1−dent) ⇒ 形状一致。
+       * 只动 xy 不动 z ⇒ 环面仍过洞心且 ⊥ 视线 ⇒ "写深度做真替换"的前提不破。 */
+      p.xy *= (1.0 - dent);
+    }
+    vec4 wp = modelMatrix * vec4(p, 1.0);
     vW = wp.xyz;
     gl_Position = projectionMatrix * viewMatrix * wp;
   }
@@ -3547,7 +4082,14 @@ export class L5Core {
         u_gv_fwd: { value: new THREE.Vector3(0, 0, -1) },
         u_gv_rs: { value: 0.10 },
         u_gv_uout: { value: LENS_U_OUT },
-        u_gv_proxy: { value: LENS_PROXY_R }
+        u_gv_proxy: { value: LENS_PROXY_R },
+        /* v-塌修：环的挤压输入。三个都必须有 ——
+         *   u_bh_crush 少一个 ⇒ 环仍是正圆（用户报的那个 bug 的全部成因）；
+         *   u_time 用别的时钟 ⇒ 环的凹坑与黑球的凹坑相位错开（同一场不同相位 = 两套形状）；
+         *   u_gv_rotinv 缺 ⇒ 父链自旋时环的凹坑绕错方向。 */
+        u_bh_crush: { value: 0.0 },
+        u_time: { value: 0.0 },
+        u_gv_rotinv: { value: new THREE.Matrix3() }
       },
       transparent: true,
       /* v5.30：★ 环必须**写深度**（写的是洞心深度）。
@@ -3587,12 +4129,24 @@ export class L5Core {
      * onBeforeRender 里改朝向 + 立刻 updateMatrixWorld —— 此时父链 matrixWorld 已是当前帧。 */
     const _gvQ = new THREE.Quaternion();
     const _gvQ2 = new THREE.Quaternion();
+    /* v-塌修：_gvQ2 下面会被原地 invert 后复用（变成 bhGrav 的局部四元数），
+     * 所以"世界→bhGroup"的逆要单独存一份，不能借用它。 */
+    const _gvQi = new THREE.Quaternion();
+    /* ⚠ three 0.186 的 Matrix3 **没有** makeRotationFromQuaternion（已核对
+     *   node_modules/three/src/math/Matrix3.js 的方法表）⇒ 必须经 Matrix4 中转：
+     *   Matrix4.makeRotationFromQuaternion → Matrix3.setFromMatrix4（取左上 3×3）。
+     *   走四元数而不是 setFromMatrix4(matrixWorld).invert() 是有意的：四元数路径
+     *   不含缩放，父链上哪天出现非等比缩放也不会把方向扭歪。 */
+    const _gvM4 = new THREE.Matrix4();
     this.bhGrav.onBeforeRender = (renderer, scene, camera) => {
       camera.getWorldQuaternion(_gvQ);
-      this.bhGrav.parent.getWorldQuaternion(_gvQ2);
+      this.bhGrav.parent.getWorldQuaternion(_gvQ2);   // = bhGroup 的世界旋转（含父链自旋）
+      _gvQi.copy(_gvQ2).invert();                    // 世界 → bhGroup 空间
       this.bhGrav.quaternion.copy(_gvQ2.invert().multiply(_gvQ));
       this.bhGrav.updateMatrixWorld(true);
       const gu = this.bhGravMaterial.uniforms;
+      _gvM4.makeRotationFromQuaternion(_gvQi);
+      gu.u_gv_rotinv.value.setFromMatrix4(_gvM4);
       this.bhGrav.getWorldPosition(gu.u_gv_center.value);   // 洞心（世界）
       gu.u_gv_fwd.value.copy(this.uniforms.u_cam_forward.value);
     };
@@ -3889,6 +4443,232 @@ export class L5Core {
         bbCorners: _bb
       };
     });
+
+    /* ---------- ★ v-碎膜：碎膜飞散系统（构造） ----------
+     * 用户构思（v4 定稿，用户草图定标）：跌破 80 时，外缘环碎块的白膜先**沿裂缝线裂成 n 块
+     * 不均匀的碎片**（n 按 stored 分档 3/6/9；块与块共享裂缝线、出生一帧拼合 = 完整白膜），
+     * 然后每块**各自沿内缘铰链向外掀开、沿「片心→块心」方向四散**消散。
+     * ⇒ 因此不能用 InstancedMesh（要求全部实例共享一份几何，装不下 285 种形状）
+     *   ⇒ 走**动态顶点缓冲**：每碎片把自己轮廓的顶点写进同一个 BufferGeometry ⇒ 仍是一次 draw call。 */
+    /* ① 每片碎块的**凸包轮廓**（面内 (u,v)，已减本片质心）：
+     *    ★ v4：不再用「扇区取最远点」的近似包络 —— 分裂算法要求**简单多边形**（不自交），
+     *    且裂出来的块要贴合片的真实形状。凸包是唯一同时满足「永不自交 + 半平面切割严格成立 +
+     *    贴合外形」的选择（凹片的包络误差 < 一个顶点间距，膜本来就贴在片上）。
+     *    ⚠ 直接读底层 Float32Array（285 片 × ~1727 顶点 ≈ 49 万点）—— 与上面 bbCorners 同一手法；
+     *      用 getX/getY/getZ 访问器会多 150 万次函数调用，构造期肉眼可见地变慢。 */
+    const _shardContours = new Array(this.fragments.length);
+    const _shardCenters = new Array(this.fragments.length);
+    for (let fi = 0; fi < this.fragments.length; fi++) {
+      const f = this.fragments[fi];
+      const pa = f.geo.getAttribute('position');
+      const cnt = pa.count;
+      const raw = !pa.isInterleavedBufferAttribute && pa.array ? pa.array : null;
+      const e1 = f.e1, e2 = f.e2;
+      /* ★ 先求本片**自身**的面内质心 —— f.geo 的顶点是「面局部坐标（原点 = 面心）」，
+       * 不是片局部坐标（见外缘环捕集池那段的注释：粒子目标 = mesh.position + f.centroid）。
+       * 不减掉质心的话，轮廓是"从面心看过去的这圈外缘"，半径最大到 0.3u+ ⇒ 第一版
+       * 碎片全部炸在每张面的**中心**附近，而不是贴在各片自己身上。
+       * 顶点平均 = 片质心（与 f.centroid 同法；这里不能直接用它 —— 本块在其计算之前执行）。 */
+      let su = 0, sv = 0;
+      for (let i = 0; i < cnt; i++) {
+        const x = raw ? raw[i * 3] : pa.getX(i);
+        const y = raw ? raw[i * 3 + 1] : pa.getY(i);
+        const z = raw ? raw[i * 3 + 2] : pa.getZ(i);
+        su += x * e1.x + y * e1.y + z * e1.z;
+        sv += x * e2.x + y * e2.y + z * e2.z;
+      }
+      const cu0 = su / Math.max(1, cnt), cv0 = sv / Math.max(1, cnt);
+      /* 收集面内点 → Andrew 单调链凸包。片是重分网格的面片（~1700 顶点，绝大多数在
+       * 内部、不影响包络）⇒ 先等距抽稀到 ≤256 再排序求包络（构造期一次，量级可忽略）。 */
+      const pts = [];
+      const stride = Math.max(1, Math.ceil(cnt / 256));
+      for (let i = 0; i < cnt; i += stride) {
+        const x = raw ? raw[i * 3] : pa.getX(i);
+        const y = raw ? raw[i * 3 + 1] : pa.getY(i);
+        const z = raw ? raw[i * 3 + 2] : pa.getZ(i);
+        pts.push([x * e1.x + y * e1.y + z * e1.z - cu0,   // ★ 减质心 ⇒ 片自身坐标
+                  x * e2.x + y * e2.y + z * e2.z - cv0]);
+      }
+      pts.sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]));
+      const hull = [];
+      const cross = (o, a, b) =>
+        (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+      for (let k = 0; k < pts.length; k++) {              // 下链
+        const p = pts[k];
+        while (hull.length >= 2 && cross(hull[hull.length - 2], hull[hull.length - 1], p) <= 0) hull.pop();
+        hull.push(p);
+      }
+      const lower = hull.length + 1;                      // 上链：不弹掉下链最后一个点
+      for (let k = pts.length - 2; k >= 0; k--) {
+        const p = pts[k];
+        while (hull.length >= lower && cross(hull[hull.length - 2], hull[hull.length - 1], p) <= 0) hull.pop();
+        hull.push(p);
+      }
+      hull.pop();                                         // 末点 = 起点重复
+      /* 超上限等距抽稀（重分网格的片可能有几十个包络点 ⇒ 压到 SHARD_HULL_MAX） */
+      if (hull.length > SHARD_HULL_MAX) {
+        const dec = [];
+        for (let k = 0; k < SHARD_HULL_MAX; k++) {
+          dec.push(hull[Math.floor(k * hull.length / SHARD_HULL_MAX)]);
+        }
+        hull.length = 0;
+        for (const p of dec) hull.push(p);
+      }
+      /* 顶点顺序 = 单调链输出（绕序一致 ⇒ 半平面切割后两侧仍保序）。退化（共线/过细）给 null，
+       * 发射守卫直接跳过这片。 */
+      _shardContours[fi] = hull.length >= 3 ? new Float32Array(hull.flat()) : null;
+      _shardCenters[fi] = new Float32Array([cu0, cv0]);  // 本片质心（面局部坐标的面内分量）
+    }
+    this._shardContours = _shardContours;
+    this._shardCenters = _shardCenters;
+    this._shardTierN = new Uint8Array(this.fragments.length);   // 两遍发射法的中转：每片存的**档位序号 + 1**（0 = 本次不裂）
+    this._shardPick = new Uint8Array(this.fragments.length);    // v5.8：本片是否已被白屏保险丝选中（见 _emitShardBurst）
+    /* ★ v5.7：轮廓/质心一就绪就把**等面积分割预烘格**做出来（外缘环片 × n=2..9）——
+     *  崩裂帧只查表，见 _shardBakeTiles。radialN 由 dodecaKit 建片时写好 ⇒ 此处可用。 */
+    this._shardBakeTiles();
+
+    /* ② 动态缓冲。碎片 = 每槽一个**最多 SHARD_PIECE_V 顶点**的多边形（加色、双面 ⇒ 零厚度的
+     *    "膜晶片"；不足顶点数时复制末点补齐 = 零面积三角形，加色下不可见）；
+     *    拖尾 = 每片一条 4 顶点流线带。两个几何各一次 draw call，索引**预生成一次**，
+     *    之后每帧只写 position / color ⇒ 不动索引、不重建 attribute。 */
+    const _shardGeo = new THREE.BufferGeometry();
+    const _shardPos = new Float32Array(SHARD_MAX * SHARD_PIECE_V * 3);
+    const _shardCol = new Float32Array(SHARD_MAX * SHARD_PIECE_V * 3);
+    _shardGeo.setAttribute('position',
+      new THREE.BufferAttribute(_shardPos, 3).setUsage(THREE.DynamicDrawUsage));
+    _shardGeo.setAttribute('color',
+      new THREE.BufferAttribute(_shardCol, 3).setUsage(THREE.DynamicDrawUsage));
+    /* ★ v5.4（B 方案）：三个**块局部**属性 —— 块形状在发射时算一次、之后终生不变
+     * ⇒ 只在发射时写一遍，**每帧的 CPU 开销为零**（update 循环一个字节都不加）。
+     *   · aLocal(vec2)：块局部坐标 ÷ 块半径 ⇒ |aLocal| ≤ 1（供面内微结构取样）
+     *   · aRad(float) ：0 = 块质心、1 = 块**整条边界**（不能用 |aLocal| 代替：细长块
+     *                   只在两个端头 |aLocal|→1，而它的裂缝恰好在长边上）
+     *   · aSeed(vec3) ：每块一个稳定三维种子（刻面法线方向 / 微结构相位） */
+    const _shardLocal = new Float32Array(SHARD_MAX * SHARD_PIECE_V * 2);
+    const _shardRad = new Float32Array(SHARD_MAX * SHARD_PIECE_V);
+    const _shardSeed = new Float32Array(SHARD_MAX * SHARD_PIECE_V * 3);
+    _shardGeo.setAttribute('aLocal',
+      new THREE.BufferAttribute(_shardLocal, 2).setUsage(THREE.DynamicDrawUsage));
+    _shardGeo.setAttribute('aRad',
+      new THREE.BufferAttribute(_shardRad, 1).setUsage(THREE.DynamicDrawUsage));
+    _shardGeo.setAttribute('aSeed',
+      new THREE.BufferAttribute(_shardSeed, 3).setUsage(THREE.DynamicDrawUsage));
+    {
+      const tri = SHARD_PIECE_V - 2;               // 以 0 号（= 块质心）为基准的扇形三角数（28 顶点 → 26）
+                                                   // 实际块顶点数 m ≤ 25 ⇒ 需要 m 个三角；多余的落在
+                                                   // "复制 b0"的零面积三角上（加色下不可见）。
+                                                   // ⚠ tri 必须 ≥ 块顶点上限 m，否则最外侧的楔形**
+                                                   // 画不出来**（碎片缺一个从质心到首末边的口子）。
+      const idx = new Uint16Array(SHARD_MAX * tri * 3);
+      for (let s = 0; s < SHARD_MAX; s++) {
+        const base = s * SHARD_PIECE_V;
+        for (let k = 0; k < tri; k++) {
+          const o = (s * tri + k) * 3;
+          idx[o] = base; idx[o + 1] = base + k + 1; idx[o + 2] = base + k + 2;
+        }
+      }
+      _shardGeo.setIndex(new THREE.BufferAttribute(idx, 1));
+    }
+    /* ③ **裂缝块池**：发射时把凸包切成的 n 块 (u,v) 写进本槽位区（每槽定长 SHARD_PIECE_V × 2），
+     *    每帧 update 从这里读块顶点 —— 块形状只在发射时算一次，之后整个生命周期复用。 */
+    const _shardPieces = new Float32Array(SHARD_MAX * SHARD_PIECE_V * 2);
+    const _trailGeo = new THREE.BufferGeometry();
+    const _trailPos = new Float32Array(SHARD_MAX * 4 * 3);
+    const _trailCol = new Float32Array(SHARD_MAX * 4 * 3);
+    _trailGeo.setAttribute('position',
+      new THREE.BufferAttribute(_trailPos, 3).setUsage(THREE.DynamicDrawUsage));
+    _trailGeo.setAttribute('color',
+      new THREE.BufferAttribute(_trailCol, 3).setUsage(THREE.DynamicDrawUsage));
+    {
+      const idx = new Uint16Array(SHARD_MAX * 6);
+      for (let s = 0; s < SHARD_MAX; s++) {
+        const base = s * 4, o = s * 6;
+        idx[o] = base; idx[o + 1] = base + 1; idx[o + 2] = base + 2;
+        idx[o + 3] = base; idx[o + 4] = base + 2; idx[o + 5] = base + 3;
+      }
+      _trailGeo.setIndex(new THREE.BufferAttribute(idx, 1));
+    }
+    /* 加色 + 不写深度 + toneMapped:false：
+     *   · 加色 ⇒ 颜色衰减到 0 就是"消失"（不必逐顶点 alpha，MeshBasicMaterial 没有）；
+     *   · toneMapped:false ⇒ 顶点色可 > 1（HDR），交给 bloom 炸出光晕 ⇒ 用户要的"更亮一些"。 */
+    /* ★ 层序：**为什么这里 33 是安全的**（勿照搬 v5.32 柱面的教训反推）。
+     *   · 铁律「同类物体必须同层」针对的是**跨面 alpha 排序**（柱面曾 33→32：分层会让背面的墙
+     *     透到正面晶体上）—— 前提是那一层**参与 alpha 混合，排序决定成色**；
+     *   · 碎片本体是 **additive**（「blending: AdditiveBlending」）⇒ 加法可交换，
+     *     层内先后**不改变成色**，只影响"被谁遮住"；
+     *   · 而遮挡由「depthTest: true」独立保证：所有透明层都「depthWrite: false」
+     *     ⇒ 透明层之间互不遮挡（本来就不该互相遮挡，加法叠加才是对的），
+     *        真正写深度的只有不透明结构（coreMesh 30 / shellInner 31）⇒ 内核照常遮住碎片。
+     *   ⇒ 33 = "恒定叠在晶体面之上"的一层**发光贴花**（与 cage / ambientPoints 同层），
+     *     碎片从近侧晶面剥离时读作"晶面上的碎光飞起"，不出现"半圈在上、半圈在下"的半吊子排序。 */
+    /* ★ v5.4（B 方案）：碎片本体从 MeshBasicMaterial 换成**专用小 ShaderMaterial**
+     * （规则 18：不并入 uber-FRAG —— 它自带 envProc 公共块 + 3 个块局部属性）。
+     * 混合/深度/排序**一个都没动**：加色 / depthWrite:false / depthTest:true /
+     * toneMapped:false（顶点色可 > 1，交给 bloom 炸光晕）⇒ 上面那段"为什么 33 安全"的
+     * 全部前提依然成立。vertexColors:true ⇒ three 会声明内置「attribute vec3 color」
+     * （本 program 里读成 vShCol）；不提供 normal 属性 —— 法线走 dFdx/dFdy（见 SHARD_VERT 注）。 */
+    this.shardMaterial = new THREE.ShaderMaterial({
+      vertexShader: SHARD_VERT,
+      fragmentShader: SHARD_FRAG,
+      vertexColors: true, side: THREE.DoubleSide, blending: THREE.AdditiveBlending,
+      depthWrite: false, depthTest: true, transparent: true, toneMapped: false
+    });
+    this.shardTrailMaterial = new THREE.MeshBasicMaterial({
+      vertexColors: true, side: THREE.DoubleSide, blending: THREE.AdditiveBlending,
+      depthWrite: false, depthTest: true, transparent: true, toneMapped: false
+    });
+    this.shardMesh = new THREE.Mesh(_shardGeo, this.shardMaterial);
+    this.shardMesh.name = 'L5_ShardBurst';
+    this.shardMesh.renderOrder = 33;             // 见上「为什么这里 33 是安全的」
+    this.shardMesh.frustumCulled = false;        // 顶点由 CPU 逐帧写，包围球无意义
+    this.shardMesh.userData.noGlowMask = true;   // 不进辐射链（否则又被糊成一层光晕）
+    this.shardMesh.visible = false;
+    this.shardTrail = new THREE.Mesh(_trailGeo, this.shardTrailMaterial);
+    this.shardTrail.name = 'L5_ShardTrails';
+    this.shardTrail.renderOrder = 33;            // 与碎片本体同层（拖尾是它自己的流线，不该被晶面吃掉半截）
+    this.shardTrail.frustumCulled = false;
+    this.shardTrail.userData.noGlowMask = true;
+    this.shardTrail.visible = false;
+    this.group.add(this.shardMesh, this.shardTrail);
+    this._shardPos = _shardPos;
+    this._shardCol = _shardCol;
+    this._shardPieces = _shardPieces;
+    this._shardLocal = _shardLocal;      // v5.4 B 方案：块局部坐标（发射写一次）
+    this._shardRad = _shardRad;          // v5.4 B 方案：0 质心 / 1 边界
+    this._shardSeed = _shardSeed;        // v5.4 B 方案：每块稳定三维种子
+    this._shardDirty = false;            // 有块写进上面三个属性 ⇒ 下一帧上传一次
+    this._trailPos = _trailPos;
+    this._trailCol = _trailCol;
+    /* ③ 状态池：定长、槽位对象**复用**（触发期不分配对象 ⇒ 不产生 GC 抖动）。 */
+    this.shardState = [];
+    for (let i = 0; i < SHARD_MAX; i++) {
+      this.shardState.push({
+        active: false,
+        slot: i,                                    // 本槽在 _shardPieces 里的固定区号（发射写块顶点用）
+        vcount: 0,                                  // 本块实际顶点数（≤ SHARD_PIECE_V，update 只画这些）
+        pos: new THREE.Vector3(), vel: new THREE.Vector3(),
+        nrm: new THREE.Vector3(), ax: new THREE.Vector3(), ay: new THREE.Vector3(),
+        tan: new THREE.Vector3(),                   // 面内朝外单位向量（掀开铰链的定位方向）
+        halfExt: 0,                                 // 片沿 tan 的半宽 ⇒ 枢轴 = 片心 − tan·halfExt
+        bsize: 0,                                   // 块半径（顶点到块心的最大距离）⇒ 拖尾长度按块尺寸定标
+        eu: 0, ev: 0,                               // ★ v5.1 拖尾锚点：块的**内缘边界点**（块局部坐标，已减块质心）
+                                                    //   —— 拖尾从这条真实边缘出发，不再从块心出发
+        spin: 0, spinRate: 0, life: 0, maxLife: 1, size: 1, bright: 1
+      });
+    }
+    this._shardCursor = 0;
+    this._shardMissed = 0;      // 池满时丢弃的碎片数（观测口，正常恒 0）
+    /* ★ v5.1 观测口（_revStats.shard）—— 让"碎片去哪了"这类问题**可测量**而不是靠猜：
+     *   gate  = 过闸（SHARD_COOL_MIN）的碎块数 = 本次爆发实际参与裂开的片数；
+     *   out   = 实际写进池的块数（= Σ 各片档位请求块数，扣掉尖角被合并的；每片 ≥ SHARD_TILE_MIN = 10）；
+     *   skipped = v5.8 新增：被 SF 预算挤掉、**这次没裂**的片数（白膜保持原样自然褪）。 */
+    this._shardGate = 0;
+    this._shardOut = 0;
+    this._shardSkipped = 0;
+    /* 发射期的**面内基暂存**（每片算一次，供该片所有碎片共用）—— 用成员字段而不是
+     * 「new THREE.Vector3()」：触发发生在渲染帧内，不能引入对象分配。 */
+    this._shardE1 = new THREE.Vector3();
+    this._shardE2 = new THREE.Vector3();
 
     /* ---------- v5.33：探针 LOD 代理（每面 1 个合并网格：570 draw call → 26） ----------
      * 用户实测"关掉探针立刻不卡" ⇒ 瓶颈确认是探针；用户明确否决降频/降分辨率（退化），
@@ -4727,7 +5507,13 @@ export class L5Core {
      * 水晶消失之前全亮"（见 sync() 穿帮修复块的使用）。重新展开（wantSeq=true）
      * 即解除。 */
     if (wantSeq) this._dropSync = 0;
-    else if (_wasSeq) this._dropSync = 1;
+    else if (_wasSeq) {
+      this._dropSync = 1;
+      /* ★ v-碎膜：**这一帧就是 true→false 沿** —— 白膜在此"裂开"。
+       * 与 drain 同帧启动：drain（8×，0.3s）把 u_cool 清掉的同时，碎片正往外剥离
+       * ⇒ 读作"白碎成了碎片飞走"，而不是"白色褪掉"（用户构思）。 */
+      this._emitShardBurst();
+    }
     /* —— v5.16：面级脉冲排程全部作废 ——
      * 用户原话："能量到达80之后，每个五边形面中心会扩散出一道脉冲，然后一直循环……
      *   我怀疑你是把基准面渐隐渐显做到水晶碎块上了，而且没有设置触发条件"
@@ -5317,7 +6103,38 @@ export class L5Core {
       /* v5.38：门控效果 —— shellDraw=false 表示这 570 个 draw call 本轮根本没发；
        * twins.on 是屏幕剔除后真正开启的隐形遮挡体数量。 */
       shellDraw: this._shellDraw !== false,
-      twins: { on: this._twinOn ?? -1, total: this.fragTwins ? this.fragTwins.length : 0 }
+      twins: { on: this._twinOn ?? -1, total: this.fragTwins ? this.fragTwins.length : 0 },
+      /* v-碎膜：碎膜飞散的观测口。★ v5.8.2 起，"为什么只有几片"这句话有了**可分离的两个数**：
+       *   · cand  = **有膜**的外圈片数（stored > 0）= 这次"本该"裂几片；
+       *   · gate  = 真正过闸的片数。`gate ≈ cand` ⇒ 闸门不是瓶颈，问题在粒子侧（没打够）；
+       *             `gate << cand` ⇒ 瓶颈在闸门 / 预烘格。
+       *   · storedMax / storedAvg = 有膜片的储存分布 —— 定 `SHARD_TIERS`（每片几块）用这个数。
+       *   · active = 当前在飞的碎片数（跌破 80 瞬间一波，随后 0.85~1.25s 衰减到 0）；
+       *   · out = 实际写进池的块数 ≈ gate × 每片块数；
+       *   · skipped = 被 `budget` 挤掉、这次没裂的片数（白膜自然褪，不是 bug）；
+       *   · budget = 本次预算（`min(SHARD_BURST_MAX, 外圈池 × 16)`）；若 out 明显小于
+       *             `gate × tilePcAvg` ⇒ 池太小（missed > 0）或被 budget 截断（skipped 大）。
+       *   · missed = 池满被丢弃的碎片数 —— **恒应为 0**；>0 说明 SHARD_MAX 给小了。 */
+      shard: {
+        active: this._shardActive ?? 0, missed: this._shardMissed ?? 0, cap: SHARD_MAX,
+        cand: this._shardCand ?? 0,
+        gate: this._shardGate ?? 0, out: this._shardOut ?? 0,
+        budget: this._shardBudget ?? 0,
+        tileMiss: this._shardTileMiss ?? 0,
+        storedMax: this._shardStoredMax ?? 0,
+        storedAvg: this._shardStoredAvg ?? 0,
+        /* v5.8：被预算挤掉、这次没裂的片数（它们不裂、白膜自然褪，不是 bug）。 */
+        skipped: this._shardSkipped ?? 0,
+        /* 加载期烘出的预烘格数 —— 期望 ≈ 外缘环片数 × SHARD_TILE_N（档位数 3）。
+         * 明显偏小 ⇒ 某档整格作废（母片轮廓退化），那档的片不会崩。 */
+        tiles: this._shardTileCount ?? 0,
+        /* ★ v5.8 修正后新增 —— **"每片到底分出几块"的唯一硬判据**（别再靠眼睛数）：
+         *   · tilePcMin 应 ≥ SHARD_TILE_MIN（10）。若是 1~4 ⇒ 面积配平又退化了（见
+         *     SHARD_TILE_GAIN 那段注：配平方向写反会走正反馈、邻居被闸门整批删掉）；
+         *   · tilePcAvg 期望 10~16（请求 12/14/16，尖角楔形被合并掉 1~3 个）。 */
+        tilePcMin: this._shardTilePcMin ?? 0,
+        tilePcAvg: this._shardTilePcAvg ?? 0
+      }
     };
   }
 
@@ -6418,6 +7235,10 @@ export class L5Core {
     const gvu = this.bhGravMaterial.uniforms;
     gvu.u_gv_rs.value = bhRDraw / (BH_LENS_K * BH_B_CRIT_RS);
     gvu.u_gv_uout.value = LENS_U_OUT;
+    /* v-塌修：与 bhCore / bhLens **同帧、同一个值、同一个时钟** —— 上面 6564/6567 两个
+     * 也是写的 bhWarp 与 simTime。三者共享同一次求值才可能压出同一个形状。 */
+    gvu.u_bh_crush.value = bhWarp;
+    gvu.u_time.value = simTime;
     /* v5.29：打开碎片的**隐形遮挡体**（renderOrder 35，只写深度不写颜色）。
      * 洞前的碎片 ⇒ 深度比洞心近 ⇒ 透镜环(36)被深度测试挡掉 ⇒ 碎片正常遮住黑洞，
      * 且它自己的绘制完全不受影响；洞后的碎片 ⇒ 深度更远 ⇒ 透镜环正常覆盖它。
@@ -6452,6 +7273,12 @@ export class L5Core {
      *  就不存在环流了）" → 整个 >80 挡位 suckAll=true，不再有 flow 环流。 */
     this._updateDataParticles(p, dt, simTime, bh.phase, bhR, bhOver80);
 
+    /* ★ v-碎膜：碎膜飞散的**逐帧推进**必须挂在 sync() 里（无条件每帧跑），
+     * 不能挂在 _animateDeploy 里 —— 后者只在展开/回落演出期间被调用，
+     * 而碎片是**飞出后继续漂浮**（生命 0.85~1.25s，远长于下降沿那一帧）
+     * ⇒ 挂在演出里会让碎片在触发后的下一帧就冻在半空。 */
+    this._updateShardBurst(dt);
+
     // v-new：笼框/幽灵框是结构件 → 恒冷青（结构冷、能量暖）；亮度仍随 p/head 走
     const coldC = this._coldColor || (this._coldColor = new THREE.Color(0.15, 0.60, 1.0));
     this.cageMaterial.color.copy(coldC);
@@ -6460,6 +7287,693 @@ export class L5Core {
     this.cageGhostMaterial.opacity = (0.12 + 0.26 * p) * head * (this._cageMul ?? 1.0);
 
     // v5.21e：棱线光导管的逐帧颜色/透明度驱动（rodGain / rodHead / rodContain）已随之删除
+  }
+
+  /* ═══════════ ★ v-碎膜：碎膜飞散 ═══════════════════════════════════════════
+   * 用户构思：跌破 80 时，外围那圈变白的碎块表面不再"瞬间褪白"，而是**白膜裂成一系列微小
+   * 水晶碎片、往外剥离消散**；碎片**大小与形状取决于各自碎块面的大小和形状**。
+   *   · 触发 = 「_animateDeploy」里 wantSeq true→false 的那一帧（与 drain 同帧）；
+   *   · 发射源 = **外缘环**（radialN ≥ SHARD_RING_N）里 stored > 0 的碎块 —— 数据粒子的捕获池
+   *     本来只在那一圈选片（「_pickFragmentIndex」），所以"变白的就那一圈"，与用户观察一致；
+   *   · 数量 = stored 分档 3 / 6 / 9（用户定标）；
+   *   · 形状 = 各自碎块面的简化轮廓（构造期预计算），按片内 3×3 子格分布并各带随机扰动；
+   *   · 渲染 = 动态顶点缓冲，碎片 + 流线拖尾各 1 次 draw call。 */
+
+  /** 取一个空闲碎片槽位（环形游标，避免每帧从 0 扫）。池满返回 null 并计数。 */
+  _takeShard() {
+    for (let k = 0; k < SHARD_MAX; k++) {
+      const idx = (this._shardCursor + k) % SHARD_MAX;
+      const s = this.shardState[idx];
+      if (!s.active) { this._shardCursor = (idx + 1) % SHARD_MAX; return s; }
+    }
+    this._shardMissed = (this._shardMissed || 0) + 1;
+    return null;
+  }
+
+  /* ── 碎膜分裂工具（作用在模块级 scratch _PART_POOL/_PART_N/_PART_S 上；见常量区说明）──
+   * 用户定标（v5）：白膜裂成 n 块**不规则**碎片（不是被平行切成条），块块共享裂缝边、拼合 = 原片。 */
+
+  /** 第 j 个多边形的面积（鞋带公式取绝对值）。用于源凸包面积（定种子最小间距）。 */
+  _shardPolyArea(j) {
+    const m = _PART_N[j], b = j * SHARD_PIECE_V * 2;
+    let a = 0;
+    for (let k = 0; k < m; k++) {
+      const k2 = ((k + 1) % m) * 2;
+      a += _PART_POOL[b + k * 2] * _PART_POOL[b + k2 + 1]
+         - _PART_POOL[b + k2] * _PART_POOL[b + k * 2 + 1];
+    }
+    return Math.abs(a * 0.5);
+  }
+
+  /** 点 (px,py) 是否落在**源凸包**（槽 PART_HULL）内。单调链输出是逆时针 ⇒ 每条边的叉积都必须 ≥ 0。
+   *  ⚠⚠ v5.2 血案（"只裂两三片、其余全不见"的真根因，**不是**闸门阈值）：
+   *  池里的顶点是**成对**存的 —— 第 k 个顶点的 x 在「b + 2k」、y 在「b + 2k + 1」。
+   *  旧版把"第 k 个顶点"写成「_PART_POOL[b + k] / [b + k + 1]」（**漏了 ×2**）⇒ 除 k=0 外
+   *  取到的全是**隔壁分量的值**（x 与 y 串位）⇒ 每条边的"半平面"都是错的。
+   *  后果不是"画错"，而是**根本测不出任何内点**：拿最普通的单位正方形凸包手算 ——
+   *  内部点 (0.5,0.5) 在 k=1 那条（错位）边上叉积 = −0.5 < 0 ⇒ 直接判 false。
+   *  于是 `_shardPartitionN` 里的种子采样**一颗都放不下** ⇒ pc = 0 ⇒ _emitShardBurst 里
+   *  「if (!pc) continue」⇒ **该片一块都不发射**（v4 的"二分切最大块"没有这个判点步骤，
+   *  所以 v4 时所有碎片都正常出来 —— 与用户观察一致）。
+   *  为什么还看得到"两三片"：少数片的凸包恰好让这组错乱半平面仍有正面积 ⇒ 只有那几片取得到种子。
+   *  ⇒ 教训：池化 (u,v) 的下标一律写成「i * 2 / i * 2 + 1」，读之前先拿一个**已知内点**验证判据。 */
+  _shardPtInHull(px, py) {
+    const m = _PART_N[PART_HULL], b = PART_HULL * SHARD_PIECE_V * 2;
+    for (let k = 0; k < m; k++) {
+      const k2 = ((k + 1) % m) * 2;                                     // 下一顶点（环绕）的 x 下标
+      const ax = _PART_POOL[b + k * 2], ay = _PART_POOL[b + k * 2 + 1]; // 第 k 个顶点 —— ×2 不能漏
+      const bx = _PART_POOL[b + k2], by = _PART_POOL[b + k2 + 1];
+      if ((bx - ax) * (py - ay) - (by - ay) * (px - ax) < 0) return false;
+    }
+    return true;
+  }
+
+  /** 按半平面「保留 (p − m)·n ≤ 0」把第 j 个多边形裁一刀（单侧裁剪，输出 ≤ 输入 + 2 顶点）。
+   *  凸多边形 + 直线 ⇒ 数学严格；裁剪线取两个 Voronoi 种子的**垂直平分线** ⇒ 相邻胞共享这条边。 */
+  _shardClipHalf(j, mx, my, nx, ny) {
+    const m = _PART_N[j], b = j * SHARD_PIECE_V * 2;
+    let na = 0;
+    for (let k = 0; k < m; k++) {
+      const px = _PART_POOL[b + k * 2], py = _PART_POOL[b + k * 2 + 1];
+      const q = (k + 1) % m;
+      const qx = _PART_POOL[b + q * 2], qy = _PART_POOL[b + q * 2 + 1];
+      const sp = (px - mx) * nx + (py - my) * ny;
+      const sq = (qx - mx) * nx + (qy - my) * ny;
+      if (sp <= 0) { _PART_A[na++] = px; _PART_A[na++] = py; }
+      if ((sp <= 0) !== (sq <= 0)) {                        // 跨过裁剪线 ⇒ 补交点
+        const t = sp / (sp - sq);
+        _PART_A[na++] = px + (qx - px) * t;
+        _PART_A[na++] = py + (qy - py) * t;
+      }
+    }
+    if (na > SHARD_PIECE_V * 2) na = SHARD_PIECE_V * 2;     // 保险丝（截断，见 SHARD_PIECE_V 注）
+    _PART_N[j] = na / 2;
+    for (let q = 0; q < na; q++) _PART_POOL[b + q] = _PART_A[q];   // 手写循环（同 _shardClipAllPower 的理由）
+  }
+
+  /** 把槽 PART_HULL 的母片轮廓切成 n 块**不相交胞**（power diagram / 加权 Voronoi）。
+   *  ★ 不变式：**所有胞合起来 = 母片轮廓**（精确拼合、块间共享裂缝边）。
+   *  ★ 为什么是"加权"：普通 Voronoi 只按距离分配、**不管面积** ⇒ 被挤住的胞摊成细长条；
+   *    按面积迭代权重后，各胞被拉向**各自的目标面积** ⇒ 敦实、不摊条。
+   *  ★ 目标面积**各胞不同**（`_PART_T`，随机 ±SHARD_TILE_SIZE_VAR）—— 等面积会被读成
+   *    "切菜等宽段"（用户否掉），有大块有小屑才像摔碎。
+   *  流程：抛镖撒种 → 迭代(带权裁剪 → 按各自目标调权 → 增量重定心) → 细长胞连种子删掉
+   *  再配平（最多 SHARD_TILE_ROUND 轮）。结果留在槽 0..pc-1，返回 pc。
+   *  ⚠ 本函数**只在加载期**调用（烘格），崩裂帧只查表（见 _shardBakeTiles / emit）。 */
+  _shardPartitionN(n, chunk) {
+    const HN = _PART_N[PART_HULL], SB = PART_HULL * SHARD_PIECE_V * 2;
+    if (HN < 3 || n < 1) return 0;
+    if (n > PART_N) n = PART_N;                 // 槽位硬上限：超了会写到母片轮廓槽上 ⇒ 必须先夹住
+    const gate = chunk === undefined ? SHARD_CHIP_CHUNK : chunk;   // 细长闸门（烘格期可放宽重切）
+    /* 源凸包的包围盒（种子在盒内拒绝采样） */
+    let u0 = 1e9, u1 = -1e9, v0 = 1e9, v1 = -1e9;
+    for (let k = 0; k < HN; k++) {
+      const u = _PART_POOL[SB + k * 2], v = _PART_POOL[SB + k * 2 + 1];
+      if (u < u0) u0 = u;
+      if (u > u1) u1 = u;
+      if (v < v0) v0 = v;
+      if (v > v1) v1 = v;
+    }
+    /* ★ v5.8 种子 = **抛镖采样（dart throwing）**，不再是 maximin「一轮取最远点」。
+     *  最远点会把种子摆成等距点阵 ⇒ 胞排成"切菜式"等宽一排（用户否："不能是切菜一样切成一段
+     *  一段的"）；抛镖只要求"别挨太近"、**先到先得** ⇒ 疏密不均、朝向各异，像真摔碎。
+     *  dmin² = SHARD_SEED_GAP·面积/n：松 ⇒ 24 次内几乎必中；一次都没中就取"最远那个"兜底。 */
+    const hullArea = this._shardPolyArea(PART_HULL);
+    const dmin2 = SHARD_SEED_GAP * hullArea / Math.max(1, n);
+    let pc = 0;
+    for (let k = 0; k < n; k++) {
+      let bx = 0, by = 0, bd = -1;
+      for (let tr = 0; tr < 24; tr++) {
+        const px = u0 + Math.random() * (u1 - u0);
+        const py = v0 + Math.random() * (v1 - v0);
+        if (!this._shardPtInHull(px, py)) continue;
+        let md = 1e9;                                       // 到已有种子的**最近**距离²
+        for (let j = 0; j < k; j++) {
+          const ax = px - _PART_S[j * 2], ay = py - _PART_S[j * 2 + 1];
+          const d2 = ax * ax + ay * ay;
+          if (d2 < md) md = d2;
+        }
+        if (md > bd) { bd = md; bx = px; by = py; }          // 兜底：记下"最远那个"
+        if (md >= dmin2) break;                              // 够开 ⇒ **立刻收**（不再挑最远 ⇒ 打破点阵）
+      }
+      if (bd < 0) {
+        /* 24 次采样全落在凸包外：k=0 退回**顶点平均**（凸 ⇒ 必在内部，零失败概率 ——
+         * v5.2 的加固不能丢，否则细长凸包上整片一块不出）；k≥1 少裂一块。 */
+        if (k !== 0) break;
+        for (let v = 0; v < HN; v++) { bx += _PART_POOL[SB + v * 2]; by += _PART_POOL[SB + v * 2 + 1]; }
+        bx /= HN; by /= HN;
+      }
+      _PART_S[k * 2] = bx; _PART_S[k * 2 + 1] = by;
+      pc = k + 1;
+    }
+    if (pc < 1) return 0;
+    /* ★ v5.8 加权配平（目标面积**各胞不同**）+ 细长胞剔除（最多 SHARD_TILE_ROUND 轮） */
+    for (let k = 0; k < pc; k++) {
+      _PART_W[k] = 0;
+      /* 每胞一个随机的**面积目标系数**：等面积 ⇒ 每块一样大 ⇒ 读作"切菜等宽段"（用户否）。
+       * 有大块、有小屑才像摔碎；加权配平照旧在跑 ⇒ 只是"大小不一"，不会退化成细长条。 */
+      _PART_T[k] = 1 - SHARD_TILE_SIZE_VAR + Math.random() * 2 * SHARD_TILE_SIZE_VAR;
+    }
+    for (let round = 0; round < SHARD_TILE_ROUND; round++) {
+      let sumT = 0;
+      for (let k = 0; k < pc; k++) sumT += _PART_T[k];
+      const areaPer = hullArea / sumT;
+      for (let pass = 0; pass < SHARD_TILE_PASS; pass++) {
+        this._shardClipAllPower(pc);
+        let worst = 0;
+        for (let k = 0; k < pc; k++) {
+          const tk = areaPer * _PART_T[k];                  // 本胞**自己**的目标面积
+          const a = this._shardCellArea(k);
+          const err = a - tk;
+          worst = Math.max(worst, Math.abs(err) / tk);
+          /* ★★ v5.8 **符号修正**：抬权 ⇒ 胞**变大**（`c = (…+wk−wj)/(2L)`，抬权把每条边界往外推）
+           *  ⇒ 面积已经**超出**自己目标的胞（err > 0）必须**降权** ⇒ 步长取 **−GAIN·err**。
+           *  这里是 v5.7 的真错误：原来写 `+GAIN·err` = 正反馈（越大越大）⇒ 邻居被挤成 0 顶点
+           *  ⇒ 被细长闸门整批删掉 ⇒ 每片最后只剩 1~4 块（用户："根本没有分出 10 片"）。
+           *  单步夹在 ±STEP×目标 内防大误差一步过冲。 */
+          let d = -SHARD_TILE_GAIN * err;
+          const cap = SHARD_TILE_STEP * tk;
+          if (d > cap) d = cap; else if (d < -cap) d = -cap;
+          _PART_W[k] += d;
+        }
+        /* 增量重定心：只有权重**差**有意义 ⇒ 每轮减去均值，避免数值漂移 */
+        let mw = 0;
+        for (let k = 0; k < pc; k++) mw += _PART_W[k];
+        mw /= pc;
+        for (let k = 0; k < pc; k++) _PART_W[k] -= mw;
+        if (worst <= SHARD_TILE_TOL) break;
+      }
+      this._shardClipAllPower(pc);
+      /* 细长胞（含被压没的）连种子带权重一起删，再配平一轮 —— 它占的区域由邻胞接管，
+       * 拼合仍然完整（那一片归了隔壁）。 */
+      let keep = 0;
+      for (let k = 0; k < pc; k++) {
+        if (_PART_N[k] >= 3 && this._shardCellThick(k) >= gate) {
+          if (keep !== k) {
+            _PART_S[keep * 2] = _PART_S[k * 2]; _PART_S[keep * 2 + 1] = _PART_S[k * 2 + 1];
+            _PART_W[keep] = _PART_W[k];
+            _PART_T[keep] = _PART_T[k];                    // 面积目标也要跟着搬（否则下一轮的目标全错位）
+          }
+          keep++;
+        }
+      }
+      if (keep === pc) break;                               // 没有细长胞 ⇒ 收敛，收工
+      if (keep < 1) return 0;                               // 整片全是细长条 ⇒ 这片不崩
+      pc = keep;
+      if (round === SHARD_TILE_ROUND - 1) this._shardClipAllPower(pc);  // 末轮仍要重裁一次
+    }
+    return pc;
+  }
+
+  /** 按**当前**种子 + 权重把前 pc 个胞重裁一遍（power diagram）：
+   *  胞 k = 母片轮廓 ∩（对每个 j≠k 保留 |p−S_k|²−w_k ≤ |p−S_j|²−w_j 那侧）。
+   *  展开后它是一个**半平面** ⇒ 仍用 `_shardClipHalf`，只是裁剪中点从"垂直平分点"挪到带权点
+   *  `c·n̂`，其中 n̂ = (S_j−S_k)/L、c = (|S_j|²−|S_k|² + w_k − w_j) / (2L)。
+   *  槽 PART_HULL 永远是母片轮廓、绝不被写 ⇒ 可反复调用。 */
+  _shardClipAllPower(pc) {
+    const HN = _PART_N[PART_HULL], SB = PART_HULL * SHARD_PIECE_V * 2;
+    for (let k = 0; k < pc; k++) {
+      _PART_N[k] = HN;
+      /* 槽 k ← 槽 PART_HULL 的母片轮廓。★ 手写循环、不用 `subarray().set()`：配平会让这段被调用
+       * 数万次（每片 ×档位数 × 每份数十趟）⇒ 每次 subarray 都产一个视图对象 = 纯加载期垃圾。
+       * 槽 k（k ≤ PART_HULL−1）区间与槽 PART_HULL 的区间不重叠 ⇒ 原地拷安全。 */
+      const hn2 = HN * 2, kb = k * SHARD_PIECE_V * 2;
+      for (let q = 0; q < hn2; q++) _PART_POOL[kb + q] = _PART_POOL[SB + q];
+      const kx = _PART_S[k * 2], ky = _PART_S[k * 2 + 1];
+      const sk = kx * kx + ky * ky;
+      for (let j = 0; j < pc; j++) {
+        if (j === k || _PART_N[k] < 3) continue;
+        const dx = _PART_S[j * 2] - kx, dy = _PART_S[j * 2 + 1] - ky;
+        const L = Math.hypot(dx, dy);
+        if (L < 1e-6) continue;                             // 种子重合（几乎不会）⇒ 跳过这刀
+        const nx = dx / L, ny = dy / L;
+        const sj = _PART_S[j * 2] * _PART_S[j * 2] + _PART_S[j * 2 + 1] * _PART_S[j * 2 + 1];
+        const c = (sj - sk + _PART_W[k] - _PART_W[j]) / (2 * L);
+        this._shardClipHalf(k, c * nx, c * ny, nx, ny);
+      }
+    }
+  }
+
+  /** 槽 k 多边形的面积（鞋带取绝对值）。等面积配平用。 */
+  _shardCellArea(k) {
+    const m = _PART_N[k], b = k * SHARD_PIECE_V * 2;
+    if (m < 3) return 0;
+    let a2 = 0;
+    for (let v = 0; v < m; v++) {
+      const w = (v + 1) % m;
+      a2 += _PART_POOL[b + v * 2] * _PART_POOL[b + w * 2 + 1]
+          - _PART_POOL[b + w * 2] * _PART_POOL[b + v * 2 + 1];
+    }
+    return Math.abs(a2 * 0.5);
+  }
+
+  /** 槽 k 多边形的细长度 q = 2·√面积 ÷ 周长（面积/周长直接取自池）。
+   *  标定：正方形 0.50 / 等边三角形 0.44 / 圆 0.56（上限）/ 1:5 长条 0.37 / 1:8 → 0.31。 */
+  _shardCellThick(k) {
+    const m = _PART_N[k], b = k * SHARD_PIECE_V * 2;
+    if (m < 3) return 0;
+    let a2 = 0, p = 0;
+    for (let v = 0; v < m; v++) {
+      const w = (v + 1) % m;
+      const x0 = _PART_POOL[b + v * 2], y0 = _PART_POOL[b + v * 2 + 1];
+      const x1 = _PART_POOL[b + w * 2], y1 = _PART_POOL[b + w * 2 + 1];
+      a2 += x0 * y1 - x1 * y0;                              // 鞋带（2×面积）
+      p += Math.hypot(x1 - x0, y1 - y0);
+    }
+    const a = Math.abs(a2 * 0.5);
+    if (a <= 1e-9 || p <= 1e-9) return 0;                   // 退化 ⇒ 当细长条处理
+    return 2 * Math.sqrt(a) / p;
+  }
+
+  /** ★ **加载期预烘格**：对每个"会结膜的外缘环片"（radialN ≥ SHARD_RING_N）把它的凸包
+   *  按 `SHARD_TILE_NS` 里每一档的块数各切一次，结果打包存进 `this._shardTiles`；
+   *  崩裂帧只做"查表 + 拷贝"（零迭代、零随机、零分配）。
+   *  为什么可以预烘：胞的分割**只依赖（母片轮廓, 块数）**，两者加载期就定死了。
+   *  为什么必须预烘：一次配平 = 最多 ROUND×PASS 趟 × pc² 次半平面裁剪；崩裂那一帧
+   *  若几十片同时炸，实时算就是一次肉眼可见的卡顿。
+   *  索引 = `fi * SHARD_TILE_N + 档位序号`；每格 = { pc, m:Uint8Array(各胞顶点数),
+   *  v:Float32Array(各胞顶点**变长紧排** (u,v)) } —— 变长紧排比定长矩阵省数倍内存。 */
+  _shardBakeTiles() {
+    const nf = this.fragments.length;
+    const tiles = new Array(nf * SHARD_TILE_N).fill(null);
+    let baked = 0;
+    /* ★ v5.8 修正后新增的判据：预烘格**实际切出几块**（最小 / 平均）。
+     * 配平方向写反时这里是 1~4（邻居被正反馈挤成 0 顶点、全被细长闸门删掉）；
+     * 修正后应 ≥ SHARD_TILE_MIN（10）。见 _revStats.shard.tilePcMin / tilePcAvg。 */
+    let pcMin = 99, pcSum = 0;
+    for (let fi = 0; fi < nf; fi++) {
+      const f = this.fragments[fi];
+      /* 只有外缘环那圈会结膜 ⇒ 只有它们需要切（其余 200 多片的格子恒 null，emit 直接跳过）。 */
+      if ((f.radialN ?? 0) < SHARD_RING_N) continue;
+      const hull = this._shardContours[fi];
+      if (!hull || hull.length < 6) continue;                // 退化轮廓（emit 守卫同款）
+      const HN = hull.length / 2;
+      if (HN > SHARD_HULL_MAX) continue;                     // 轮廓已抽稀到 ≤ SHARD_HULL_MAX
+      _PART_N[PART_HULL] = HN;                               // 母片轮廓固定进专用槽（_shardPartitionN 的输入）
+      const SB = PART_HULL * SHARD_PIECE_V * 2;
+      for (let k = 0; k < HN * 2; k++) _PART_POOL[SB + k] = hull[k];
+      for (let ti = 0; ti < SHARD_TILE_N; ti++) {
+        const want = SHARD_TILE_NS[ti];
+        let pc = this._shardPartitionN(want);
+        /* ★ 硬地板：用户定标"每片至少崩 10 块"。凸包**尖角**处的楔形胞必被细长闸门合并给
+         *  邻居 ⇒ 最终块数会掉几个；掉到 SHARD_TILE_MIN 以下就把闸门**放宽 30%** 重切一次
+         *  （宁可那一两块薄一点，也不能少于 10 块）。只在不够时触发 ⇒ 绝大多数片只切一次。
+         *  ⚠ 补切会**覆盖** scratch 里的旧结果 ⇒ 只有"更不差"才采用，否则得重切原档，
+         *    否则池里留的是 pc2 的几何、却按 pc 去读 ⇒ 读到上一次的残渣。 */
+        if (pc > 0 && pc < SHARD_TILE_MIN) {
+          const pc2 = this._shardPartitionN(want, SHARD_CHIP_CHUNK * 0.70);
+          pc = pc2 >= pc ? pc2 : this._shardPartitionN(want);
+        }
+        if (!pc) continue;
+        const m = new Uint8Array(pc);
+        let tot = 0, bad = false;
+        for (let k = 0; k < pc; k++) {
+          const mv = _PART_N[k];
+          /* 保险丝：按构造胞顶点 ≤ SHARD_HULL_MAX + (NMAX−1) ≤ SHARD_TILE_V ⇒ 不会触发；
+           * 真触发（母片轮廓异常）就整格作废 ⇒ 这片那档不崩，但**绝不写出越界的几何**。 */
+          if (mv < 3 || mv > SHARD_TILE_V) { bad = true; break; }
+          m[k] = mv; tot += mv;
+        }
+        if (bad) continue;
+        const v = new Float32Array(tot * 2);
+        let o = 0;
+        for (let k = 0; k < pc; k++) {
+          const b = k * SHARD_PIECE_V * 2;
+          for (let q = 0; q < m[k] * 2; q++) v[o++] = _PART_POOL[b + q];
+        }
+        tiles[fi * SHARD_TILE_N + ti] = { pc, m, v };
+        baked++;
+        pcSum += pc;
+        if (pc < pcMin) pcMin = pc;
+      }
+    }
+    this._shardTiles = tiles;
+    this._shardTileCount = baked;    // 观测口：烘出多少格（0 或有空缺 = 分裂算法出问题）
+    this._shardTilePcMin = baked ? pcMin : 0;
+    this._shardTilePcAvg = baked ? pcSum / baked : 0;
+  }
+
+  /** 触发一次碎膜飞散：外缘环上**真的白了**的碎块，白膜崩成 12 / 14 / 16 块（尖角合并后典型 ≥10）。 */
+  _emitShardBurst() {
+    const frags = this.fragments;
+    const ns = this._shardTierN;
+    const sLoc = this._shardLocal, sRad = this._shardRad, sSeed = this._shardSeed;  // v5.4（B 方案）
+    /* 第一遍：给"该碎"的片定**档位**（= 块数档，见 SHARD_TILE_NS / SHARD_TIERS）。
+     * ★★ v5.8.2 修正的是**门槛语义**，不是阈值：门槛 = "**这一片有没有膜**"（`stored > 0`
+     *   = 被命中过），**不是**"膜够不够厚"。厚薄只决定碎片亮度（下面的 `cool`）。
+     *   旧门槛 0.85（≈ 同一片被命中 5 次）会把"有膜但薄"的片整批挡掉 ⇒ 正是用户报的
+     *   "只有一两片碎、其他碎块根本没有碎片出来"。（`stored > 0` 为什么以前被否、现在又能用，
+     *   见 SHARD_COOL_MIN 注：那时每片 3/6/9 块 + 保险丝"按比例缩块数"；现在 12~16 块 + 按片入选。）
+     * ★ 存法：`ns[i] = 档位序号 + 1`（0 = 不崩）—— 沿用既有的 _shardTierN 缓冲，
+     *   省一个数组，也让"未入选"和"档位 0"能区分开。 */
+    let gate = 0, cand = 0, tileMiss = 0, storedMax = 0, storedSum = 0;
+    for (let i = 0; i < frags.length; i++) {
+      ns[i] = 0;
+      const f = frags[i];
+      if ((f.radialN ?? 0) < SHARD_RING_N) continue;      // 只有外缘环那圈会结膜
+      const stored = f.stored || 0;
+      if (stored <= 0) continue;                          // 没被命中过 ⇒ 没膜 ⇒ 无膜可裂
+      cand++;                                             // ★ v5.8.2 观测口：有膜的外圈片数
+      if (stored > storedMax) storedMax = stored;
+      storedSum += stored;
+      /* 轮廓/预烘格任一缺席 ⇒ 这片裂不出可拼合的块，直接剔除（否则白挑了片、白占了预算）。 */
+      if (!this._shardContours[i] || !this._shardCenters[i]) { tileMiss++; continue; }
+      if (!this._shardTiles[i * SHARD_TILE_N]) { tileMiss++; continue; }
+      const cool = Math.min(stored * this._COOL_PER, this._COOL_MAX) / this._COOL_MAX;
+      if (cool < SHARD_COOL_MIN) continue;
+      let t = 0;
+      for (let q = 0; q < SHARD_TIERS.length; q++) {
+        if (stored >= SHARD_TIERS[q][0]) t = SHARD_TIERS[q][1];
+      }
+      ns[i] = t + 1;
+      gate++;
+    }
+    /* 观测口（v5.8.2 新增）：`cand` = **有膜**的外圈片数（= 这次"本该"裂几片），`gate` = 真正
+     * 过闸的片数。两者差得多 ⇒ 问题在闸门/预烘格；两者都小 ⇒ 是粒子侧"没打够"（去看存储分布）。 */
+    this._shardGate = gate;
+    this._shardCand = cand;
+    this._shardTileMiss = tileMiss;
+    this._shardStoredMax = storedMax;
+    this._shardStoredAvg = cand ? storedSum / cand : 0;
+    this._shardOut = 0;          // 观测口：实际写进池的块数
+    if (!gate) return;
+    /* ★ 白屏保险丝（v5.8 改口径 / v5.8.2 改**预算口径**）：白片数量不可控（长局后外圈可能整圈
+     *   全白），放任一堆白膜同时加色 + bloom 就是第一版那张"亮成白色的一团"。但用户定标"碎片
+     *   至少要分 10 块" ⇒ **不许再削每片的块数**，要控总量只能**少挑几片**：按白得最狠
+     *   （stored 大）优先入选，累计块数到 `budget` 就停。挑剩下的片保持原样、照旧自然褪白 ——
+     *   它们根本没碎，所以也不会出现"白长条垫在碎晶底下"。
+     *   ★ `budget = min(SHARD_BURST_MAX, 外圈池片数 × 16)`：外圈池够小 ⇒ **整圈都能裂**（用户诉求）；
+     *     只有在池子大于上限时才需要"少挑几片"。 */
+    let used = 0, skipped = 0;
+    /* ★★ v5.8.2：预算**不再是常数** —— 必须 ≥「外圈池里每一片都裂」的需要量，否则"每个白了的
+     * 碎块面都碎"在算术上就不可能（旧的 400 只够 400/12 ≈ 33 片）。上界 = SHARD_BURST_MAX。 */
+    const budget = Math.min(SHARD_BURST_MAX, this._ringPoolN * SHARD_TILE_NMAX);
+    this._shardBudget = budget;
+    const pick = this._shardPick;
+    pick.fill(0);
+    for (;;) {
+      let best = -1, bestStored = -1;
+      for (let i = 0; i < frags.length; i++) {
+        /* ⚠ 必须跳过"已入选"的片：入选时只累加 used、**不清 ns**（第二遍还要按档位查表）
+         * ⇒ 没有这个标志的话，下一轮又会挑中同一片、反复累加同一份块数。 */
+        if (!ns[i] || pick[i]) continue;
+        const st = frags[i].stored || 0;
+        if (st > bestStored) { bestStored = st; best = i; }
+      }
+      if (best < 0) break;
+      const need = SHARD_TILE_NS[ns[best] - 1];
+      if (used + need > budget) { ns[best] = 0; skipped++; continue; }
+      pick[best] = 1;
+      used += need;
+    }
+    this._shardSkipped = skipped;    // 观测口：被预算挤掉的片数（它们不裂，白膜照旧自然褪）
+    if (!used) return;
+    for (let i = 0; i < frags.length; i++) {
+      const tcode = ns[i];
+      if (!tcode) continue;
+      const f = frags[i];
+      const cUV = this._shardCenters[i];                 // 本片自身质心（面局部坐标的面内分量）
+      const cool = Math.min((f.stored || 0) * this._COOL_PER, this._COOL_MAX) / this._COOL_MAX;
+      const ti = tcode - 1;                              // 档位序号 = 预烘格索引
+      /* ★ 面内基必须**跟着本片当前的朝向** —— 碎块在展开期会绕自身法线转过 FRAG_ROT
+       * （最大 0.26 rad ≈ 15°）。规则 9：world = position + R·p ⇒ 面内偏移 p 必须乘那个
+       * 四元数。法线正是旋转轴 ⇒「f.normal」本身不受影响，直接沿用。 */
+      const e1 = this._shardE1.copy(f.e1).applyQuaternion(f.mesh.quaternion);
+      const e2 = this._shardE2.copy(f.e2).applyQuaternion(f.mesh.quaternion);
+      /* ── 取本片那一档的胞（加载期已烘好，这里只查表 + 拷进 scratch）──
+       *   · 胞 = 加权 power diagram 把本片凸包精确切开的产物 ⇒ 块与块共享裂缝边、
+       *     合起来正好是母片轮廓 ⇒ **出生那一帧拼回完整白膜**（既定不变式）；
+       *   · 每胞被拉向**各自的随机目标面积** ⇒ 有大块、有小屑，不是"切菜等宽段"，
+       *     同时配平保证不出现被挤扁的细长条；
+       *   · scratch（_PART_POOL）为加载期定长缓冲，拷贝是手写循环 ⇒ 渲染帧内零分配。 */
+      const tile = this._shardTiles[i * SHARD_TILE_N + ti];
+      if (!tile) continue;                                  // 该片这档没烘出来 ⇒ 这片不裂
+      const pc = tile.pc, tm = tile.m, tv = tile.v;
+      const pool = _PART_POOL, pn = _PART_N;
+      let so = 0;
+      for (let k = 0; k < pc; k++) {
+        const mv = tm[k], d = k * SHARD_PIECE_V * 2;
+        for (let q = 0; q < mv * 2; q++) pool[d + q] = tv[so + q];
+        so += mv * 2;
+        pn[k] = mv;
+      }
+      /* ★ v5.6：崩出去的那一刻就把**母片的白**清掉。旧版白要靠 drain 慢慢掉（0.3s）⇒
+       *   这 0.3s 里母片还是一条 2~4:1 的白色长条叠在新碎晶底下 = 用户看到的"细长条"。
+       *   白色没有消失，是**转移**进了同帧出生、原地覆盖它的碎晶里（亮度沿用同一 cool 定标）
+       *   ⇒ 读作"白膜当场碎成碎晶飞走"，而不是"白膜底下垫着一堆六边形"。 */
+      f.stored = 0;
+      for (let k = 0; k < pc; k++) {
+        const m = pn[k];
+        if (m < 3) continue;                               // 退化块画不出（<3 顶点）
+        const s = this._takeShard();
+        if (!s) return;                                    // 池满：整体放弃（观测口 _shardMissed）
+        const pb = k * SHARD_PIECE_V * 2;
+        /* 块质心（凸 ⇒ 顶点平均在块内）与块朝外方向 t̂（=「片心→块心」的方位，group 空间）。 */
+        let cuu = 0, cvv = 0;
+        for (let v = 0; v < m; v++) { cuu += pool[pb + v * 2]; cvv += pool[pb + v * 2 + 1]; }
+        cuu /= m; cvv /= m;
+        const dl = Math.hypot(cuu, cvv);
+        const tx = dl > 1e-5 ? cuu / dl : 1, ty = dl > 1e-5 ? cvv / dl : 0;
+        s.active = true;
+        this._shardOut++;                           // 观测口
+        s.vcount = m;
+        s.nrm.copy(f.normal);
+        s.ax.copy(e1);
+        s.ay.copy(e2);
+        s.tan.copy(e1).multiplyScalar(tx).addScaledVector(e2, ty);
+        /* 块顶点写进本槽位的裂缝块池 —— ★ 必须**减去块自身质心 (cuu,cvv)** 重定心：
+         * 池里的 (u,v) 原本是相对「片质心」的坐标，而 s.pos 已经放在块心 ⇒ 不减的话
+         * 块心偏移会被叠加两次，块整体沿「片心→块心」方向外推、拼不回原片；
+         * 减掉之后 (u,v) 以块心为原点 ⇒ 自转/掀开也都正确地绕块自身中心。
+         * 块形状只在发射时算一次，之后整个生命周期由 update 复用（零重复计算）。 */
+        const db = s.slot * SHARD_PIECE_V * 2;
+        for (let v = 0; v < m; v++) {
+          this._shardPieces[db + v * 2] = pool[pb + v * 2] - cuu;
+          this._shardPieces[db + v * 2 + 1] = pool[pb + v * 2 + 1] - cvv;
+        }
+        /* 初始位置 = 片质心 + 块质心偏移（组空间；e1/e2 已乘片四元数，规则 9），
+         * 再沿法线微抬离母面（否则第一帧与母面重合、又都是加色白）。 */
+        s.pos.copy(f.mesh.position)
+          .addScaledVector(e1, cUV[0] + cuu)
+          .addScaledVector(e2, cUV[1] + cvv)
+          .addScaledVector(s.nrm, SHARD_LIFT);
+        /* 铰链：枢轴 = 块心 − t̂·L，L = 块顶点沿 t̂ 的**最小**相对投影取反 ⇒ 枢轴恰在块的
+         * **内缘**（朝片心一侧）⇒ 掀开时这条边不动、外缘抬起（读作"从母面上剥离"）。 */
+        let minE = 0, maxR2 = 0, eu = 0, ev = 0;
+        for (let v = 0; v < m; v++) {
+          const ru = pool[pb + v * 2] - cuu, rv = pool[pb + v * 2 + 1] - cvv;
+          const e = ru * tx + rv * ty;
+          /* ★ v5.1：「minE」那个顶点就是**块沿运动反方向最远的边界点** —— 正是拖尾该挂的锚点
+           *  （块沿 t̂ = 片心→块心 四散 ⇒ 内缘 = 背向运动那一侧）。顺手把它的块局部坐标记下来。 */
+          if (e < minE) { minE = e; eu = ru; ev = rv; }
+          const r2 = ru * ru + rv * rv;
+          if (r2 > maxR2) maxR2 = r2;
+        }
+        s.halfExt = -minE;
+        s.bsize = Math.sqrt(maxR2);                 // 块半径：拖尾长度按它定标（小块短线、大块长线）
+        s.eu = eu; s.ev = ev;                       // 与池里块顶点同一坐标系（已减块质心）⇒ 变换可直接复用
+        /* ★ v5.4（B 方案）逐顶点属性 —— **只在发射时写一遍**，之后终生不变（每帧零开销）。
+         * ⚠ 渲染缓冲的顶点布局 = [质心, b0, b1, …, b_{m-1}, b0(重复)]，与「_shardPieces」
+         *   的布局（[b0 … b_{m-1}]）**差一个偏移**；两处映射必须完全一致：
+         *     v = 0        → 块质心（局部 (0,0)，aRad = 0）
+         *     v = 1..m     → 边界 b_{v-1}（aRad = 1）
+         *     v = m+1..V-1 → **复制 b0**（不是复制末点！扇形最后一个楔形是
+         *                    (质心, b_{m-1}, b0) —— 靠这一格闭合；若复制末点，每个块
+         *                    都会缺一个从质心到"首末边"的三角口子）
+         *   见 _updateShardBurst 里同款映射（改一处必须改两处）。 */
+        const ab = s.slot * SHARD_PIECE_V;
+        const invR = 1 / Math.max(s.bsize, 1e-5);
+        /* 每块的三维种子：块心 (cuu,cvv) + 片号 ⇒ sin 哈希。**只在 CPU 内部用**（不需要与
+         * GPU 逐位一致），所以用 sin 哈希没问题 —— 规则 4 那条"无 sin"只约束跨端复算的量。 */
+        let hA = Math.sin(cuu * 127.1 + cvv * 311.7 + i * 74.7) * 43758.5453;
+        let hB = Math.sin(cuu * 269.5 + cvv * 183.3 + i * 41.3) * 28001.8384;
+        let hC = Math.sin(cuu * 419.2 + cvv * 371.9 + i * 96.1) * 19999.1234;
+        hA -= Math.floor(hA); hB -= Math.floor(hB); hC -= Math.floor(hC);
+        for (let v = 0; v < SHARD_PIECE_V; v++) {
+          const sv = v === 0 ? -1 : (v <= m ? v - 1 : 0);
+          const o2 = (ab + v) * 2, o3 = (ab + v) * 3;
+          sRad[ab + v] = sv < 0 ? 0 : 1;
+          sSeed[o3] = hA; sSeed[o3 + 1] = hB; sSeed[o3 + 2] = hC;
+          if (sv < 0) { sLoc[o2] = 0; sLoc[o2 + 1] = 0; }
+          else {
+            sLoc[o2] = (pool[pb + sv * 2] - cuu) * invR;
+            sLoc[o2 + 1] = (pool[pb + sv * 2 + 1] - cvv) * invR;
+          }
+        }
+        this._shardDirty = true;                    // 下一帧把这些属性上传一次（见 _updateShardBurst）
+        /* 速度：沿法线剥离为主 + **沿块自己的朝外方向四散**（草图：四块箭头各指一方）
+         * + 少量切向抖动 ⇒ 不同块方向不同，读作"裂开四散"而非"整片平移"。 */
+        s.vel.copy(s.nrm).multiplyScalar(SHARD_OUT_SPD * (0.7 + Math.random() * 0.6));
+        s.vel.addScaledVector(s.tan, SHARD_SPREAD * (0.5 + Math.random()));
+        s.vel.addScaledVector(e1, (Math.random() - 0.5) * SHARD_SPREAD * 0.8);
+        s.vel.addScaledVector(e2, (Math.random() - 0.5) * SHARD_SPREAD * 0.8);
+        /* 自转**从 0 开始**、缓慢错动 —— 出生那一帧块与块拼合成完整白膜（"裂开"的前提）；
+         * 旧版随机相位 + 8 rad/s 会直接读成"一堆乱飞的碎屑"。 */
+        s.spin = 0;
+        s.spinRate = (Math.random() < 0.5 ? 1 : -1) * SHARD_SPIN_MAX * (0.4 + Math.random() * 0.6);
+        s.maxLife = SHARD_LIFE_MIN + Math.random() * (SHARD_LIFE_MAX - SHARD_LIFE_MIN);
+        s.life = s.maxLife;
+        s.size = 1;                    // 块用**真实尺寸**（拼合的前提）；末段收缩由 fade 负责
+        /* ★ v5.5 块间亮度散开（±25%）：整批一个亮度 = "一片等亮的白屑"；
+         *   有明有暗才读得出一颗颗独立的碎晶（加色下这也是唯一不用改着色器的对比杠杆）。 */
+        s.bright = SHARD_HDR * (0.35 + 0.65 * cool) * (0.75 + 0.50 * Math.random());
+      }
+    }
+  }
+
+  /** 每帧更新：惯性 + 阻尼 → 剥离后减速漂浮；自转；末段缩小 + 变暗；死亡时清顶点。 */
+  _updateShardBurst(dt) {
+    const pos = this._shardPos, col = this._shardCol;
+    const tpos = this._trailPos, tcol = this._trailCol;
+    const T0 = SHARD_TINT[0], T1 = SHARD_TINT[1], T2 = SHARD_TINT[2];
+    const G0 = SHARD_TRAIL_TINT[0], G1 = SHARD_TRAIL_TINT[1], G2 = SHARD_TRAIL_TINT[2];
+    const damp = Math.max(0, 1 - SHARD_DRAG * dt);
+    let any = false, nActive = 0;
+    for (let i = 0; i < SHARD_MAX; i++) {
+      const s = this.shardState[i];
+      if (!s.active) continue;                    // 未激活槽位恒为 0（构造时已清零）
+      any = true;
+      nActive++;
+      s.life -= dt;
+      const o = i * SHARD_PIECE_V * 3;
+      const to = i * 4 * 3;
+      if (s.life <= 0) {
+        /* 死亡：把顶点归零（加色混合下 0 = 完全不可见）⇒ 不留残影。归零只需这一次。 */
+        s.active = false;
+        for (let k = 0; k < SHARD_PIECE_V * 3; k++) { pos[o + k] = 0; col[o + k] = 0; }
+        for (let k = 0; k < 12; k++) { tpos[to + k] = 0; tcol[to + k] = 0; }
+        continue;
+      }
+      s.vel.multiplyScalar(damp);
+      s.pos.addScaledVector(s.vel, dt);
+      s.spin += s.spinRate * dt;
+      /* 末段 30% 才收缩/变暗 —— 前 70% 保持满亮，碎片"飞出去"的过程才看得清。 */
+      const t = s.life / s.maxLife;
+      const fade = t > 0.3 ? 1 : t / 0.3;
+      const bright = s.bright * fade;
+      const size = s.size * (0.35 + 0.65 * fade);
+      const cr = Math.cos(s.spin), sr = Math.sin(s.spin);
+      const ax = s.ax, ay = s.ay, px = s.pos.x, py = s.pos.y, pz = s.pos.z;
+      /* ★ 掀开（peel）：整个碎片绕**本片内缘的铰链线**向外开合 —— 见 SHARD_TILT_MAX。
+       *   轴线 â = t̂ × nrm（t̂ = 面内朝外单位向量）；枢轴 P = 片心 − t̂·halfExt。
+       *   顶点 = Rodrigues(P + rot(顶点−P))；因为 t̂ = 面内朝外，且 t̂ ⊥ nrm ⊥ â，旋转
+       *   (â×rel) 的方向恰好是 +nrm ⇒ 外缘必然朝**外**抬起（不会是往里塌）。 */
+      const tp = 1 - t;                                     // life/maxLife: 1→0 ⇒ 0→1
+      const th = SHARD_TILT_MAX * tp, cth = Math.cos(th), sth = Math.sin(th);
+      const nrmx = s.nrm.x, nrmy = s.nrm.y, nrmz = s.nrm.z;
+      const tgx = s.tan.x, tgy = s.tan.y, tgz = s.tan.z;
+      const hx = tgy * nrmz - tgz * nrmy;                   // â = t̂ × nrm（单位，且 ⊥ t̂、⊥ nrm）
+      const hy = tgz * nrmx - tgx * nrmz;
+      const hz = tgx * nrmy - tgy * nrmx;
+      const hh = s.halfExt;
+      const pvx = px - tgx * hh, pvy = py - tgy * hh, pvz = pz - tgz * hh;
+      const R0 = T0 * bright, R1 = T1 * bright, R2 = T2 * bright;
+      /* 块顶点源 = 裂缝块池里本槽位的 (u,v)（发射时写入、已减块质心）；mvc = 边界点数 m。
+       * ★ v5.4 起 0 号顶点 = **块质心**（局部 (0,0)），边界点整体后移一格；超出 mvc 的部分
+       * **复制 b0**（不是复制末点，见下）⇒ 索引扇形多出的三角形零面积、加色下不可见。 */
+      const pcArr = this._shardPieces, pcb = s.slot * SHARD_PIECE_V * 2, mvc = s.vcount;
+      for (let v = 0; v < SHARD_PIECE_V; v++) {
+        /* ★ v5.4（B 方案）顶点映射：v=0 → **块质心**（局部 (0,0)）；v=1..mvc → 边界 b_{v-1}；
+         *   v>mvc → **复制 b0**（闭合楔形 (质心, b_{m-1}, b0) 靠它画出来）。
+         *   必须与 _emitShardBurst 里写 aLocal/aRad 的映射**逐字一致**。 */
+        const bi = v === 0 ? -1 : (v <= mvc ? v - 1 : 0);
+        const u0 = bi < 0 ? 0 : pcArr[pcb + bi * 2];
+        const v0 = bi < 0 ? 0 : pcArr[pcb + bi * 2 + 1];
+        const uu = (u0 * cr - v0 * sr) * size;
+        const vv = (u0 * sr + v0 * cr) * size;
+        /* ① 平铺（未掀开）位置 → 相对枢轴 ② 绕 â 做 Rodrigues 旋转 ③ 回到世界 */
+        const rx = px + ax.x * uu + ay.x * vv - pvx;
+        const ry = py + ax.y * uu + ay.y * vv - pvy;
+        const rz = pz + ax.z * uu + ay.z * vv - pvz;
+        const dd = hx * rx + hy * ry + hz * rz;
+        const qx = rx - hx * dd, qy = ry - hy * dd, qz = rz - hz * dd;
+        const cxq = hy * qz - hz * qy, cyq = hz * qx - hx * qz, czq = hx * qy - hy * qx;
+        const w = o + v * 3;
+        pos[w] = pvx + hx * dd + qx * cth + cxq * sth;
+        pos[w + 1] = pvy + hy * dd + qy * cth + cyq * sth;
+        pos[w + 2] = pvz + hz * dd + qz * cth + czq * sth;
+        col[w] = R0; col[w + 1] = R1; col[w + 2] = R2;
+      }
+      /* 拖尾锚点 ★ v5.1：**块内缘的那个真实边界点**（发射时记在 s.eu/s.ev）——
+       *   走与块顶点**完全相同**的一套变换（自转 → 绕 â Rodrigues）⇒ 锚点精确落在碎片边界上。
+       *   旧版锚点 = 掀开后的**块心**（弧长 = t̂·hh·(cosθ−1) + nrm·hh·sinθ）⇒ 用户指出的"拖尾从
+       *   碎片中心出发"。换成边界点之后，拖尾是从**碎片边缘**长出来的。 */
+      const euu = (s.eu * cr - s.ev * sr) * size;
+      const evv = (s.eu * sr + s.ev * cr) * size;
+      const erx = px + ax.x * euu + ay.x * evv - pvx;
+      const ery = py + ax.y * euu + ay.y * evv - pvy;
+      const erz = pz + ax.z * euu + ay.z * evv - pvz;
+      const edd = hx * erx + hy * ery + hz * erz;
+      const eqx = erx - hx * edd, eqy = ery - hy * edd, eqz = erz - hz * edd;
+      const ecx = hy * eqz - hz * eqy, ecy = hz * eqx - hx * eqz, ecz = hx * eqy - hy * eqx;
+      const kx = pvx + hx * edd + eqx * cth + ecx * sth;
+      const ky = pvy + hy * edd + eqy * cth + ecy * sth;
+      const kz = pvz + hz * edd + eqz * cth + ecz * sth;
+      /* ★ v5 修正（"青色流线一条都看不到"的真根因）：方向必须取**速度在切平面上的投影**的反向。
+       *   旧版直接取 −vel，而 vel 的主导项是面法线（OUT_SPD 0.85 对切向 SHARD_SPREAD 0.16）
+       *   ⇒ −vel ≈ −nrm = **指向壳体内部**：整条带子从碎片位置往晶体里伸，被 depthTest 的
+       *   晶体几何整段剔掉（与规则 27 同源 —— 法线方向在小 FOV 下既不产生屏幕位移、又会被
+       *   自己所在的凸壳挡掉）。投影到切平面后它只在母面平面内延伸 ⇒ 必然有屏幕投影。 */
+      const vd = s.vel.x * nrmx + s.vel.y * nrmy + s.vel.z * nrmz;
+      const vix = s.vel.x - nrmx * vd, viy = s.vel.y - nrmy * vd, viz = s.vel.z - nrmz * vd;
+      let vin = Math.sqrt(vix * vix + viy * viy + viz * viz);
+      let dx, dy, dz;
+      if (vin > 1e-4) { const iv = -1 / vin; dx = vix * iv; dy = viy * iv; dz = viz * iv; }
+      else { vin = 0; dx = -tgx; dy = -tgy; dz = -tgz; }   // 退化（切向速度≈0）⇒ 沿面内朝内（剥离的来向）
+      /* 长度按**块自身尺寸**定标（小块短线、大块长线），再叠一点切向速度项 ⇒ 快时拉长、阻尼后自动收回。
+       * ★ v5.6：2.4→1.3、上限 0.34→0.24 —— 用户实测拖尾读成"细长条"，先砍长。 */
+      const len = Math.min(SHARD_TRAIL_LEN, s.bsize * 1.3 + vin * 0.22);
+      /* ★★ v5.6 侧向 = **屏幕面内的垂直方向** (−dy, dx, 0)。旧 = 拖尾方向 × 面法线（躺在母面平面里）
+       *   —— 母面一转到掠射角，带子的宽度在屏幕上塌成 1~2px、长度却不变 = 用户看到的"细长条"。
+       *   相机是固定正交（视线恒 −Z、屏幕面 = 世界 X/Y）⇒ 宽度方向整体放进屏幕面里，
+       *   **任何朝向都保住全宽**。拖尾方向平行视线（屏上没长度）⇒ 退化回旧式 dir × nrm。 */
+      let sx = -dy, sy = dx, sz = 0;
+      let sl = Math.hypot(sx, sy);
+      if (sl < 1e-4) {
+        sx = dy * nrmz - dz * nrmy;
+        sy = dz * nrmx - dx * nrmz;
+        sz = dx * nrmy - dy * nrmx;
+        sl = Math.sqrt(sx * sx + sy * sy + sz * sz);
+      }
+      if (sl > 1e-5) { sx /= sl; sy /= sl; sz /= sl; }
+      const hw = SHARD_TRAIL_W * 0.5 * (0.35 + 0.65 * fade);
+      const tw = hw * 0.32;                      // 尾端收细 ⇒ 是"流线"不是等宽带子
+      /* 抬升两段：+nrm（浮在母面之上，v5 的修正）+ **+Z 朝相机**（v5.6：屏幕上零位移、只改深度
+       * —— 把带子从壳面拎到相机这一侧 ⇒ 掠射角那部分也不会再被壳体 depthTest 削掉半条）。
+       * 可见面片沿 +Z 必然离开凸壳（可见点 = 该视线进入壳体的入口，再往前就是壳外）。 */
+      const lx = nrmx * SHARD_TRAIL_LIFT, ly = nrmy * SHARD_TRAIL_LIFT, lz = nrmz * SHARD_TRAIL_LIFT
+        + SHARD_TRAIL_ZLIFT;
+      const ax0 = kx + lx, ay0 = ky + ly, az0 = kz + lz;     // 抬高后的头部 = 碎块**内缘边界点**
+      const tx = ax0 + dx * len, ty = ay0 + dy * len, tz = az0 + dz * len;
+      const ta = bright * SHARD_TRAIL_ALPHA;
+      tpos[to] = ax0 + sx * hw; tpos[to + 1] = ay0 + sy * hw; tpos[to + 2] = az0 + sz * hw;
+      tpos[to + 3] = ax0 - sx * hw; tpos[to + 4] = ay0 - sy * hw; tpos[to + 5] = az0 - sz * hw;
+      tpos[to + 6] = tx - sx * tw; tpos[to + 7] = ty - sy * tw; tpos[to + 8] = tz - sz * tw;
+      tpos[to + 9] = tx + sx * tw; tpos[to + 10] = ty + sy * tw; tpos[to + 11] = tz + sz * tw;
+      tcol[to] = G0 * ta; tcol[to + 1] = G1 * ta; tcol[to + 2] = G2 * ta;
+      tcol[to + 3] = G0 * ta; tcol[to + 4] = G1 * ta; tcol[to + 5] = G2 * ta;
+      tcol[to + 6] = 0; tcol[to + 7] = 0; tcol[to + 8] = 0;      // 尾部归零 = 流线淡出
+      tcol[to + 9] = 0; tcol[to + 10] = 0; tcol[to + 11] = 0;
+    }
+    /* 没有活跃碎片就整体不画（省两次 draw call），缓冲保持全 0 不脏。 */
+    this._shardActive = nActive;               // 观测口（见 _revStats.shard）
+    this.shardMesh.visible = any;
+    this.shardTrail.visible = any;
+    if (any) {
+      this.shardMesh.geometry.attributes.position.needsUpdate = true;
+      this.shardMesh.geometry.attributes.color.needsUpdate = true;
+      /* v5.4（B 方案）：aLocal/aRad/aSeed 是**块局部量**（发射时写一遍、终生不变）⇒ 只在
+       * "有块写进来"的那一帧上传一次，不进每帧的上传路径。 */
+      if (this._shardDirty) {
+        const at = this.shardMesh.geometry.attributes;
+        at.aLocal.needsUpdate = true;
+        at.aRad.needsUpdate = true;
+        at.aSeed.needsUpdate = true;
+        this._shardDirty = false;
+      }
+      this.shardTrail.geometry.attributes.position.needsUpdate = true;
+      this.shardTrail.geometry.attributes.color.needsUpdate = true;
+    }
   }
 
   /** v-内容5：高能数据立方体粒子 —— 与黑洞体相位联动的状态机。

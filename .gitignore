@@ -54,3 +54,23 @@ test-results/
 investigation/
 .workbuddy/
 *.bak
+
+# ── 仅保留可构建的源码：src / index.html / package*.json / vite.config.js ──
+# 下列均为开发期产物（一次性修复脚本、离线预览、静态断言、调研与交接文档），
+# 只在本机使用，不进版本库。
+_*.mjs
+_*.cjs
+_*.glsl
+_*.js
+fracture-preview.html
+tools_*.mjs
+
+# 调研 / 报告 / 交接类文档
+水晶材质节点化调研_*.md
+水晶材质节点式渲染路线_*.md
+碎片质感调研_*.md
+性能排查报告_*.md
+新会话提示词.md
+HANDOFF_*.md
+L5_坐标地图_*.md
+L5_阈值图层对照图.svg
